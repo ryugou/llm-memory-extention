@@ -40,7 +40,17 @@ pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    // /mcp requires auth; /healthz does not.
+    let mcp_router = Router::new()
+        .route("/mcp", axum::routing::post(crate::mcp::transport::handle))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.jwt_keys.clone(),
+            llm_memory_auth::middleware::require_auth,
+        ))
+        .with_state(state.clone());
+
     Router::new()
+        .merge(mcp_router)
         .route("/healthz", get(healthz))
         .with_state(state)
 }
