@@ -4,3 +4,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+llm-memory-core = { path = "../llm-memory-core" }
+llm-memory-storage = { path = "../llm-memory-storage" }
+llm-memory-llm = { path = "../llm-memory-llm" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util"] }
