@@ -1122,6 +1122,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "base64 0.22.1",
+ "futures",
  "jsonwebtoken",
  "llm-memory-core",
  "llm-memory-storage",
@@ -1130,8 +1131,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "thiserror 1.0.69",
  "tokio",
+ "tower",
  "tracing",
  "url",
 ]
