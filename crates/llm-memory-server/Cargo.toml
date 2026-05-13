@@ -7,4 +7,26 @@ license.workspace = true
 name = "llm-memory-server"
 path = "src/main.rs"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
+llm-memory-core = { path = "../llm-memory-core" }
+llm-memory-storage = { path = "../llm-memory-storage" }
+llm-memory-llm = { path = "../llm-memory-llm" }
+llm-memory-coordinator = { path = "../llm-memory-coordinator" }
+llm-memory-auth = { path = "../llm-memory-auth" }
+axum.workspace = true
+axum-extra.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+prometheus.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
