@@ -11,6 +11,8 @@ pub struct SearchQuery<'a> {
 }
 
 pub async fn raws(pool: &SqlitePool, q: SearchQuery<'_>) -> Result<Vec<Raw>, StorageError> {
+    // 1..=100 にクランプ。負値や巨大値による DoS/誤動作を防ぐ。
+    let limit = q.limit.clamp(1, 100);
     let mut sql = String::from(
         "SELECT r.id, r.scope, r.owner_id, r.title, r.content, r.source, r.tags, r.created_by, r.created_at
          FROM raws_fts JOIN raws r ON r.rowid = raws_fts.rowid
@@ -31,7 +33,7 @@ pub async fn raws(pool: &SqlitePool, q: SearchQuery<'_>) -> Result<Vec<Raw>, Sto
     for b in &binds {
         query = query.bind(b);
     }
-    query = query.bind(q.limit);
+    query = query.bind(limit);
     Ok(query.fetch_all(pool).await?)
 }
 
@@ -70,6 +72,70 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn negative_limit_is_clamped_to_one() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "Alpha",
+                content: "x",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "alpha",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: -100,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(res.len() <= 1, "negative limit must clamp to 1");
+    }
+
+    #[tokio::test]
+    async fn huge_limit_is_clamped_to_one_hundred() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        for i in 0..150 {
+            insert(
+                &pool,
+                NewRaw {
+                    scope: Scope::Personal,
+                    owner_id: "u1",
+                    title: &format!("alpha-{i}"),
+                    content: "x",
+                    source: "m",
+                    tags_json: None,
+                    created_by: Some("u1"),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "alpha",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 9999,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(res.len() <= 100, "huge limit must clamp to 100");
     }
 
     #[tokio::test]

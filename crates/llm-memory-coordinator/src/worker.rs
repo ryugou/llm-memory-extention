@@ -108,12 +108,22 @@ pub(crate) async fn run_session<C: AnthropicClient>(
                     extracted.affected_existing.into_iter().collect();
                 let current_count =
                     wikis::count_concepts(&deps.pool, key.scope, &key.owner_id).await?;
-                if current_count < CONCEPT_LIMIT_PER_OWNER {
-                    for c in extracted.new_concepts {
-                        set.insert(c);
-                    }
-                } else {
+                // 残り枠だけ追加。current_count=199, new=100 でも 200 までで止める。
+                let remaining = (CONCEPT_LIMIT_PER_OWNER - current_count).max(0) as usize;
+                let new_total = extracted.new_concepts.len();
+                if remaining == 0 && new_total > 0 {
                     warn!(owner = ?key, current_count, "concept limit reached, ignoring new_concepts");
+                } else if new_total > remaining {
+                    warn!(
+                        owner = ?key,
+                        current_count,
+                        new_total,
+                        remaining,
+                        "concept limit approached, truncated new_concepts"
+                    );
+                }
+                for c in extracted.new_concepts.into_iter().take(remaining) {
+                    set.insert(c);
                 }
                 set.into_iter().collect()
             }
@@ -387,6 +397,58 @@ mod tests {
         {
             panic!("intentional panic for test");
         }
+    }
+
+    #[tokio::test]
+    async fn append_clamps_new_concepts_to_remaining_budget() {
+        // 既存 CONCEPT_LIMIT_PER_OWNER - 1 個 (= 199) の wiki を投入して残り枠を 1 にする。
+        // Haiku が 5 個の new_concept を返しても、Sonnet 呼び出しは 1 件分しか
+        // 発生せず、最終的に CONCEPT_LIMIT_PER_OWNER を超えないこと。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        for i in 0..(CONCEPT_LIMIT_PER_OWNER - 1) {
+            wikis::upsert(&pool, Scope::Personal, "u1", &format!("c{i}"), "x", "[]", 1)
+                .await
+                .unwrap();
+        }
+        let mock = Arc::new(MockClient::new());
+        // Haiku: 5 個の new_concept (clamp 対象)
+        mock.push_text(
+            r#"{"affected_existing":[],"new_concepts":["new1","new2","new3","new4","new5"]}"#,
+        )
+        .await;
+        // Sonnet: 残り枠 1 つだけ呼ばれる
+        mock.push_text(r#"{"content":"x","source_refs":[]}"#).await;
+
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "t",
+                content: "c",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let deps_arc = deps(pool.clone(), mock.clone()).await;
+        run_session(&deps_arc, &OwnerKey::personal("u1"), RebuildMode::Append)
+            .await
+            .unwrap();
+
+        let count = wikis::count_concepts(&pool, Scope::Personal, "u1")
+            .await
+            .unwrap();
+        assert_eq!(
+            count, CONCEPT_LIMIT_PER_OWNER,
+            "must not exceed CONCEPT_LIMIT_PER_OWNER"
+        );
+        // 呼ばれた LLM は Haiku 1 + Sonnet 1 のみ (clamp により Sonnet が 1 件)
+        let cap = mock.captured().await;
+        assert_eq!(cap.len(), 2, "Haiku + 1 Sonnet only");
     }
 
     #[tokio::test]

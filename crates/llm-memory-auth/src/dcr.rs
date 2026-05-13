@@ -28,7 +28,7 @@ pub struct DcrResponse {
 
 pub const MAX_REDIRECT_URIS: usize = 5;
 pub const ALLOWED_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token"];
-pub const ALLOWED_AUTH_METHODS: &[&str] = &["none", "client_secret_basic"];
+pub const ALLOWED_AUTH_METHODS: &[&str] = &["none"];
 
 /// Validate a DCR request and return a populated response (without client_id).
 /// Caller must fill `client_id` with a freshly generated value (ULID).
@@ -124,10 +124,11 @@ mod tests {
     }
 
     #[test]
-    fn accepts_client_secret_basic() {
+    fn rejects_client_secret_basic() {
+        // /oauth/token 側で client_secret_basic を検証していないため、当面 advertise しない。
         let mut r = base();
         r.token_endpoint_auth_method = Some("client_secret_basic".into());
-        assert!(validate(&r).is_ok());
+        assert!(validate(&r).is_err());
     }
 
     #[test]
