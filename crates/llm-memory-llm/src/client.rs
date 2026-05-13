@@ -1,9 +1,9 @@
-use async_trait::async_trait;
 use crate::error::LlmError;
+use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
 pub struct Message {
-    pub role: String,         // "user" or "assistant"
+    pub role: String, // "user" or "assistant"
     pub content: String,
 }
 

@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use llm_memory_core::scope::Scope;
-use llm_memory_storage::raws::{insert, NewRaw};
+use llm_memory_storage::raws::{NewRaw, insert};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::app::AppState;
 use llm_memory_auth::middleware::AuthenticatedUser;
@@ -26,15 +26,19 @@ pub async fn call(state: AppState, user: AuthenticatedUser, args: Value) -> Resu
         return Err(anyhow!("content exceeds 1 MB"));
     }
     let tags_json = a.tags.as_ref().map(|t| serde_json::to_string(t).unwrap());
-    let r = insert(&state.pool, NewRaw {
-        scope: Scope::Personal,
-        owner_id: &user.user_id,
-        title: &a.title,
-        content: &a.content,
-        source: &a.source,
-        tags_json: tags_json.as_deref(),
-        created_by: Some(&user.user_id),
-    }).await?;
+    let r = insert(
+        &state.pool,
+        NewRaw {
+            scope: Scope::Personal,
+            owner_id: &user.user_id,
+            title: &a.title,
+            content: &a.content,
+            source: &a.source,
+            tags_json: tags_json.as_deref(),
+            created_by: Some(&user.user_id),
+        },
+    )
+    .await?;
     let started = state.coordinator.notify_append(&user.user_id).await;
     Ok(json!({ "raw_id": r.id, "rebuild_started": started }))
 }
@@ -53,14 +57,18 @@ mod tests {
             anthropic_api_key: "test".into(),
             google_client_id: "id".into(),
             google_client_secret: "s".into(),
-            model_haiku: "h".into(), model_sonnet: "s".into(),
+            model_haiku: "h".into(),
+            model_sonnet: "s".into(),
             trusted_proxy_count: 1,
         };
         build_state(cfg).await.unwrap()
     }
 
     fn user() -> AuthenticatedUser {
-        AuthenticatedUser { user_id: "u1".into(), client_id: "c1".into() }
+        AuthenticatedUser {
+            user_id: "u1".into(),
+            client_id: "c1".into(),
+        }
     }
 
     #[tokio::test]

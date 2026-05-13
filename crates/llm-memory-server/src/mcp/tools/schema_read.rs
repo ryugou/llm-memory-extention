@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use llm_memory_core::scope::Scope;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::app::AppState;
 use llm_memory_auth::middleware::AuthenticatedUser;

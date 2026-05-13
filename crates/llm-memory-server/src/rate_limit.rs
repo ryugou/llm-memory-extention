@@ -8,9 +8,18 @@ pub struct Tier {
     pub per_minute: u32,
 }
 
-pub const READ_TIER: Tier = Tier { name: "read", per_minute: 600 };
-pub const WRITE_TIER: Tier = Tier { name: "write", per_minute: 60 };
-pub const HEAVY_TIER: Tier = Tier { name: "heavy", per_minute: 6 };
+pub const READ_TIER: Tier = Tier {
+    name: "read",
+    per_minute: 600,
+};
+pub const WRITE_TIER: Tier = Tier {
+    name: "write",
+    per_minute: 60,
+};
+pub const HEAVY_TIER: Tier = Tier {
+    name: "heavy",
+    per_minute: 6,
+};
 
 /// Choose the tier based on the tool name.
 pub fn tier_of(tool: &str) -> Tier {
@@ -69,7 +78,9 @@ impl RateLimiter {
 }
 
 impl Default for RateLimiter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -102,17 +113,24 @@ mod tests {
     fn refills_over_time() {
         let rl = RateLimiter::new();
         // Drain heavy tier completely.
-        for _ in 0..6 { rl.check("u-r", HEAVY_TIER); }
+        for _ in 0..6 {
+            rl.check("u-r", HEAVY_TIER);
+        }
         assert!(!rl.check("u-r", HEAVY_TIER));
         // Wait for a refill (>10s gives ~1 token at 6/min).
         sleep(Duration::from_millis(11_000));
-        assert!(rl.check("u-r", HEAVY_TIER), "should have refilled at least 1 token");
+        assert!(
+            rl.check("u-r", HEAVY_TIER),
+            "should have refilled at least 1 token"
+        );
     }
 
     #[test]
     fn different_users_isolated() {
         let rl = RateLimiter::new();
-        for _ in 0..6 { rl.check("u1", HEAVY_TIER); }
+        for _ in 0..6 {
+            rl.check("u1", HEAVY_TIER);
+        }
         assert!(!rl.check("u1", HEAVY_TIER));
         assert!(rl.check("u2", HEAVY_TIER), "u2 should be unaffected");
     }

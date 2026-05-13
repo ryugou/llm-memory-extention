@@ -1,7 +1,7 @@
 use anyhow::Result;
 use llm_memory_core::scope::Scope;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::app::AppState;
 use llm_memory_auth::middleware::AuthenticatedUser;
@@ -13,7 +13,8 @@ struct Args {
 
 pub async fn call(state: AppState, user: AuthenticatedUser, args: Value) -> Result<Value> {
     let a: Args = serde_json::from_value(args)?;
-    llm_memory_storage::schemas::upsert(&state.pool, Scope::Personal, &user.user_id, &a.content).await?;
+    llm_memory_storage::schemas::upsert(&state.pool, Scope::Personal, &user.user_id, &a.content)
+        .await?;
     Ok(json!({ "ok": true }))
 }
 
@@ -40,14 +41,21 @@ mod tests {
     }
 
     fn u() -> AuthenticatedUser {
-        AuthenticatedUser { user_id: "u1".into(), client_id: "c".into() }
+        AuthenticatedUser {
+            user_id: "u1".into(),
+            client_id: "c".into(),
+        }
     }
 
     #[tokio::test]
     async fn upserts_schema() {
         let s = state().await;
-        call(s.clone(), u(), json!({ "content": "v1" })).await.unwrap();
-        let got = llm_memory_storage::schemas::get(&s.pool, Scope::Personal, "u1").await.unwrap();
+        call(s.clone(), u(), json!({ "content": "v1" }))
+            .await
+            .unwrap();
+        let got = llm_memory_storage::schemas::get(&s.pool, Scope::Personal, "u1")
+            .await
+            .unwrap();
         assert_eq!(got.as_deref(), Some("v1"));
     }
 }

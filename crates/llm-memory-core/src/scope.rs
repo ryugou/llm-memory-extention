@@ -35,12 +35,20 @@ pub struct OwnerKey {
 
 impl OwnerKey {
     pub fn personal(user_id: impl Into<String>) -> Self {
-        Self { scope: Scope::Personal, owner_id: user_id.into() }
+        Self {
+            scope: Scope::Personal,
+            owner_id: user_id.into(),
+        }
     }
     pub fn shared(shared_memory_id: SharedMemoryId) -> Self {
-        Self { scope: Scope::Shared, owner_id: shared_memory_id.as_str().to_string() }
+        Self {
+            scope: Scope::Shared,
+            owner_id: shared_memory_id.as_str().to_string(),
+        }
     }
-    pub fn owner_id(&self) -> &str { &self.owner_id }
+    pub fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
 }
 
 #[cfg(test)]

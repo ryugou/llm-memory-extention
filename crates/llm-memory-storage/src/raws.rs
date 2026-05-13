@@ -53,7 +53,10 @@ pub async fn insert(pool: &SqlitePool, r: NewRaw<'_>) -> Result<Raw, StorageErro
 }
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Raw>, StorageError> {
-    Ok(sqlx::query_as::<_, Raw>("SELECT * FROM raws WHERE id = ?").bind(id).fetch_optional(pool).await?)
+    Ok(sqlx::query_as::<_, Raw>("SELECT * FROM raws WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 pub async fn list_since(
@@ -67,8 +70,12 @@ pub async fn list_since(
         "SELECT * FROM raws WHERE scope = ? AND owner_id = ? AND created_at > ? AND created_at <= ?
          ORDER BY created_at ASC, id ASC",
     )
-    .bind(scope.as_str()).bind(owner_id).bind(since_exclusive).bind(until_inclusive)
-    .fetch_all(pool).await?)
+    .bind(scope.as_str())
+    .bind(owner_id)
+    .bind(since_exclusive)
+    .bind(until_inclusive)
+    .fetch_all(pool)
+    .await?)
 }
 
 #[cfg(test)]
@@ -79,15 +86,20 @@ mod tests {
     #[tokio::test]
     async fn insert_and_get() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
-        let r = insert(&pool, NewRaw {
-            scope: Scope::Personal,
-            owner_id: "u1",
-            title: "t",
-            content: "c",
-            source: "manual",
-            tags_json: Some(r#"["a","b"]"#),
-            created_by: Some("u1"),
-        }).await.unwrap();
+        let r = insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "t",
+                content: "c",
+                source: "manual",
+                tags_json: Some(r#"["a","b"]"#),
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
         let got = get(&pool, &r.id).await.unwrap().unwrap();
         assert_eq!(got.title, "t");
         assert_eq!(got.tags.as_deref(), Some(r#"["a","b"]"#));
@@ -97,16 +109,30 @@ mod tests {
     async fn list_since_filters_by_range() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
         for _ in 0..5 {
-            insert(&pool, NewRaw {
-                scope: Scope::Personal, owner_id: "u1", title: "t", content: "c",
-                source: "manual", tags_json: None, created_by: Some("u1"),
-            }).await.unwrap();
+            insert(
+                &pool,
+                NewRaw {
+                    scope: Scope::Personal,
+                    owner_id: "u1",
+                    title: "t",
+                    content: "c",
+                    source: "manual",
+                    tags_json: None,
+                    created_by: Some("u1"),
+                },
+            )
+            .await
+            .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         let until = now_ms();
-        let all = list_since(&pool, Scope::Personal, "u1", 0, until).await.unwrap();
+        let all = list_since(&pool, Scope::Personal, "u1", 0, until)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 5);
-        let none = list_since(&pool, Scope::Personal, "u1", until, until).await.unwrap();
+        let none = list_since(&pool, Scope::Personal, "u1", until, until)
+            .await
+            .unwrap();
         assert_eq!(none.len(), 0);
     }
 }

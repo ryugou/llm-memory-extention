@@ -1,8 +1,8 @@
+use crate::client::{AnthropicClient, CompleteRequest, CompleteResponse};
+use crate::error::LlmError;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use crate::client::{AnthropicClient, CompleteRequest, CompleteResponse};
-use crate::error::LlmError;
 
 #[derive(Clone)]
 pub struct AnthropicHttp {
@@ -60,7 +60,10 @@ impl AnthropicClient for AnthropicHttp {
         let msgs: Vec<ApiMessage> = req
             .messages
             .iter()
-            .map(|m| ApiMessage { role: m.role.as_str(), content: &m.content })
+            .map(|m| ApiMessage {
+                role: m.role.as_str(),
+                content: &m.content,
+            })
             .collect();
         let payload = ApiRequest {
             model: &req.model,
@@ -79,10 +82,18 @@ impl AnthropicClient for AnthropicHttp {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            return Err(LlmError::Api { status: status.as_u16(), message: body });
+            return Err(LlmError::Api {
+                status: status.as_u16(),
+                message: body,
+            });
         }
         let resp: ApiResponse = res.json().await?;
-        let content = resp.content.into_iter().map(|c| c.text).collect::<Vec<_>>().join("");
+        let content = resp
+            .content
+            .into_iter()
+            .map(|c| c.text)
+            .collect::<Vec<_>>()
+            .join("");
         Ok(CompleteResponse { content })
     }
 }
@@ -98,13 +109,23 @@ mod tests {
         let req = CompleteRequest {
             model: "haiku".into(),
             system: "sys".into(),
-            messages: vec![Message { role: "user".into(), content: "hi".into() }],
+            messages: vec![Message {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
             max_tokens: 100,
         };
         let payload = ApiRequest {
             model: &req.model,
             system: &req.system,
-            messages: req.messages.iter().map(|m| ApiMessage { role: m.role.as_str(), content: &m.content }).collect(),
+            messages: req
+                .messages
+                .iter()
+                .map(|m| ApiMessage {
+                    role: m.role.as_str(),
+                    content: &m.content,
+                })
+                .collect(),
             max_tokens: req.max_tokens,
         };
         let json = serde_json::to_string(&payload).unwrap();

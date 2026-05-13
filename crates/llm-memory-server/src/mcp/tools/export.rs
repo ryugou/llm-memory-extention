@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use llm_memory_core::scope::Scope;
 use llm_memory_core::time::now_ms;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::app::AppState;
 use llm_memory_auth::middleware::AuthenticatedUser;
@@ -40,8 +40,11 @@ pub async fn call(state: AppState, user: AuthenticatedUser, args: Value) -> Resu
 
     // wikis + schema は最初の page (cursor=0) でのみ返す
     let (wikis_value, schema) = if cursor_i == 0 {
-        let wikis = llm_memory_storage::wikis::list_for_owner(&state.pool, Scope::Personal, &user.user_id).await?;
-        let schema = llm_memory_storage::schemas::get(&state.pool, Scope::Personal, &user.user_id).await?;
+        let wikis =
+            llm_memory_storage::wikis::list_for_owner(&state.pool, Scope::Personal, &user.user_id)
+                .await?;
+        let schema =
+            llm_memory_storage::schemas::get(&state.pool, Scope::Personal, &user.user_id).await?;
         (Some(wikis), schema)
     } else {
         (None, None)
@@ -63,7 +66,7 @@ mod tests {
     use super::*;
     use crate::app::build_state;
     use crate::config::ServerConfig;
-    use llm_memory_storage::raws::{insert, NewRaw};
+    use llm_memory_storage::raws::{NewRaw, insert};
 
     async fn state() -> AppState {
         build_state(ServerConfig {
@@ -82,21 +85,27 @@ mod tests {
     }
 
     fn u() -> AuthenticatedUser {
-        AuthenticatedUser { user_id: "u1".into(), client_id: "c".into() }
+        AuthenticatedUser {
+            user_id: "u1".into(),
+            client_id: "c".into(),
+        }
     }
 
     #[tokio::test]
     async fn export_returns_raws_and_wikis_on_first_page() {
         let s = state().await;
-        insert(&s.pool, NewRaw {
-            scope: Scope::Personal,
-            owner_id: "u1",
-            title: "t",
-            content: "c",
-            source: "m",
-            tags_json: None,
-            created_by: Some("u1"),
-        })
+        insert(
+            &s.pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "t",
+                content: "c",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
         .await
         .unwrap();
         let res = call(s, u(), json!({})).await.unwrap();

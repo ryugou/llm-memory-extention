@@ -42,7 +42,8 @@ pub fn validate(req: &DcrRequest) -> Result<DcrResponse, AuthError> {
         )));
     }
     for u in &req.redirect_uris {
-        let parsed = Url::parse(u).map_err(|_| AuthError::OAuth(format!("invalid redirect_uri: {u}")))?;
+        let parsed =
+            Url::parse(u).map_err(|_| AuthError::OAuth(format!("invalid redirect_uri: {u}")))?;
         if parsed.scheme() != "https" {
             return Err(AuthError::OAuth(format!("redirect_uri must be https: {u}")));
         }
@@ -52,9 +53,14 @@ pub fn validate(req: &DcrRequest) -> Result<DcrResponse, AuthError> {
             return Err(AuthError::OAuth(format!("grant_type not allowed: {g}")));
         }
     }
-    let method = req.token_endpoint_auth_method.clone().unwrap_or_else(|| "none".into());
+    let method = req
+        .token_endpoint_auth_method
+        .clone()
+        .unwrap_or_else(|| "none".into());
     if !ALLOWED_AUTH_METHODS.contains(&method.as_str()) {
-        return Err(AuthError::OAuth(format!("auth method not allowed: {method}")));
+        return Err(AuthError::OAuth(format!(
+            "auth method not allowed: {method}"
+        )));
     }
     Ok(DcrResponse {
         client_id: String::new(),

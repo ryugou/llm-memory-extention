@@ -28,7 +28,9 @@ pub enum StartOutcome {
 }
 
 impl StateMap {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Try to claim a worker slot for the given owner.
     /// - If idle: marks running=true and returns Started(mode).
@@ -40,8 +42,11 @@ impl StateMap {
         if entry.running {
             match &mode {
                 RebuildMode::Manual { concept } => {
-                    let incoming = RebuildMode::Manual { concept: concept.clone() };
-                    entry.manual_pending = Some(merge_pending(entry.manual_pending.take(), incoming));
+                    let incoming = RebuildMode::Manual {
+                        concept: concept.clone(),
+                    };
+                    entry.manual_pending =
+                        Some(merge_pending(entry.manual_pending.take(), incoming));
                     StartOutcome::Pending
                 }
                 RebuildMode::Append => StartOutcome::AlreadyRunning,
@@ -95,7 +100,9 @@ fn merge_pending(existing: Option<RebuildMode>, incoming: RebuildMode) -> Rebuil
 mod tests {
     use super::*;
 
-    fn key() -> OwnerKey { OwnerKey::personal("u1") }
+    fn key() -> OwnerKey {
+        OwnerKey::personal("u1")
+    }
 
     #[tokio::test]
     async fn append_starts_when_idle() {
@@ -117,10 +124,22 @@ mod tests {
     async fn manual_pending_when_running() {
         let s = StateMap::new();
         s.try_start(&key(), RebuildMode::Append).await;
-        let r = s.try_start(&key(), RebuildMode::Manual { concept: Some("c".into()) }).await;
+        let r = s
+            .try_start(
+                &key(),
+                RebuildMode::Manual {
+                    concept: Some("c".into()),
+                },
+            )
+            .await;
         assert_eq!(r, StartOutcome::Pending);
         let cont = s.mark_idle_or_continue(&key()).await;
-        assert_eq!(cont, Some(RebuildMode::Manual { concept: Some("c".into()) }));
+        assert_eq!(
+            cont,
+            Some(RebuildMode::Manual {
+                concept: Some("c".into())
+            })
+        );
         // After continuation, running stays true
         assert!(s.is_running(&key()).await);
     }
@@ -129,8 +148,15 @@ mod tests {
     async fn manual_none_overrides_some_in_pending() {
         let s = StateMap::new();
         s.try_start(&key(), RebuildMode::Append).await;
-        s.try_start(&key(), RebuildMode::Manual { concept: Some("c".into()) }).await;
-        s.try_start(&key(), RebuildMode::Manual { concept: None }).await;
+        s.try_start(
+            &key(),
+            RebuildMode::Manual {
+                concept: Some("c".into()),
+            },
+        )
+        .await;
+        s.try_start(&key(), RebuildMode::Manual { concept: None })
+            .await;
         let cont = s.mark_idle_or_continue(&key()).await;
         assert_eq!(cont, Some(RebuildMode::Manual { concept: None }));
     }

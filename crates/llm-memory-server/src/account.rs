@@ -25,7 +25,7 @@ mod tests {
     use axum::http::Request;
     use llm_memory_auth::jwt;
     use llm_memory_core::scope::Scope;
-    use llm_memory_storage::raws::{insert, NewRaw};
+    use llm_memory_storage::raws::{NewRaw, insert};
     use llm_memory_storage::users;
     use std::collections::HashMap;
     use tower::ServiceExt;
@@ -117,11 +117,7 @@ mod tests {
     async fn delete_me_without_token_is_401() {
         let (router, _, _) = setup().await;
         let res = router
-            .oneshot(
-                Request::delete("/v1/account")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::delete("/v1/account").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);

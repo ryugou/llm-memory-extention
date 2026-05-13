@@ -1,9 +1,14 @@
+use crate::error::StorageError;
 use llm_memory_core::scope::Scope;
 use llm_memory_core::time::now_ms;
 use sqlx::SqlitePool;
-use crate::error::StorageError;
 
-pub async fn upsert(pool: &SqlitePool, scope: Scope, owner_id: &str, content: &str) -> Result<(), StorageError> {
+pub async fn upsert(
+    pool: &SqlitePool,
+    scope: Scope,
+    owner_id: &str,
+    content: &str,
+) -> Result<(), StorageError> {
     sqlx::query(
         "INSERT INTO schemas (scope, owner_id, content, updated_at)
          VALUES (?, ?, ?, ?)
@@ -14,10 +19,17 @@ pub async fn upsert(pool: &SqlitePool, scope: Scope, owner_id: &str, content: &s
     Ok(())
 }
 
-pub async fn get(pool: &SqlitePool, scope: Scope, owner_id: &str) -> Result<Option<String>, StorageError> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT content FROM schemas WHERE scope = ? AND owner_id = ?",
-    ).bind(scope.as_str()).bind(owner_id).fetch_optional(pool).await?;
+pub async fn get(
+    pool: &SqlitePool,
+    scope: Scope,
+    owner_id: &str,
+) -> Result<Option<String>, StorageError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT content FROM schemas WHERE scope = ? AND owner_id = ?")
+            .bind(scope.as_str())
+            .bind(owner_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|(c,)| c))
 }
 
@@ -31,7 +43,10 @@ mod tests {
         let pool = init_pool("sqlite::memory:").await.unwrap();
         upsert(&pool, Scope::Personal, "u1", "v1").await.unwrap();
         upsert(&pool, Scope::Personal, "u1", "v2").await.unwrap();
-        assert_eq!(get(&pool, Scope::Personal, "u1").await.unwrap().as_deref(), Some("v2"));
+        assert_eq!(
+            get(&pool, Scope::Personal, "u1").await.unwrap().as_deref(),
+            Some("v2")
+        );
     }
 
     #[tokio::test]

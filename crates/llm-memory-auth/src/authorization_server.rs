@@ -15,11 +15,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use axum::{
+    Form, Router,
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Redirect},
     routing::{get, post},
-    Form, Router,
 };
 use base64::Engine;
 use llm_memory_core::id::new_ulid;
@@ -146,10 +146,7 @@ async fn metadata(State(state): State<AsState>) -> impl IntoResponse {
     }))
 }
 
-async fn register(
-    State(state): State<AsState>,
-    Json(body): Json<dcr::DcrRequest>,
-) -> Response {
+async fn register(State(state): State<AsState>, Json(body): Json<dcr::DcrRequest>) -> Response {
     let mut resp = match dcr::validate(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -178,7 +175,11 @@ async fn register(
         Err(e) => return server_error(&e.to_string()),
     };
     resp.client_id = client.id;
-    (StatusCode::CREATED, Json(serde_json::to_value(resp).unwrap())).into_response()
+    (
+        StatusCode::CREATED,
+        Json(serde_json::to_value(resp).unwrap()),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -195,12 +196,12 @@ struct AuthorizeParams {
     scope: Option<String>,
 }
 
-async fn authorize(
-    State(state): State<AsState>,
-    Query(p): Query<AuthorizeParams>,
-) -> Response {
+async fn authorize(State(state): State<AsState>, Query(p): Query<AuthorizeParams>) -> Response {
     if p.response_type != "code" {
-        return bad_request("unsupported_response_type", "only response_type=code supported");
+        return bad_request(
+            "unsupported_response_type",
+            "only response_type=code supported",
+        );
     }
     if p.code_challenge_method != "S256" {
         return bad_request("invalid_request", "code_challenge_method must be S256");
@@ -458,7 +459,7 @@ fn server_error(message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use std::collections::HashMap;
     use tower::ServiceExt;

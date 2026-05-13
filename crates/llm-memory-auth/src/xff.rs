@@ -7,9 +7,17 @@ use std::net::IpAddr;
 /// untrusted and we fall back to the peer address.
 ///
 /// MVP assumes deployment behind GCP Cloud Load Balancer (`TRUSTED_PROXY_COUNT=1`).
-pub fn parse_client_ip(xff_header: Option<&str>, peer_ip: IpAddr, trusted_proxy_count: usize) -> IpAddr {
+pub fn parse_client_ip(
+    xff_header: Option<&str>,
+    peer_ip: IpAddr,
+    trusted_proxy_count: usize,
+) -> IpAddr {
     if let Some(xff) = xff_header {
-        let ips: Vec<&str> = xff.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let ips: Vec<&str> = xff
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         if ips.len() > trusted_proxy_count {
             let idx = ips.len() - 1 - trusted_proxy_count;
             if let Ok(ip) = ips[idx].parse::<IpAddr>() {
@@ -25,7 +33,9 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    fn peer() -> IpAddr { IpAddr::from_str("10.0.0.1").unwrap() }
+    fn peer() -> IpAddr {
+        IpAddr::from_str("10.0.0.1").unwrap()
+    }
 
     #[test]
     fn xff_one_trusted_proxy() {

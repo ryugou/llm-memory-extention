@@ -59,7 +59,10 @@ pub fn issue(
     };
     let mut header = Header::new(jsonwebtoken::Algorithm::HS256);
     header.kid = Some(keys.current_kid.clone());
-    let secret = keys.keys.get(&keys.current_kid).ok_or(AuthError::MissingKid)?;
+    let secret = keys
+        .keys
+        .get(&keys.current_kid)
+        .ok_or(AuthError::MissingKid)?;
     Ok(jsonwebtoken::encode(
         &header,
         &claims,
@@ -76,7 +79,8 @@ pub fn verify(keys: &JwtKeys, token: &str) -> Result<Claims, AuthError> {
         .ok_or_else(|| AuthError::UnknownKid(kid.clone()))?;
     let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.validate_exp = true;
-    let data = jsonwebtoken::decode::<Claims>(token, &DecodingKey::from_secret(secret), &validation)?;
+    let data =
+        jsonwebtoken::decode::<Claims>(token, &DecodingKey::from_secret(secret), &validation)?;
     Ok(data.claims)
 }
 

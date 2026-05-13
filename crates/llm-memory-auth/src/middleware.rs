@@ -5,8 +5,8 @@ use axum::{
     response::Response,
 };
 use axum_extra::{
-    headers::{authorization::Bearer, Authorization},
     TypedHeader,
+    headers::{Authorization, authorization::Bearer},
 };
 
 use crate::jwt::{self, JwtKeys};
@@ -37,22 +37,27 @@ pub async fn require_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jwt::{issue, JwtKeys};
+    use crate::jwt::{JwtKeys, issue};
+    use axum::Router;
     use axum::body::Body;
     use axum::http::Request as AxumRequest;
     use axum::middleware::from_fn_with_state;
     use axum::routing::get;
-    use axum::Router;
     use std::collections::HashMap;
     use tower::ServiceExt;
 
     fn keys() -> JwtKeys {
         let mut m = HashMap::new();
         m.insert("v1".into(), b"01234567890123456789012345678901".to_vec());
-        JwtKeys { current_kid: "v1".into(), keys: m }
+        JwtKeys {
+            current_kid: "v1".into(),
+            keys: m,
+        }
     }
 
-    async fn protected() -> &'static str { "ok" }
+    async fn protected() -> &'static str {
+        "ok"
+    }
 
     fn app(k: JwtKeys) -> Router {
         Router::new()
@@ -64,7 +69,10 @@ mod tests {
     #[tokio::test]
     async fn missing_bearer_returns_401() {
         let k = keys();
-        let res = app(k).oneshot(AxumRequest::get("/").body(Body::empty()).unwrap()).await.unwrap();
+        let res = app(k)
+            .oneshot(AxumRequest::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -72,22 +80,30 @@ mod tests {
     async fn valid_token_passes_through() {
         let k = keys();
         let token = issue(&k, "u1", "c1", 3600).unwrap();
-        let res = app(k).oneshot(
-            AxumRequest::get("/")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let res = app(k)
+            .oneshot(
+                AxumRequest::get("/")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn invalid_token_returns_401() {
         let k = keys();
-        let res = app(k).oneshot(
-            AxumRequest::get("/")
-                .header("authorization", "Bearer not-a-jwt")
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let res = app(k)
+            .oneshot(
+                AxumRequest::get("/")
+                    .header("authorization", "Bearer not-a-jwt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -28,7 +28,7 @@ mod tests {
     use crate::app::build_state;
     use crate::config::ServerConfig;
     use llm_memory_core::scope::Scope;
-    use llm_memory_storage::raws::{insert, NewRaw};
+    use llm_memory_storage::raws::{NewRaw, insert};
     use serde_json::json;
 
     async fn state() -> AppState {

@@ -1,8 +1,8 @@
+use crate::client::{AnthropicClient, CompleteRequest, CompleteResponse};
+use crate::error::LlmError;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::client::{AnthropicClient, CompleteRequest, CompleteResponse};
-use crate::error::LlmError;
 
 #[derive(Clone, Default)]
 pub struct MockClient {
@@ -11,14 +11,21 @@ pub struct MockClient {
 }
 
 impl MockClient {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
     pub async fn push_text(&self, s: impl Into<String>) {
-        self.responses.lock().await.push(Ok(CompleteResponse { content: s.into() }));
+        self.responses
+            .lock()
+            .await
+            .push(Ok(CompleteResponse { content: s.into() }));
     }
     pub async fn push_error(&self, msg: impl Into<String>) {
         self.responses.lock().await.push(Err(msg.into()));
     }
-    pub async fn captured(&self) -> Vec<CompleteRequest> { self.captured.lock().await.clone() }
+    pub async fn captured(&self) -> Vec<CompleteRequest> {
+        self.captured.lock().await.clone()
+    }
 }
 
 #[async_trait]
@@ -35,7 +42,10 @@ impl AnthropicClient for MockClient {
         let resp = responses.remove(0);
         match resp {
             Ok(r) => Ok(r),
-            Err(e) => Err(LlmError::Api { status: 500, message: e }),
+            Err(e) => Err(LlmError::Api {
+                status: 500,
+                message: e,
+            }),
         }
     }
 }
@@ -49,9 +59,15 @@ mod tests {
     async fn mock_returns_pushed_responses_in_order() {
         let m = MockClient::new();
         m.push_text("hello").await;
-        let r = m.complete(CompleteRequest {
-            model: "x".into(), system: "".into(), messages: vec![], max_tokens: 10,
-        }).await.unwrap();
+        let r = m
+            .complete(CompleteRequest {
+                model: "x".into(),
+                system: "".into(),
+                messages: vec![],
+                max_tokens: 10,
+            })
+            .await
+            .unwrap();
         assert_eq!(r.content, "hello");
         assert_eq!(m.captured().await.len(), 1);
     }
@@ -59,9 +75,14 @@ mod tests {
     #[tokio::test]
     async fn mock_returns_error_when_no_response_queued() {
         let m = MockClient::new();
-        let r = m.complete(CompleteRequest {
-            model: "x".into(), system: "".into(), messages: vec![], max_tokens: 10,
-        }).await;
+        let r = m
+            .complete(CompleteRequest {
+                model: "x".into(),
+                system: "".into(),
+                messages: vec![],
+                max_tokens: 10,
+            })
+            .await;
         assert!(r.is_err());
     }
 }

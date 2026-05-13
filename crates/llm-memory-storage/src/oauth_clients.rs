@@ -1,13 +1,13 @@
+use crate::error::StorageError;
 use llm_memory_core::id::new_ulid;
 use llm_memory_core::time::now_ms;
 use sqlx::SqlitePool;
-use crate::error::StorageError;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OAuthClient {
     pub id: String,
-    pub redirect_uris: String,         // JSON array
-    pub grant_types: String,           // JSON array
+    pub redirect_uris: String, // JSON array
+    pub grant_types: String,   // JSON array
     pub token_endpoint_auth_method: String,
     pub client_name: Option<String>,
     pub created_at: i64,
@@ -31,9 +31,14 @@ pub async fn register(
     .bind(&id).bind(redirect_uris_json).bind(grant_types_json).bind(auth_method).bind(client_name).bind(now)
     .execute(pool).await?;
     Ok(OAuthClient {
-        id, redirect_uris: redirect_uris_json.into(), grant_types: grant_types_json.into(),
-        token_endpoint_auth_method: auth_method.into(), client_name: client_name.map(Into::into),
-        created_at: now, last_seen_at: None, revoked_at: None,
+        id,
+        redirect_uris: redirect_uris_json.into(),
+        grant_types: grant_types_json.into(),
+        token_endpoint_auth_method: auth_method.into(),
+        client_name: client_name.map(Into::into),
+        created_at: now,
+        last_seen_at: None,
+        revoked_at: None,
     })
 }
 
@@ -46,7 +51,10 @@ pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<OAuthClient>, Sto
 
 pub async fn touch_last_seen(pool: &SqlitePool, id: &str) -> Result<(), StorageError> {
     sqlx::query("UPDATE oauth_clients SET last_seen_at = ? WHERE id = ?")
-        .bind(now_ms()).bind(id).execute(pool).await?;
+        .bind(now_ms())
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -58,7 +66,15 @@ mod tests {
     #[tokio::test]
     async fn register_and_get() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
-        let c = register(&pool, r#"["https://example.com/cb"]"#, r#"["authorization_code"]"#, "none", Some("Claude")).await.unwrap();
+        let c = register(
+            &pool,
+            r#"["https://example.com/cb"]"#,
+            r#"["authorization_code"]"#,
+            "none",
+            Some("Claude"),
+        )
+        .await
+        .unwrap();
         let got = get(&pool, &c.id).await.unwrap().unwrap();
         assert_eq!(got.client_name.as_deref(), Some("Claude"));
     }

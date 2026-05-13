@@ -4,7 +4,7 @@ use llm_memory_core::scope::OwnerKey;
 use llm_memory_llm::client::AnthropicClient;
 
 use crate::state::{RebuildMode, StartOutcome};
-use crate::worker::{spawn_worker, WorkerDeps};
+use crate::worker::{WorkerDeps, spawn_worker};
 
 #[derive(Clone)]
 pub struct Coordinator<C: AnthropicClient + 'static> {
@@ -12,7 +12,9 @@ pub struct Coordinator<C: AnthropicClient + 'static> {
 }
 
 impl<C: AnthropicClient + 'static> Coordinator<C> {
-    pub fn new(deps: Arc<WorkerDeps<C>>) -> Self { Self { deps } }
+    pub fn new(deps: Arc<WorkerDeps<C>>) -> Self {
+        Self { deps }
+    }
 
     /// Append-triggered notification. Returns true if a new rebuild worker was spawned,
     /// false if a worker was already running (lazy drain).
@@ -45,7 +47,9 @@ impl<C: AnthropicClient + 'static> Coordinator<C> {
     }
 
     /// For tests / introspection
-    pub fn deps(&self) -> &Arc<WorkerDeps<C>> { &self.deps }
+    pub fn deps(&self) -> &Arc<WorkerDeps<C>> {
+        &self.deps
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -65,8 +69,11 @@ mod tests {
         let pool = init_pool("sqlite::memory:").await.unwrap();
         let mock = Arc::new(MockClient::new());
         let deps = Arc::new(WorkerDeps {
-            pool, state: StateMap::new(), llm: mock,
-            model_haiku: "haiku".into(), model_sonnet: "sonnet".into(),
+            pool,
+            state: StateMap::new(),
+            llm: mock,
+            model_haiku: "haiku".into(),
+            model_sonnet: "sonnet".into(),
         });
         Coordinator::new(deps)
     }

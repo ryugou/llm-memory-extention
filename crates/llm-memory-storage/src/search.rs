@@ -1,7 +1,7 @@
-use llm_memory_core::scope::Scope;
-use sqlx::SqlitePool;
 use crate::error::StorageError;
 use crate::raws::Raw;
+use llm_memory_core::scope::Scope;
+use sqlx::SqlitePool;
 
 pub struct SearchQuery<'a> {
     pub query: &'a str,
@@ -28,7 +28,9 @@ pub async fn raws(pool: &SqlitePool, q: SearchQuery<'_>) -> Result<Vec<Raw>, Sto
     sql.push_str(" ORDER BY bm25(raws_fts) ASC LIMIT ?");
 
     let mut query = sqlx::query_as::<_, Raw>(&sql);
-    for b in &binds { query = query.bind(b); }
+    for b in &binds {
+        query = query.bind(b);
+    }
     query = query.bind(q.limit);
     Ok(query.fetch_all(pool).await?)
 }
@@ -37,36 +39,81 @@ pub async fn raws(pool: &SqlitePool, q: SearchQuery<'_>) -> Result<Vec<Raw>, Sto
 mod tests {
     use super::*;
     use crate::pool::init_pool;
-    use crate::raws::{insert, NewRaw};
+    use crate::raws::{NewRaw, insert};
 
     #[tokio::test]
     async fn search_finds_inserted() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
-        insert(&pool, NewRaw {
-            scope: Scope::Personal, owner_id: "u1",
-            title: "Vegapunk overview", content: "GraphRAG knowledge engine",
-            source: "manual", tags_json: None, created_by: Some("u1"),
-        }).await.unwrap();
-        let res = raws(&pool, SearchQuery {
-            query: "vegapunk", scope: Some(Scope::Personal), owner_id: Some("u1"), limit: 10,
-        }).await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "Vegapunk overview",
+                content: "GraphRAG knowledge engine",
+                source: "manual",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "vegapunk",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(res.len(), 1);
     }
 
     #[tokio::test]
     async fn search_respects_owner_filter() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
-        insert(&pool, NewRaw {
-            scope: Scope::Personal, owner_id: "u1",
-            title: "Alpha", content: "x", source: "m", tags_json: None, created_by: Some("u1"),
-        }).await.unwrap();
-        insert(&pool, NewRaw {
-            scope: Scope::Personal, owner_id: "u2",
-            title: "Alpha", content: "x", source: "m", tags_json: None, created_by: Some("u2"),
-        }).await.unwrap();
-        let res = raws(&pool, SearchQuery {
-            query: "alpha", scope: Some(Scope::Personal), owner_id: Some("u1"), limit: 10,
-        }).await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "Alpha",
+                content: "x",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u2",
+                title: "Alpha",
+                content: "x",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u2"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "alpha",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].owner_id, "u1");
     }

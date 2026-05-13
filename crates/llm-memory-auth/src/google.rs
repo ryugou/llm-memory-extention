@@ -1,5 +1,8 @@
 use oauth2::basic::BasicClient;
-use oauth2::{AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl, AuthorizationCode, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, Scope, TokenResponse};
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+};
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -52,7 +55,11 @@ impl GoogleClient {
     }
 
     /// Exchange authorization code for access token.
-    pub async fn exchange_code(&self, code: String, verifier: PkceCodeVerifier) -> Result<String, AuthError> {
+    pub async fn exchange_code(
+        &self,
+        code: String,
+        verifier: PkceCodeVerifier,
+    ) -> Result<String, AuthError> {
         let token = self
             .inner
             .exchange_code(AuthorizationCode::new(code))
@@ -91,7 +98,10 @@ mod tests {
         });
         let (url, _csrf, _verifier) = c.authorize_url();
         let s = url.to_string();
-        assert!(s.contains("code_challenge="), "PKCE challenge should be in URL: {s}");
+        assert!(
+            s.contains("code_challenge="),
+            "PKCE challenge should be in URL: {s}"
+        );
         assert!(s.contains("code_challenge_method=S256"));
         assert!(s.contains("client_id=test-client-id"));
         assert!(s.contains("redirect_uri="));
@@ -100,7 +110,8 @@ mod tests {
     #[test]
     fn authorize_url_requests_openid_email_scopes() {
         let c = GoogleClient::new(GoogleConfig {
-            client_id: "id".into(), client_secret: "s".into(),
+            client_id: "id".into(),
+            client_secret: "s".into(),
             redirect_uri: "https://example.com/cb".into(),
         });
         let (url, _, _) = c.authorize_url();

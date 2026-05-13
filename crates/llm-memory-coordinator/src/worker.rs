@@ -83,7 +83,8 @@ pub(crate) async fn run_session<C: AnthropicClient>(
     for iteration in 1..=MAX_ITERATIONS {
         let started_at = now_ms();
         let watermark = wikis::max_last_rebuilt_at(&deps.pool, key.scope, &key.owner_id).await?;
-        let new_raws = raws::list_since(&deps.pool, key.scope, &key.owner_id, watermark, started_at).await?;
+        let new_raws =
+            raws::list_since(&deps.pool, key.scope, &key.owner_id, watermark, started_at).await?;
         let existing_concepts = wikis::list_concepts(&deps.pool, key.scope, &key.owner_id).await?;
 
         let affected: Vec<String> = match &mode {
@@ -92,13 +93,25 @@ pub(crate) async fn run_session<C: AnthropicClient>(
                     info!(owner = ?key, "drain complete (no new raws)");
                     return Ok(());
                 }
-                let extractor = HaikuExtractor { client: deps.llm.as_ref(), model: deps.model_haiku.clone() };
-                let titles_contents: Vec<(&str, &str)> = new_raws.iter().map(|r| (r.title.as_str(), r.content.as_str())).collect();
-                let extracted = extractor.extract(&titles_contents, &existing_concepts).await?;
-                let mut set: std::collections::BTreeSet<String> = extracted.affected_existing.into_iter().collect();
-                let current_count = wikis::count_concepts(&deps.pool, key.scope, &key.owner_id).await?;
+                let extractor = HaikuExtractor {
+                    client: deps.llm.as_ref(),
+                    model: deps.model_haiku.clone(),
+                };
+                let titles_contents: Vec<(&str, &str)> = new_raws
+                    .iter()
+                    .map(|r| (r.title.as_str(), r.content.as_str()))
+                    .collect();
+                let extracted = extractor
+                    .extract(&titles_contents, &existing_concepts)
+                    .await?;
+                let mut set: std::collections::BTreeSet<String> =
+                    extracted.affected_existing.into_iter().collect();
+                let current_count =
+                    wikis::count_concepts(&deps.pool, key.scope, &key.owner_id).await?;
                 if current_count < CONCEPT_LIMIT_PER_OWNER {
-                    for c in extracted.new_concepts { set.insert(c); }
+                    for c in extracted.new_concepts {
+                        set.insert(c);
+                    }
                 } else {
                     warn!(owner = ?key, current_count, "concept limit reached, ignoring new_concepts");
                 }
@@ -158,24 +171,55 @@ async fn synthesize_one<C: AnthropicClient>(
     started_at: i64,
 ) -> Result<(), CoordinatorError> {
     let existing_wiki = wikis::get(&deps.pool, key.scope, &key.owner_id, concept).await?;
-    let existing_refs: Vec<String> = existing_wiki.as_ref()
+    let existing_refs: Vec<String> = existing_wiki
+        .as_ref()
         .and_then(|w| serde_json::from_str(&w.source_refs).ok())
         .unwrap_or_default();
-    let inputs = input_builder::build(&deps.pool, key.scope, &key.owner_id, concept, &existing_refs, new_raws).await?;
-
-    let synth = SonnetSynthesizer { client: deps.llm.as_ref(), model: deps.model_sonnet.clone() };
-    let raws_tuple: Vec<(String, String, String)> = inputs.iter().map(|r| (r.id.clone(), r.title.clone(), r.content.clone())).collect();
-    let result = synth.synthesize(SynthInput {
+    let inputs = input_builder::build(
+        &deps.pool,
+        key.scope,
+        &key.owner_id,
         concept,
-        existing_wiki: existing_wiki.as_ref().map(|w| w.content.as_str()),
-        raws: &raws_tuple,
-    }).await?;
+        &existing_refs,
+        new_raws,
+    )
+    .await?;
+
+    let synth = SonnetSynthesizer {
+        client: deps.llm.as_ref(),
+        model: deps.model_sonnet.clone(),
+    };
+    let raws_tuple: Vec<(String, String, String)> = inputs
+        .iter()
+        .map(|r| (r.id.clone(), r.title.clone(), r.content.clone()))
+        .collect();
+    let result = synth
+        .synthesize(SynthInput {
+            concept,
+            existing_wiki: existing_wiki.as_ref().map(|w| w.content.as_str()),
+            raws: &raws_tuple,
+        })
+        .await?;
 
     let valid_ids: std::collections::HashSet<&String> = inputs.iter().map(|r| &r.id).collect();
-    let filtered_refs: Vec<String> = result.source_refs.into_iter().filter(|id| valid_ids.contains(id)).collect();
-    let refs_json = serde_json::to_string(&filtered_refs).map_err(|e| CoordinatorError::Storage(llm_memory_storage::error::StorageError::Json(e)))?;
+    let filtered_refs: Vec<String> = result
+        .source_refs
+        .into_iter()
+        .filter(|id| valid_ids.contains(id))
+        .collect();
+    let refs_json = serde_json::to_string(&filtered_refs)
+        .map_err(|e| CoordinatorError::Storage(llm_memory_storage::error::StorageError::Json(e)))?;
 
-    wikis::upsert(&deps.pool, key.scope, &key.owner_id, concept, &result.content, &refs_json, started_at).await?;
+    wikis::upsert(
+        &deps.pool,
+        key.scope,
+        &key.owner_id,
+        concept,
+        &result.content,
+        &refs_json,
+        started_at,
+    )
+    .await?;
     Ok(())
 }
 
@@ -183,14 +227,17 @@ async fn synthesize_one<C: AnthropicClient>(
 mod tests {
     use super::*;
     use llm_memory_core::scope::Scope;
-    use llm_memory_storage::pool::init_pool;
-    use llm_memory_storage::raws::{insert, NewRaw};
     use llm_memory_llm::mock::MockClient;
+    use llm_memory_storage::pool::init_pool;
+    use llm_memory_storage::raws::{NewRaw, insert};
 
     async fn deps(pool: SqlitePool, mock: Arc<MockClient>) -> Arc<WorkerDeps<MockClient>> {
         Arc::new(WorkerDeps {
-            pool, state: StateMap::new(), llm: mock,
-            model_haiku: "haiku".into(), model_sonnet: "sonnet".into(),
+            pool,
+            state: StateMap::new(),
+            llm: mock,
+            model_haiku: "haiku".into(),
+            model_sonnet: "sonnet".into(),
         })
     }
 
@@ -198,35 +245,69 @@ mod tests {
     async fn append_mode_creates_wiki() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
         let mock = Arc::new(MockClient::new());
-        mock.push_text(r#"{"affected_existing":[],"new_concepts":["vegapunk"]}"#).await;
-        mock.push_text(r##"{"content":"# Vegapunk","source_refs":[]}"##).await;
-        insert(&pool, NewRaw {
-            scope: Scope::Personal, owner_id: "u1", title: "v1", content: "graphrag",
-            source: "m", tags_json: None, created_by: Some("u1"),
-        }).await.unwrap();
+        mock.push_text(r#"{"affected_existing":[],"new_concepts":["vegapunk"]}"#)
+            .await;
+        mock.push_text(r##"{"content":"# Vegapunk","source_refs":[]}"##)
+            .await;
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "v1",
+                content: "graphrag",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
 
         let deps = deps(pool.clone(), mock).await;
-        run_session(&deps, &OwnerKey::personal("u1"), RebuildMode::Append).await.unwrap();
+        run_session(&deps, &OwnerKey::personal("u1"), RebuildMode::Append)
+            .await
+            .unwrap();
 
-        let w = wikis::get(&pool, Scope::Personal, "u1", "vegapunk").await.unwrap();
+        let w = wikis::get(&pool, Scope::Personal, "u1", "vegapunk")
+            .await
+            .unwrap();
         assert!(w.is_some());
     }
 
     #[tokio::test]
     async fn manual_full_rebuilds_all_existing_concepts() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
-        wikis::upsert(&pool, Scope::Personal, "u1", "alpha", "old-a", "[]", 100).await.unwrap();
-        wikis::upsert(&pool, Scope::Personal, "u1", "beta", "old-b", "[]", 100).await.unwrap();
+        wikis::upsert(&pool, Scope::Personal, "u1", "alpha", "old-a", "[]", 100)
+            .await
+            .unwrap();
+        wikis::upsert(&pool, Scope::Personal, "u1", "beta", "old-b", "[]", 100)
+            .await
+            .unwrap();
         let mock = Arc::new(MockClient::new());
         // Manual{None}: no Haiku, two Sonnet calls. Order in BTreeSet is alpha then beta.
-        mock.push_text(r#"{"content":"new-a","source_refs":[]}"#).await;
-        mock.push_text(r#"{"content":"new-b","source_refs":[]}"#).await;
+        mock.push_text(r#"{"content":"new-a","source_refs":[]}"#)
+            .await;
+        mock.push_text(r#"{"content":"new-b","source_refs":[]}"#)
+            .await;
 
         let deps = deps(pool.clone(), mock).await;
-        run_session(&deps, &OwnerKey::personal("u1"), RebuildMode::Manual { concept: None }).await.unwrap();
+        run_session(
+            &deps,
+            &OwnerKey::personal("u1"),
+            RebuildMode::Manual { concept: None },
+        )
+        .await
+        .unwrap();
 
-        let a = wikis::get(&pool, Scope::Personal, "u1", "alpha").await.unwrap().unwrap();
-        let b = wikis::get(&pool, Scope::Personal, "u1", "beta").await.unwrap().unwrap();
+        let a = wikis::get(&pool, Scope::Personal, "u1", "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let b = wikis::get(&pool, Scope::Personal, "u1", "beta")
+            .await
+            .unwrap()
+            .unwrap();
         assert_ne!(a.content, "old-a");
         assert_ne!(b.content, "old-b");
     }
@@ -234,12 +315,23 @@ mod tests {
     #[tokio::test]
     async fn manual_single_concept_skips_haiku() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
-        wikis::upsert(&pool, Scope::Personal, "u1", "alpha", "old", "[]", 100).await.unwrap();
+        wikis::upsert(&pool, Scope::Personal, "u1", "alpha", "old", "[]", 100)
+            .await
+            .unwrap();
         let mock = Arc::new(MockClient::new());
-        mock.push_text(r#"{"content":"new","source_refs":[]}"#).await;
+        mock.push_text(r#"{"content":"new","source_refs":[]}"#)
+            .await;
 
         let deps = deps(pool.clone(), mock.clone()).await;
-        run_session(&deps, &OwnerKey::personal("u1"), RebuildMode::Manual { concept: Some("alpha".into()) }).await.unwrap();
+        run_session(
+            &deps,
+            &OwnerKey::personal("u1"),
+            RebuildMode::Manual {
+                concept: Some("alpha".into()),
+            },
+        )
+        .await
+        .unwrap();
 
         let cap = mock.captured().await;
         assert_eq!(cap.len(), 1);
@@ -253,10 +345,20 @@ mod tests {
         let pool = init_pool("sqlite::memory:").await.unwrap();
         let mock = Arc::new(MockClient::new());
         let deps_arc = deps(pool.clone(), mock).await;
-        insert(&pool, NewRaw {
-            scope: Scope::Personal, owner_id: "u1", title: "x", content: "y",
-            source: "m", tags_json: None, created_by: Some("u1"),
-        }).await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "x",
+                content: "y",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
 
         // Set running = true to simulate try_start having claimed it
         let key = OwnerKey::personal("u1");
@@ -266,7 +368,9 @@ mod tests {
 
         // Wait for state to be released
         for _ in 0..50 {
-            if !deps_arc.state.is_running(&key).await { return; }
+            if !deps_arc.state.is_running(&key).await {
+                return;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("state still running after worker should have ended");
@@ -279,7 +383,8 @@ mod tests {
         async fn complete(
             &self,
             _req: llm_memory_llm::client::CompleteRequest,
-        ) -> Result<llm_memory_llm::client::CompleteResponse, llm_memory_llm::error::LlmError> {
+        ) -> Result<llm_memory_llm::client::CompleteResponse, llm_memory_llm::error::LlmError>
+        {
             panic!("intentional panic for test");
         }
     }
@@ -289,13 +394,26 @@ mod tests {
         let pool = init_pool("sqlite::memory:").await.unwrap();
         let llm = Arc::new(PanicClient);
         let deps_arc = Arc::new(WorkerDeps {
-            pool: pool.clone(), state: StateMap::new(), llm,
-            model_haiku: "haiku".into(), model_sonnet: "sonnet".into(),
+            pool: pool.clone(),
+            state: StateMap::new(),
+            llm,
+            model_haiku: "haiku".into(),
+            model_sonnet: "sonnet".into(),
         });
-        insert(&pool, NewRaw {
-            scope: Scope::Personal, owner_id: "u-panic", title: "x", content: "y",
-            source: "m", tags_json: None, created_by: Some("u-panic"),
-        }).await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u-panic",
+                title: "x",
+                content: "y",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u-panic"),
+            },
+        )
+        .await
+        .unwrap();
 
         let key = OwnerKey::personal("u-panic");
         deps_arc.state.try_start(&key, RebuildMode::Append).await;
@@ -303,7 +421,9 @@ mod tests {
 
         // Wait up to ~5s for state to be released
         for _ in 0..50 {
-            if !deps_arc.state.is_running(&key).await { return; }
+            if !deps_arc.state.is_running(&key).await {
+                return;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         panic!("state still running after PanicClient should have panicked the worker");

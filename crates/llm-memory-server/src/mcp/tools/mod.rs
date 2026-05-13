@@ -1,20 +1,20 @@
 use anyhow::Result;
 use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::app::AppState;
 use crate::mcp::transport::JsonRpcResponse;
 use llm_memory_auth::middleware::AuthenticatedUser;
 
+pub mod export;
 pub mod raw_append;
 pub mod raw_read;
 pub mod raw_search;
-pub mod wiki_read;
-pub mod wiki_list;
-pub mod wiki_rebuild;
 pub mod schema_read;
 pub mod schema_update;
-pub mod export;
+pub mod wiki_list;
+pub mod wiki_read;
+pub mod wiki_rebuild;
 
 pub async fn list(id: Option<Value>) -> Json<JsonRpcResponse> {
     let tools = json!([
@@ -41,7 +41,11 @@ pub async fn call(
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     let tier = crate::rate_limit::tier_of(name);
     if !state.rate_limiter.check(&user.user_id, tier) {
-        return Json(JsonRpcResponse::error(id, -32000, format!("rate_limited: {} tier", tier.name)));
+        return Json(JsonRpcResponse::error(
+            id,
+            -32000,
+            format!("rate_limited: {} tier", tier.name),
+        ));
     }
     let result: Result<Value> = match name {
         "raw_append" => raw_append::call(state, user, args).await,
@@ -53,7 +57,13 @@ pub async fn call(
         "schema_read" => schema_read::call(state, user, args).await,
         "schema_update" => schema_update::call(state, user, args).await,
         "export" => export::call(state, user, args).await,
-        _ => return Json(JsonRpcResponse::error(id, -32602, format!("unknown tool: {name}"))),
+        _ => {
+            return Json(JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("unknown tool: {name}"),
+            ));
+        }
     };
     match result {
         Ok(v) => Json(JsonRpcResponse::success(id, v)),

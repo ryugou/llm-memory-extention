@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use sqlx::SqlitePool;
 
 use llm_memory_auth::jwt::JwtKeys;
@@ -65,7 +65,10 @@ pub fn build_router(state: AppState) -> Router {
     // /mcp and /v1/account require auth; /healthz does not.
     let protected_router = Router::new()
         .route("/mcp", axum::routing::post(crate::mcp::transport::handle))
-        .route("/v1/account", axum::routing::delete(crate::account::delete_me))
+        .route(
+            "/v1/account",
+            axum::routing::delete(crate::account::delete_me),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.jwt_keys.clone(),
             llm_memory_auth::middleware::require_auth,
@@ -80,7 +83,9 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> &'static str { "ok" }
+async fn healthz() -> &'static str {
+    "ok"
+}
 
 #[cfg(test)]
 mod tests {
@@ -110,7 +115,8 @@ mod tests {
         let router = build_router(state);
         let res = router
             .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(res.status(), 200);
         let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], b"ok");
