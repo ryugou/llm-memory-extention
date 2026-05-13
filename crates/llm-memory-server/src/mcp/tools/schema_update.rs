@@ -1,8 +1,53 @@
-use anyhow::{anyhow, Result};
-use serde_json::Value;
+use anyhow::Result;
+use llm_memory_core::scope::Scope;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
 use crate::app::AppState;
 use llm_memory_auth::middleware::AuthenticatedUser;
 
-pub async fn call(_state: AppState, _user: AuthenticatedUser, _args: Value) -> Result<Value> {
-    Err(anyhow!("not implemented"))
+#[derive(Deserialize)]
+struct Args {
+    content: String,
+}
+
+pub async fn call(state: AppState, user: AuthenticatedUser, args: Value) -> Result<Value> {
+    let a: Args = serde_json::from_value(args)?;
+    llm_memory_storage::schemas::upsert(&state.pool, Scope::Personal, &user.user_id, &a.content).await?;
+    Ok(json!({ "ok": true }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::build_state;
+    use crate::config::ServerConfig;
+
+    async fn state() -> AppState {
+        build_state(ServerConfig {
+            database_url: "sqlite::memory:".into(),
+            bind_addr: "x".into(),
+            public_url: "x".into(),
+            anthropic_api_key: "x".into(),
+            google_client_id: "x".into(),
+            google_client_secret: "x".into(),
+            model_haiku: "h".into(),
+            model_sonnet: "s".into(),
+            trusted_proxy_count: 1,
+        })
+        .await
+        .unwrap()
+    }
+
+    fn u() -> AuthenticatedUser {
+        AuthenticatedUser { user_id: "u1".into(), client_id: "c".into() }
+    }
+
+    #[tokio::test]
+    async fn upserts_schema() {
+        let s = state().await;
+        call(s.clone(), u(), json!({ "content": "v1" })).await.unwrap();
+        let got = llm_memory_storage::schemas::get(&s.pool, Scope::Personal, "u1").await.unwrap();
+        assert_eq!(got.as_deref(), Some("v1"));
+    }
 }
