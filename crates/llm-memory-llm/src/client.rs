@@ -3,7 +3,7 @@ use crate::error::LlmError;
 
 #[derive(Debug, Clone)]
 pub struct Message {
-    pub role: &'static str,    // "user" or "assistant"
+    pub role: String,         // "user" or "assistant"
     pub content: String,
 }
 

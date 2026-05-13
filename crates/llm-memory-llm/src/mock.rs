@@ -25,10 +25,17 @@ impl MockClient {
 impl AnthropicClient for MockClient {
     async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse, LlmError> {
         self.captured.lock().await.push(req);
-        let resp = self.responses.lock().await.remove(0);
+        let mut responses = self.responses.lock().await;
+        if responses.is_empty() {
+            return Err(LlmError::Api {
+                status: 500,
+                message: "mock: no response queued".into(),
+            });
+        }
+        let resp = responses.remove(0);
         match resp {
             Ok(r) => Ok(r),
-            Err(e) => Err(LlmError::Api(e)),
+            Err(e) => Err(LlmError::Api { status: 500, message: e }),
         }
     }
 }
@@ -47,5 +54,14 @@ mod tests {
         }).await.unwrap();
         assert_eq!(r.content, "hello");
         assert_eq!(m.captured().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mock_returns_error_when_no_response_queued() {
+        let m = MockClient::new();
+        let r = m.complete(CompleteRequest {
+            model: "x".into(), system: "".into(), messages: vec![], max_tokens: 10,
+        }).await;
+        assert!(r.is_err());
     }
 }
