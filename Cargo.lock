@@ -767,6 +767,18 @@ version = "0.0.0"
 [[package]]
 name = "llm-memory-coordinator"
 version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "llm-memory-core",
+ "llm-memory-llm",
+ "llm-memory-storage",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "llm-memory-core"
