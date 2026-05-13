@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - DATABASE_URL=sqlite:///data/db.sqlite
+      - BIND_ADDR=0.0.0.0:8080
+      - PUBLIC_URL=${PUBLIC_URL}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}
+      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
+      - JWT_SIGNING_KEY_v1=${JWT_SIGNING_KEY_v1}
+      - TRUSTED_PROXY_COUNT=${TRUSTED_PROXY_COUNT:-1}
+      - RUST_LOG=${RUST_LOG:-info}
+    volumes:
+      - data:/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  litestream:
+    image: litestream/litestream:0.3.13
+    command: ["replicate"]
+    volumes:
+      - data:/data
+      - ./litestream.yml:/etc/litestream.yml:ro
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/etc/gcp-sa.json:ro
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/etc/gcp-sa.json
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  data:
