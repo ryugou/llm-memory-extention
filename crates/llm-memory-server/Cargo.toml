@@ -30,3 +30,4 @@ sqlx.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
+base64 = { workspace = true }

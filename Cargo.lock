@@ -1193,6 +1193,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-extra",
+ "base64 0.22.1",
  "llm-memory-auth",
  "llm-memory-coordinator",
  "llm-memory-core",

@@ -1,3 +1,4 @@
+pub mod account;
 pub mod app;
 pub mod config;
 pub mod mcp;

@@ -62,9 +62,10 @@ pub fn build_router(state: AppState) -> Router {
     );
     let as_router = llm_memory_auth::authorization_server::router().with_state(as_state);
 
-    // /mcp requires auth; /healthz does not.
-    let mcp_router = Router::new()
+    // /mcp and /v1/account require auth; /healthz does not.
+    let protected_router = Router::new()
         .route("/mcp", axum::routing::post(crate::mcp::transport::handle))
+        .route("/v1/account", axum::routing::delete(crate::account::delete_me))
         .route_layer(axum::middleware::from_fn_with_state(
             state.jwt_keys.clone(),
             llm_memory_auth::middleware::require_auth,
@@ -73,7 +74,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .merge(as_router)
-        .merge(mcp_router)
+        .merge(protected_router)
         .route("/healthz", get(healthz))
         .route("/metrics", axum::routing::get(crate::metrics::handler))
         .with_state(state)
