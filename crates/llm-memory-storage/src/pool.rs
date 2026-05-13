@@ -21,10 +21,7 @@ pub async fn init_pool(url: &str) -> Result<SqlitePool, StorageError> {
         .execute(&pool)
         .await?;
 
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
     Ok(pool)
 }
