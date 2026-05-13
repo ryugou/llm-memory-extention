@@ -1,3 +1,4 @@
+use crate::id::SharedMemoryId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -36,6 +37,10 @@ impl OwnerKey {
     pub fn personal(user_id: impl Into<String>) -> Self {
         Self { scope: Scope::Personal, owner_id: user_id.into() }
     }
+    pub fn shared(shared_memory_id: SharedMemoryId) -> Self {
+        Self { scope: Scope::Shared, owner_id: shared_memory_id.as_str().to_string() }
+    }
+    pub fn owner_id(&self) -> &str { &self.owner_id }
 }
 
 #[cfg(test)]
@@ -53,5 +58,14 @@ mod tests {
         let a = OwnerKey::personal("u1");
         let b = OwnerKey::personal("u1");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn owner_key_shared_from_validated_id() {
+        use crate::id::SharedMemoryId;
+        let sm = SharedMemoryId::parse("company-wide").unwrap();
+        let k = OwnerKey::shared(sm);
+        assert_eq!(k.scope, Scope::Shared);
+        assert_eq!(k.owner_id(), "company-wide");
     }
 }
