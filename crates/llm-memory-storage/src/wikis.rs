@@ -101,4 +101,43 @@ mod tests {
         upsert(&pool, Scope::Personal, "u1", "alpha", "x", "[]", 1).await.unwrap();
         assert_eq!(list_concepts(&pool, Scope::Personal, "u1").await.unwrap(), vec!["alpha", "zeta"]);
     }
+
+    #[tokio::test]
+    async fn get_returns_none_when_missing() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let w = get(&pool, Scope::Personal, "u1", "missing").await.unwrap();
+        assert!(w.is_none());
+    }
+
+    #[tokio::test]
+    async fn count_concepts_reflects_inserts() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        assert_eq!(count_concepts(&pool, Scope::Personal, "u1").await.unwrap(), 0);
+        upsert(&pool, Scope::Personal, "u1", "c1", "x", "[]", 1).await.unwrap();
+        upsert(&pool, Scope::Personal, "u1", "c2", "x", "[]", 1).await.unwrap();
+        assert_eq!(count_concepts(&pool, Scope::Personal, "u1").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_for_owner_returns_full_wikis() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        upsert(&pool, Scope::Personal, "u1", "alpha", "content-a", r#"["raw1"]"#, 100).await.unwrap();
+        let all = list_for_owner(&pool, Scope::Personal, "u1").await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].content, "content-a");
+        assert_eq!(all[0].source_refs, r#"["raw1"]"#);
+    }
+
+    #[tokio::test]
+    async fn owner_isolation_in_personal_scope() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        upsert(&pool, Scope::Personal, "u1", "shared-name", "u1-content", "[]", 1).await.unwrap();
+        upsert(&pool, Scope::Personal, "u2", "shared-name", "u2-content", "[]", 1).await.unwrap();
+        let u1 = get(&pool, Scope::Personal, "u1", "shared-name").await.unwrap().unwrap();
+        let u2 = get(&pool, Scope::Personal, "u2", "shared-name").await.unwrap().unwrap();
+        assert_eq!(u1.content, "u1-content");
+        assert_eq!(u2.content, "u2-content");
+        assert_eq!(list_concepts(&pool, Scope::Personal, "u1").await.unwrap(), vec!["shared-name"]);
+        assert_eq!(count_concepts(&pool, Scope::Personal, "u1").await.unwrap(), 1);
+    }
 }
