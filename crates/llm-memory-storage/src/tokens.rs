@@ -21,7 +21,7 @@ pub async fn validate_refresh(pool: &SqlitePool, token: &str, now: i64) -> Resul
         "SELECT user_id, client_id, expires_at, revoked_at FROM tokens WHERE refresh_token = ?",
     ).bind(token).fetch_optional(pool).await?;
     Ok(row.and_then(|(u, c, exp, rev)| {
-        if rev.is_some() || exp < now { None } else { Some((u, c)) }
+        if rev.is_some() || exp <= now { None } else { Some((u, c)) }
     }))
 }
 
@@ -58,5 +58,15 @@ mod tests {
         create_refresh(&pool, "tok-exp", &user.id, &client.id, 1_000_000_000_000).await.unwrap();
         // now > expires_at
         assert_eq!(validate_refresh(&pool, "tok-exp", 1_500_000_000_000).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn validate_at_exact_expiry_is_invalid() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let user = users::upsert(&pool, "01HJUSER0000000000000000C", "google", "sub-c", None).await.unwrap();
+        let client = oauth_clients::register(&pool, "[]", "[]", "none", None).await.unwrap();
+        create_refresh(&pool, "tok-boundary", &user.id, &client.id, 1_500_000_000_000).await.unwrap();
+        // now == expires_at
+        assert_eq!(validate_refresh(&pool, "tok-boundary", 1_500_000_000_000).await.unwrap(), None);
     }
 }
