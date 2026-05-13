@@ -10,6 +10,7 @@ use llm_memory_coordinator::worker::WorkerDeps;
 use llm_memory_llm::client_http::AnthropicHttp;
 
 use crate::config::ServerConfig;
+use crate::metrics::Metrics;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -18,6 +19,7 @@ pub struct AppState {
     pub jwt_keys: JwtKeys,
     pub cfg: Arc<ServerConfig>,
     pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    pub metrics: Arc<Metrics>,
 }
 
 pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
@@ -38,6 +40,7 @@ pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
         jwt_keys,
         cfg: Arc::new(cfg),
         rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
+        metrics: Arc::new(Metrics::new()),
     })
 }
 
@@ -72,6 +75,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(as_router)
         .merge(mcp_router)
         .route("/healthz", get(healthz))
+        .route("/metrics", axum::routing::get(crate::metrics::handler))
         .with_state(state)
 }
 
