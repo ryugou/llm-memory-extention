@@ -1,0 +1,6 @@
+[package]
+name = "llm-memory-llm"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,10 @@
+[package]
+name = "llm-memory-server"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "llm-memory-server"
+path = "src/main.rs"
+
+[dependencies]

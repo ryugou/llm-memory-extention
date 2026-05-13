@@ -1,0 +1,6 @@
+[package]
+name = "llm-memory-auth"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
