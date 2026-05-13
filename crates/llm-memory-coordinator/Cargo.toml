@@ -14,6 +14,7 @@ tracing.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 sqlx.workspace = true
+futures = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }
