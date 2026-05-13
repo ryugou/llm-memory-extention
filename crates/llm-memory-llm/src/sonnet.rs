@@ -37,7 +37,7 @@ impl<'a, C: AnthropicClient> SonnetSynthesizer<'a, C> {
         }).await?;
 
         let json_text = extract_json(&resp.content)
-            .ok_or_else(|| LlmError::Api { status: 0, message: format!("sonnet: no JSON in response: {}", resp.content) })?;
+            .ok_or_else(|| LlmError::Parse(format!("sonnet: no JSON in response: {}", resp.content)))?;
         Ok(serde_json::from_str(&json_text)?)
     }
 }

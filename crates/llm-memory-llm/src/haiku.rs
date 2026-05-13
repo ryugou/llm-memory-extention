@@ -33,7 +33,7 @@ impl<'a, C: AnthropicClient> HaikuExtractor<'a, C> {
         }).await?;
 
         let json_text = extract_json(&resp.content)
-            .ok_or_else(|| LlmError::Api { status: 0, message: format!("haiku: no JSON in response: {}", resp.content) })?;
+            .ok_or_else(|| LlmError::Parse(format!("haiku: no JSON in response: {}", resp.content)))?;
         let parsed: AffectedConcepts = serde_json::from_str(&json_text)?;
         Ok(parsed)
     }
