@@ -17,6 +17,7 @@ pub struct AppState {
     pub coordinator: Coordinator<AnthropicHttp>,
     pub jwt_keys: JwtKeys,
     pub cfg: Arc<ServerConfig>,
+    pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
 }
 
 pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
@@ -36,6 +37,7 @@ pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
         coordinator,
         jwt_keys,
         cfg: Arc::new(cfg),
+        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
     })
 }
 

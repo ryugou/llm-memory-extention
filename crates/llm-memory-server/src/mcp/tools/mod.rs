@@ -39,6 +39,10 @@ pub async fn call(
 ) -> Json<JsonRpcResponse> {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let tier = crate::rate_limit::tier_of(name);
+    if !state.rate_limiter.check(&user.user_id, tier) {
+        return Json(JsonRpcResponse::error(id, -32000, format!("rate_limited: {} tier", tier.name)));
+    }
     let result: Result<Value> = match name {
         "raw_append" => raw_append::call(state, user, args).await,
         "raw_read" => raw_read::call(state, user, args).await,
