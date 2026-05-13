@@ -40,6 +40,23 @@ pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    // AS state (separate from AppState — has its own session storage).
+    let google = std::sync::Arc::new(llm_memory_auth::google::GoogleClient::new(
+        llm_memory_auth::google::GoogleConfig {
+            client_id: state.cfg.google_client_id.clone(),
+            client_secret: state.cfg.google_client_secret.clone(),
+            redirect_uri: format!("{}/oauth/callback/google", state.cfg.public_url),
+        },
+    ));
+    let as_state = llm_memory_auth::authorization_server::AsState::new(
+        state.pool.clone(),
+        state.jwt_keys.clone(),
+        google,
+        state.cfg.public_url.clone(),
+        state.cfg.trusted_proxy_count,
+    );
+    let as_router = llm_memory_auth::authorization_server::router().with_state(as_state);
+
     // /mcp requires auth; /healthz does not.
     let mcp_router = Router::new()
         .route("/mcp", axum::routing::post(crate::mcp::transport::handle))
@@ -50,6 +67,7 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state.clone());
 
     Router::new()
+        .merge(as_router)
         .merge(mcp_router)
         .route("/healthz", get(healthz))
         .with_state(state)
