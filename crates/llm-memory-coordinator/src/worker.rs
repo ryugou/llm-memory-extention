@@ -138,7 +138,6 @@ async fn synthesize_concepts<C: AnthropicClient>(
     let new_raws_owned = new_raws.to_vec();
     stream::iter(affected.iter().cloned())
         .for_each_concurrent(CONCEPT_CONCURRENCY, |concept| {
-            let deps = deps;
             let key = key_for_stream.clone();
             let new_raws = new_raws_owned.clone();
             async move {
@@ -248,9 +247,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_recovers_from_panic() {
+    async fn worker_recovers_from_inner_error() {
         // mock に何も push しない → 最初の complete() で LlmError::Api を返す。
-        // しかし spawn_worker は panic でも非 panic でも state を idle に戻すはず。
+        // spawn_worker は inner error でも state を idle に戻すはず。
         let pool = init_pool("sqlite::memory:").await.unwrap();
         let mock = Arc::new(MockClient::new());
         let deps_arc = deps(pool.clone(), mock).await;
@@ -271,5 +270,42 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("state still running after worker should have ended");
+    }
+
+    struct PanicClient;
+
+    #[async_trait::async_trait]
+    impl llm_memory_llm::client::AnthropicClient for PanicClient {
+        async fn complete(
+            &self,
+            _req: llm_memory_llm::client::CompleteRequest,
+        ) -> Result<llm_memory_llm::client::CompleteResponse, llm_memory_llm::error::LlmError> {
+            panic!("intentional panic for test");
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_recovers_from_real_panic() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let llm = Arc::new(PanicClient);
+        let deps_arc = Arc::new(WorkerDeps {
+            pool: pool.clone(), state: StateMap::new(), llm,
+            model_haiku: "haiku".into(), model_sonnet: "sonnet".into(),
+        });
+        insert(&pool, NewRaw {
+            scope: Scope::Personal, owner_id: "u-panic", title: "x", content: "y",
+            source: "m", tags_json: None, created_by: Some("u-panic"),
+        }).await.unwrap();
+
+        let key = OwnerKey::personal("u-panic");
+        deps_arc.state.try_start(&key, RebuildMode::Append).await;
+        spawn_worker(deps_arc.clone(), key.clone(), RebuildMode::Append);
+
+        // Wait up to ~5s for state to be released
+        for _ in 0..50 {
+            if !deps_arc.state.is_running(&key).await { return; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("state still running after PanicClient should have panicked the worker");
     }
 }
