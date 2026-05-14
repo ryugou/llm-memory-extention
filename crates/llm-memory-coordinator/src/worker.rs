@@ -29,7 +29,13 @@ pub struct WorkerDeps<C: AnthropicClient + 'static> {
 }
 
 /// Spawn a rebuild worker. Uses an outer tokio task to capture panics via JoinHandle::await
-/// (§7.3 of the spec). Always restores state.running = false on completion, error, or panic.
+/// (§7.3 of the spec).
+///
+/// 重要: `force_idle` は inner が panic / Err で異常終了したときのみ呼ぶ。
+/// 正常終了 (Ok(Ok(()))) では `run_worker` 内の `mark_idle_or_continue` で既に
+/// running フラグが下りており、その直後に新規 append が来て新 worker が起動した場合、
+/// ここで force_idle を呼ぶと「新 worker の running フラグまで巻き戻して clear」してしまい
+/// owner ごとに複数 worker が並走する race が発生する。
 pub fn spawn_worker<C: AnthropicClient + 'static>(
     deps: Arc<WorkerDeps<C>>,
     key: OwnerKey,
@@ -47,50 +53,130 @@ pub fn spawn_worker<C: AnthropicClient + 'static>(
             async move { run_worker(deps, key, initial_mode).await }
         });
 
-        match inner.await {
-            Ok(Ok(())) => {}
+        let join_result = inner.await;
+        deps_outer.metrics.rebuild_in_flight_dec();
+
+        match join_result {
+            Ok(Ok(())) => {
+                // 正常終了: run_worker 内で mark_idle_or_continue 済み。
+                // ここで force_idle を呼ぶと後続 worker の状態を破壊するので何もしない。
+            }
             Ok(Err(e)) => {
                 error!(owner = ?key_outer, error = ?e, "rebuild worker returned error");
                 deps_outer.metrics.inc_rebuild_failed();
+                deps_outer.state.force_idle(&key_outer).await;
             }
             Err(join_err) if join_err.is_panic() => {
                 error!(owner = ?key_outer, ?join_err, "rebuild worker panicked");
                 deps_outer.metrics.inc_rebuild_failed();
+                deps_outer.state.force_idle(&key_outer).await;
             }
             Err(e) => {
                 error!(owner = ?key_outer, error = ?e, "rebuild worker join error");
                 deps_outer.metrics.inc_rebuild_failed();
+                deps_outer.state.force_idle(&key_outer).await;
             }
         }
-
-        deps_outer.metrics.rebuild_in_flight_dec();
-        // Always release the slot. force_idle is idempotent.
-        deps_outer.state.force_idle(&key_outer).await;
     });
 }
 
 /// Outer loop: run a session, then check manual_pending to decide whether to continue.
 /// state.running is managed by the StateMap, not by us directly (except via force_idle in the outer wrapper).
+///
+/// drain cap (MAX_ITERATIONS 到達) で `SessionOutcome::DrainCapped` が返ってきた場合は、
+/// `mark_idle_or_continue` を経由せずに即座に新規 Append session を起動して残 raw を捌く。
+/// これにより「次の append 通知が来るまで残 raw が放置される」問題を防ぐ。
+///
+/// Race 対策: worker 実行中に届いた `try_start(Append)` は state map 内で `append_missed=true`
+/// を立て、`mark_idle_or_continue` がそのフラグを mutex 内で原子的に拾い上げて
+/// `Some(Append)` を返す。これにより running=true の窓で届いた append 通知が取りこぼされず、
+/// MAX_CONSECUTIVE_CAPS 到達時の解放直前の race も含めてカバーされる。
+///
+/// Accepted risk: 連続 cap が `MAX_CONSECUTIVE_CAPS` を超えた場合、その時点で append_missed も
+/// manual_pending も無ければ worker を解放する。極端な負荷で raw が積まれ続けたまま誰も
+/// notify_append を呼ばない異常系では残 raw が次の append/manual rebuild まで放置される
+/// 可能性があるが、これは spec § 7.3 の安全停止要件と整合。運用側はメトリクス
+/// `rebuild_drain_capped` のアラート設定と manual rebuild 経路でフォローする。
 async fn run_worker<C: AnthropicClient + 'static>(
     deps: Arc<WorkerDeps<C>>,
     key: OwnerKey,
     initial_mode: RebuildMode,
 ) -> Result<(), CoordinatorError> {
     let mut next_mode: Option<RebuildMode> = Some(initial_mode);
+    let mut consecutive_caps: usize = 0;
     while let Some(mode) = next_mode.take() {
-        run_session(&deps, &key, mode).await?;
-        next_mode = deps.state.mark_idle_or_continue(&key).await;
+        let outcome = run_session(&deps, &key, mode).await?;
+        match outcome {
+            SessionOutcome::Done => {
+                consecutive_caps = 0;
+                next_mode = deps.state.mark_idle_or_continue(&key).await;
+            }
+            SessionOutcome::DrainCapped => {
+                consecutive_caps += 1;
+                if consecutive_caps >= MAX_CONSECUTIVE_CAPS {
+                    // 安全停止前に残 raw 数を取得して error ログ + アラート用に出す。
+                    // DB エラーは黙殺せず remaining_raws_lookup_error として明示。
+                    let watermark =
+                        wikis::max_last_rebuilt_at(&deps.pool, key.scope, &key.owner_id).await?;
+                    let lookup_result =
+                        raws::list_since(&deps.pool, key.scope, &key.owner_id, watermark, now_ms())
+                            .await;
+                    match lookup_result {
+                        Ok(remaining) => error!(
+                            owner = ?key,
+                            consecutive_caps,
+                            remaining_raws = remaining.len(),
+                            "drain cap streak exceeded MAX_CONSECUTIVE_CAPS; \
+                             remaining raws will be picked up by `append_missed` race-recovery \
+                             or next append/manual rebuild. \
+                             Operator action: check `rebuild_drain_capped` metric and consider manual rebuild."
+                        ),
+                        Err(e) => error!(
+                            owner = ?key,
+                            consecutive_caps,
+                            error = ?e,
+                            "drain cap streak exceeded MAX_CONSECUTIVE_CAPS; \
+                             remaining_raws lookup failed. \
+                             Operator action: check `rebuild_drain_capped` metric and consider manual rebuild."
+                        ),
+                    }
+                    // mark_idle_or_continue は append_missed を mutex 内で原子的に拾うため、
+                    // 解放直前に来た append 通知も取りこぼさない。
+                    next_mode = deps.state.mark_idle_or_continue(&key).await;
+                } else {
+                    // mark_idle_or_continue を経由しないので running=true は維持される。
+                    // 既存 manual_pending は次 Done セッションで評価される。
+                    next_mode = Some(RebuildMode::Append);
+                }
+            }
+        }
     }
     Ok(())
 }
 
+/// run_session の終了種別。drain cap 時は呼び元 (run_worker) が即座に
+/// 次 session を Append で起こすことで残 raw を漏れなく処理させる。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionOutcome {
+    Done,
+    DrainCapped,
+}
+
+/// drain cap 後の連続継続セッションの上限。raw が無限に積まれ続ける異常系で
+/// worker が永久に走り続けるのを防ぐ安全策。
+pub const MAX_CONSECUTIVE_CAPS: usize = 3;
+
 /// One session = up to MAX_ITERATIONS drain iterations.
 /// First iteration uses `starting_mode`; subsequent iterations are Append (drain).
+///
+/// 戻り値:
+/// - `SessionOutcome::Done` — drain 完了 or affected 空 or budget reject 等で session 終了
+/// - `SessionOutcome::DrainCapped` — MAX_ITERATIONS に到達 (呼び元が即座に Append で再起動する)
 pub(crate) async fn run_session<C: AnthropicClient>(
     deps: &WorkerDeps<C>,
     key: &OwnerKey,
     starting_mode: RebuildMode,
-) -> Result<(), CoordinatorError> {
+) -> Result<SessionOutcome, CoordinatorError> {
     let mut mode = starting_mode;
     for iteration in 1..=MAX_ITERATIONS {
         let started_at = now_ms();
@@ -103,7 +189,8 @@ pub(crate) async fn run_session<C: AnthropicClient>(
             RebuildMode::Append => {
                 if new_raws.is_empty() {
                     info!(owner = ?key, "drain complete (no new raws)");
-                    return Ok(());
+                    deps.metrics.observe_drain_iterations(iteration as u64);
+                    return Ok(SessionOutcome::Done);
                 }
                 let extractor = HaikuExtractor {
                     client: deps.llm.as_ref(),
@@ -116,8 +203,16 @@ pub(crate) async fn run_session<C: AnthropicClient>(
                 let extracted = extractor
                     .extract(&titles_contents, &existing_concepts)
                     .await?;
-                let mut set: std::collections::BTreeSet<String> =
-                    extracted.affected_existing.into_iter().collect();
+                // 安全対策: Haiku が `affected_existing` に existing でない concept を入れて
+                // 返してきても、それは無視する (そうしないと set 経由で Sonnet に投げられ
+                // CONCEPT_LIMIT_PER_OWNER を bypass して wiki が新規作成されてしまう)。
+                let existing_set: std::collections::HashSet<&String> =
+                    existing_concepts.iter().collect();
+                let mut set: std::collections::BTreeSet<String> = extracted
+                    .affected_existing
+                    .into_iter()
+                    .filter(|c| existing_set.contains(c))
+                    .collect();
                 let current_count =
                     wikis::count_concepts(&deps.pool, key.scope, &key.owner_id).await?;
                 // 残り枠だけ追加。current_count=199, new=100 でも 200 までで止める。
@@ -135,18 +230,40 @@ pub(crate) async fn run_session<C: AnthropicClient>(
                     );
                 }
                 for c in extracted.new_concepts.into_iter().take(remaining) {
+                    // 既存 concept と衝突する場合は set に入れるだけで新規 count を消費しない。
                     set.insert(c);
                 }
                 set.into_iter().collect()
             }
-            RebuildMode::Manual { concept: Some(c) } => vec![c.clone()],
+            RebuildMode::Manual { concept: Some(c) } => {
+                // 既存 concept の rebuild は無条件 OK。新規 concept を Manual で
+                // 作る場合だけ CONCEPT_LIMIT_PER_OWNER をチェックして budget bypass を防ぐ。
+                let is_existing = existing_concepts.iter().any(|x| x == c);
+                if !is_existing {
+                    let current_count =
+                        wikis::count_concepts(&deps.pool, key.scope, &key.owner_id).await?;
+                    if current_count >= CONCEPT_LIMIT_PER_OWNER {
+                        warn!(
+                            owner = ?key,
+                            concept = %c,
+                            current_count,
+                            "manual rebuild of new concept rejected: concept limit reached"
+                        );
+                        // budget reject: この concept は諦めるが、同 owner の未処理 raw を
+                        // 取りこぼさないよう Append drain に遷移して継続する。
+                        mode = RebuildMode::Append;
+                        continue;
+                    }
+                }
+                vec![c.clone()]
+            }
             RebuildMode::Manual { concept: None } => existing_concepts.clone(),
         };
 
         if affected.is_empty() {
             info!(owner = ?key, "no affected concepts, ending session");
             deps.metrics.observe_drain_iterations(iteration as u64);
-            return Ok(());
+            return Ok(SessionOutcome::Done);
         }
 
         synthesize_concepts(deps, key, &affected, &new_raws, started_at).await?;
@@ -155,13 +272,20 @@ pub(crate) async fn run_session<C: AnthropicClient>(
         mode = RebuildMode::Append;
 
         if iteration == MAX_ITERATIONS {
-            warn!(owner = ?key, "drain loop hit MAX_ITERATIONS, deferring remainder");
+            warn!(
+                owner = ?key,
+                "drain loop hit MAX_ITERATIONS, deferring remainder to next Append session"
+            );
             deps.metrics.inc_rebuild_drain_capped();
             deps.metrics.observe_drain_iterations(iteration as u64);
-            return Ok(());
+            // run_worker が SessionOutcome::DrainCapped を見て即座に新規 Append session を
+            // 起動する。Manual{None} を pending に積まないので、残 raw に潜む新規 concept を
+            // Haiku で抽出する経路が維持される & 既存の manual_pending (user intent) も
+            // 破壊しない。
+            return Ok(SessionOutcome::DrainCapped);
         }
     }
-    Ok(())
+    Ok(SessionOutcome::Done)
 }
 
 async fn synthesize_concepts<C: AnthropicClient>(
@@ -173,13 +297,17 @@ async fn synthesize_concepts<C: AnthropicClient>(
 ) -> Result<(), CoordinatorError> {
     use futures::stream::{self, StreamExt};
     let key_for_stream = key.clone();
-    let new_raws_owned = new_raws.to_vec();
+    // concept ごとに new_raws を clone すると 50 raws × 100 concept = 5000 clone と
+    // メモリ過多。Arc 共有して各タスクは参照だけ持つ。
+    let new_raws_arc: Arc<Vec<raws::Raw>> = Arc::new(new_raws.to_vec());
     stream::iter(affected.iter().cloned())
         .for_each_concurrent(CONCEPT_CONCURRENCY, |concept| {
             let key = key_for_stream.clone();
-            let new_raws = new_raws_owned.clone();
+            let new_raws_ref = new_raws_arc.clone();
             async move {
-                if let Err(e) = synthesize_one(deps, &key, &concept, &new_raws, started_at).await {
+                if let Err(e) =
+                    synthesize_one(deps, &key, &concept, &new_raws_ref, started_at).await
+                {
                     error!(owner = ?key, %concept, error = ?e, "synthesize_one failed");
                     deps.metrics.inc_concept_rebuild_failed();
                 }
@@ -508,6 +636,372 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         panic!("state still running after PanicClient should have panicked the worker");
+    }
+
+    #[tokio::test]
+    async fn append_ignores_haiku_unknown_affected_existing() {
+        // Haiku が `affected_existing` に existing でない concept 名を返しても、
+        // それが synthesize 対象に混入しないこと (= Sonnet 呼び出しが発生しないこと)。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        // existing concept は無し (`existing_concepts` 空)
+        let mock = Arc::new(MockClient::new());
+        // Haiku: ありもしない "ghost" を affected_existing に入れる + new_concepts は空
+        mock.push_text(r#"{"affected_existing":["ghost"],"new_concepts":[]}"#)
+            .await;
+        // Sonnet 用の応答は push しない。もし呼ばれたら mock がエラーを返してテストで気付ける。
+
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u-ghost",
+                title: "t",
+                content: "c",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u-ghost"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let deps_arc = deps(pool.clone(), mock.clone()).await;
+        run_session(
+            &deps_arc,
+            &OwnerKey::personal("u-ghost"),
+            RebuildMode::Append,
+        )
+        .await
+        .expect("Sonnet should never be called; session should end gracefully");
+
+        // "ghost" 用 wiki は作られない
+        let w = wikis::get(&pool, Scope::Personal, "u-ghost", "ghost")
+            .await
+            .unwrap();
+        assert!(w.is_none(), "ghost concept must not be synthesized");
+
+        // mock は Haiku の 1 回だけ呼ばれた
+        let cap = mock.captured().await;
+        assert_eq!(cap.len(), 1, "only Haiku should have been called");
+        assert_eq!(cap[0].model, "haiku");
+    }
+
+    #[tokio::test]
+    async fn manual_single_new_concept_rejected_when_limit_reached() {
+        // CONCEPT_LIMIT_PER_OWNER 個まで埋めた状態で Manual{Some("brand-new")} を
+        // 呼んでも、新規 concept は budget で弾かれて Sonnet が呼ばれないこと。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        for i in 0..CONCEPT_LIMIT_PER_OWNER {
+            wikis::upsert(&pool, Scope::Personal, "u1", &format!("c{i}"), "x", "[]", 1)
+                .await
+                .unwrap();
+        }
+        let mock = Arc::new(MockClient::new());
+        // Sonnet 応答を push しない: もし呼ばれたら LlmError で worker が Err になり気付ける。
+
+        let deps_arc = deps(pool.clone(), mock.clone()).await;
+        run_session(
+            &deps_arc,
+            &OwnerKey::personal("u1"),
+            RebuildMode::Manual {
+                concept: Some("brand-new".into()),
+            },
+        )
+        .await
+        .expect("should return Ok without invoking Sonnet when budget exhausted");
+
+        // 新規 concept は作成されていない
+        let w = wikis::get(&pool, Scope::Personal, "u1", "brand-new")
+            .await
+            .unwrap();
+        assert!(w.is_none(), "brand-new must not be synthesized");
+
+        // 総 concept 数は変わらず
+        let count = wikis::count_concepts(&pool, Scope::Personal, "u1")
+            .await
+            .unwrap();
+        assert_eq!(count, CONCEPT_LIMIT_PER_OWNER);
+
+        // LLM は一度も呼ばれない (Manual{Some} は Haiku をスキップする)
+        let cap = mock.captured().await;
+        assert!(cap.is_empty(), "no LLM call expected");
+    }
+
+    #[tokio::test]
+    async fn manual_single_new_concept_reject_falls_through_to_append_drain() {
+        // Manual{Some(brand-new)} が budget で reject されたあと、同 session 内で
+        // Append drain に遷移して未処理 raw を Haiku → Sonnet で処理すること。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        for i in 0..CONCEPT_LIMIT_PER_OWNER {
+            wikis::upsert(&pool, Scope::Personal, "u1", &format!("c{i}"), "x", "[]", 1)
+                .await
+                .unwrap();
+        }
+        // 未処理 raw を 1 件投入
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "t",
+                content: "c",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mock = Arc::new(MockClient::new());
+        // Append drain 1 回目: Haiku → existing c0 を更新
+        mock.push_text(r#"{"affected_existing":["c0"],"new_concepts":[]}"#)
+            .await;
+        // Sonnet: c0 を更新
+        mock.push_text(r#"{"content":"updated","source_refs":[]}"#)
+            .await;
+
+        let deps_arc = deps(pool.clone(), mock.clone()).await;
+        let outcome = run_session(
+            &deps_arc,
+            &OwnerKey::personal("u1"),
+            RebuildMode::Manual {
+                concept: Some("brand-new".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, SessionOutcome::Done);
+
+        // brand-new は作成されない
+        let w = wikis::get(&pool, Scope::Personal, "u1", "brand-new")
+            .await
+            .unwrap();
+        assert!(w.is_none());
+        // c0 は drain で更新された
+        let c0 = wikis::get(&pool, Scope::Personal, "u1", "c0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c0.content, "updated");
+        // Haiku + Sonnet が 1 回ずつ呼ばれている
+        assert_eq!(mock.captured().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn manual_single_existing_concept_proceeds_at_limit() {
+        // CONCEPT_LIMIT_PER_OWNER 個埋まっていても、既存 concept の rebuild は通る。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        for i in 0..CONCEPT_LIMIT_PER_OWNER {
+            wikis::upsert(
+                &pool,
+                Scope::Personal,
+                "u1",
+                &format!("c{i}"),
+                "old",
+                "[]",
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        let mock = Arc::new(MockClient::new());
+        mock.push_text(r#"{"content":"new","source_refs":[]}"#)
+            .await;
+
+        let deps_arc = deps(pool.clone(), mock.clone()).await;
+        run_session(
+            &deps_arc,
+            &OwnerKey::personal("u1"),
+            RebuildMode::Manual {
+                concept: Some("c0".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 既存 concept "c0" は更新されている
+        let w = wikis::get(&pool, Scope::Personal, "u1", "c0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.content, "new");
+    }
+
+    #[tokio::test]
+    async fn append_missed_recovered_even_at_consecutive_caps_boundary() {
+        // 安全停止分岐 (MAX_CONSECUTIVE_CAPS 到達 → mark_idle_or_continue) でも、
+        // 直前に届いた append 通知が append_missed として記録されていれば、
+        // mark_idle_or_continue が mutex 内で原子的に拾って Some(Append) を返すこと。
+        // run_worker を直接呼ばず、state.rs の API で境界を直接検証する。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let mock = Arc::new(MockClient::new());
+        let deps_arc = deps(pool.clone(), mock).await;
+        let key = OwnerKey::personal("u-boundary");
+
+        // worker A running 中の状態を作る
+        deps_arc.state.try_start(&key, RebuildMode::Append).await;
+        // remaining_raws lookup している瞬間に append 通知が来た想定
+        let r = deps_arc.state.try_start(&key, RebuildMode::Append).await;
+        assert_eq!(r, crate::state::StartOutcome::AlreadyRunning);
+
+        // この時点で run_worker の DrainCapped 安全停止分岐が
+        // mark_idle_or_continue を呼ぶのと同じシーケンスを直接踏む
+        let cont = deps_arc.state.mark_idle_or_continue(&key).await;
+        assert_eq!(
+            cont,
+            Some(RebuildMode::Append),
+            "append_missed must be recovered atomically even at MAX_CONSECUTIVE_CAPS boundary"
+        );
+        // running は維持され (Some を返したので)、append が取りこぼされていない
+        assert!(deps_arc.state.is_running(&key).await);
+    }
+
+    #[tokio::test]
+    async fn append_missed_is_recovered_after_session_done() {
+        // worker A 実行中に届いた append 通知 (= AlreadyRunning) は append_missed として
+        // 記録され、session 終了時の mark_idle_or_continue で Some(Append) として
+        // 取り出されて drain が継続すること。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let mock = Arc::new(MockClient::new());
+        // session 1: 空 extraction → Done
+        mock.push_text(r#"{"affected_existing":[],"new_concepts":[]}"#)
+            .await;
+        // session 2 (append_missed 経由で起動): 空 extraction → Done
+        mock.push_text(r#"{"affected_existing":[],"new_concepts":[]}"#)
+            .await;
+
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u-missed",
+                title: "t",
+                content: "c",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u-missed"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let deps_arc = deps(pool.clone(), mock.clone()).await;
+        let key = OwnerKey::personal("u-missed");
+        // worker A claim
+        deps_arc.state.try_start(&key, RebuildMode::Append).await;
+        // running 中に append 通知が落ちる → append_missed = true
+        let r = deps_arc.state.try_start(&key, RebuildMode::Append).await;
+        assert_eq!(r, crate::state::StartOutcome::AlreadyRunning);
+
+        // run_worker を起動 (run_worker 内の while ループが mark_idle_or_continue で
+        // append_missed を拾って session 2 を実行する)
+        spawn_worker(deps_arc.clone(), key.clone(), RebuildMode::Append);
+
+        // 両 session 完了で running=false に戻る
+        let mut ended = false;
+        for _ in 0..100 {
+            if !deps_arc.state.is_running(&key).await {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            ended,
+            "worker should release running after both sessions complete"
+        );
+
+        // Haiku が 2 回呼ばれたはず (session 1 と append_missed-recovery session 2)
+        let cap = mock.captured().await;
+        assert_eq!(cap.len(), 2, "two haiku calls expected (one per session)");
+    }
+
+    #[tokio::test]
+    async fn append_session_returns_done_when_no_raws() {
+        // SessionOutcome::Done を返す基本パス: new_raws 空 → drain complete。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let mock = Arc::new(MockClient::new());
+        let deps_arc = deps(pool.clone(), mock).await;
+        let outcome = run_session(&deps_arc, &OwnerKey::personal("u1"), RebuildMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(outcome, SessionOutcome::Done);
+    }
+
+    #[tokio::test]
+    async fn manual_full_session_returns_done() {
+        // Manual{None} で 0 existing concept のパス → affected 空で Done を返すこと。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let mock = Arc::new(MockClient::new());
+        let deps_arc = deps(pool.clone(), mock).await;
+        let outcome = run_session(
+            &deps_arc,
+            &OwnerKey::personal("u1"),
+            RebuildMode::Manual { concept: None },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, SessionOutcome::Done);
+    }
+
+    #[tokio::test]
+    async fn normal_exit_does_not_clobber_subsequent_workers_state() {
+        // 1) worker A 起動 → 正常終了 (Haiku が空応答 → drain complete)
+        // 2) outer wrapper の await が終わった後も、後続の worker B の state を
+        //    破壊しないこと (= 正常終了パスで force_idle が呼ばれていないこと) を検証。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let mock = Arc::new(MockClient::new());
+        // worker A 用: 空 extraction → drain complete
+        mock.push_text(r#"{"affected_existing":[],"new_concepts":[]}"#)
+            .await;
+
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u-race",
+                title: "x",
+                content: "y",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u-race"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let deps_arc = deps(pool.clone(), mock).await;
+        let key = OwnerKey::personal("u-race");
+        deps_arc.state.try_start(&key, RebuildMode::Append).await;
+        spawn_worker(deps_arc.clone(), key.clone(), RebuildMode::Append);
+
+        // A が正常終了して running=false に戻ること
+        let mut ended = false;
+        for _ in 0..50 {
+            if !deps_arc.state.is_running(&key).await {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(ended, "worker A should release running flag normally");
+
+        // 別経路で worker B 相当の状態を作る (try_start で running=true)
+        let started = deps_arc
+            .state
+            .try_start(&key, RebuildMode::Manual { concept: None })
+            .await;
+        assert!(matches!(started, crate::state::StartOutcome::Started(_)));
+        assert!(deps_arc.state.is_running(&key).await, "B should be running");
+
+        // 少し待って、A の outer wrapper が遅延 force_idle を呼んでいないことを確認。
+        // (正常終了パスで force_idle を消したので、ここで running が落ちないはず)
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            deps_arc.state.is_running(&key).await,
+            "A's outer wrapper must not clobber B's running flag"
+        );
     }
 
     #[tokio::test]
