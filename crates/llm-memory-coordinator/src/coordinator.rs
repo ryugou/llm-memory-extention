@@ -61,6 +61,7 @@ pub enum ManualOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{MetricsSink, NoopMetricsSink};
     use crate::state::StateMap;
     use llm_memory_llm::mock::MockClient;
     use llm_memory_storage::pool::init_pool;
@@ -74,6 +75,7 @@ mod tests {
             llm: mock,
             model_haiku: "haiku".into(),
             model_sonnet: "sonnet".into(),
+            metrics: Arc::new(NoopMetricsSink) as Arc<dyn MetricsSink>,
         });
         Coordinator::new(deps)
     }

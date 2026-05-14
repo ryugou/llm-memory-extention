@@ -25,12 +25,15 @@ pub struct AppState {
 pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
     let pool = llm_memory_storage::pool::init_pool(&cfg.database_url).await?;
     let llm = Arc::new(AnthropicHttp::new(cfg.anthropic_api_key.clone()));
+    // Metrics は worker と /metrics ハンドラの両方で同じインスタンスを共有する。
+    let metrics = Arc::new(Metrics::new());
     let deps = Arc::new(WorkerDeps {
         pool: pool.clone(),
         state: StateMap::new(),
         llm,
         model_haiku: cfg.model_haiku.clone(),
         model_sonnet: cfg.model_sonnet.clone(),
+        metrics: metrics.clone() as Arc<dyn llm_memory_coordinator::metrics::MetricsSink>,
     });
     let coordinator = Coordinator::new(deps);
     let jwt_keys = JwtKeys::from_env();
@@ -40,7 +43,7 @@ pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
         jwt_keys,
         cfg: Arc::new(cfg),
         rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
-        metrics: Arc::new(Metrics::new()),
+        metrics,
     })
 }
 

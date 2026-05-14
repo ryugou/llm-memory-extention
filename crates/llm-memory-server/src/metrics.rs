@@ -1,3 +1,4 @@
+use llm_memory_coordinator::metrics::MetricsSink;
 use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
 
 #[derive(Clone)]
@@ -97,6 +98,29 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// coordinator crate からの呼び出しを Prometheus メトリクスへ橋渡しする。
+/// trait は coordinator 側に定義 (循環依存回避)。
+impl MetricsSink for Metrics {
+    fn inc_rebuild_failed(&self) {
+        self.rebuild_failed.inc();
+    }
+    fn inc_concept_rebuild_failed(&self) {
+        self.concept_rebuild_failed.inc();
+    }
+    fn inc_rebuild_drain_capped(&self) {
+        self.rebuild_drain_capped.inc();
+    }
+    fn observe_drain_iterations(&self, n: u64) {
+        self.rebuild_drain_iterations.observe(n as f64);
+    }
+    fn rebuild_in_flight_inc(&self) {
+        self.rebuild_in_flight.inc();
+    }
+    fn rebuild_in_flight_dec(&self) {
+        self.rebuild_in_flight.dec();
     }
 }
 

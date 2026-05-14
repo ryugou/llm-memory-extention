@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 
 use crate::error::CoordinatorError;
 use crate::input_builder;
+use crate::metrics::MetricsSink;
 use crate::state::{RebuildMode, StateMap};
 
 pub const MAX_ITERATIONS: usize = 10;
@@ -23,6 +24,8 @@ pub struct WorkerDeps<C: AnthropicClient + 'static> {
     pub llm: Arc<C>,
     pub model_haiku: String,
     pub model_sonnet: String,
+    /// 外部メトリクス層への薄い抽象。テストでは `NoopMetricsSink` を渡す。
+    pub metrics: Arc<dyn MetricsSink>,
 }
 
 /// Spawn a rebuild worker. Uses an outer tokio task to capture panics via JoinHandle::await
@@ -34,6 +37,7 @@ pub fn spawn_worker<C: AnthropicClient + 'static>(
 ) {
     let deps_outer = deps.clone();
     let key_outer = key.clone();
+    deps_outer.metrics.rebuild_in_flight_inc();
 
     tokio::spawn(async move {
         // Spawn the actual work as a child task so we can await its JoinHandle and catch panics.
@@ -45,13 +49,21 @@ pub fn spawn_worker<C: AnthropicClient + 'static>(
 
         match inner.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => error!(owner = ?key_outer, error = ?e, "rebuild worker returned error"),
+            Ok(Err(e)) => {
+                error!(owner = ?key_outer, error = ?e, "rebuild worker returned error");
+                deps_outer.metrics.inc_rebuild_failed();
+            }
             Err(join_err) if join_err.is_panic() => {
                 error!(owner = ?key_outer, ?join_err, "rebuild worker panicked");
+                deps_outer.metrics.inc_rebuild_failed();
             }
-            Err(e) => error!(owner = ?key_outer, error = ?e, "rebuild worker join error"),
+            Err(e) => {
+                error!(owner = ?key_outer, error = ?e, "rebuild worker join error");
+                deps_outer.metrics.inc_rebuild_failed();
+            }
         }
 
+        deps_outer.metrics.rebuild_in_flight_dec();
         // Always release the slot. force_idle is idempotent.
         deps_outer.state.force_idle(&key_outer).await;
     });
@@ -133,6 +145,7 @@ pub(crate) async fn run_session<C: AnthropicClient>(
 
         if affected.is_empty() {
             info!(owner = ?key, "no affected concepts, ending session");
+            deps.metrics.observe_drain_iterations(iteration as u64);
             return Ok(());
         }
 
@@ -143,6 +156,8 @@ pub(crate) async fn run_session<C: AnthropicClient>(
 
         if iteration == MAX_ITERATIONS {
             warn!(owner = ?key, "drain loop hit MAX_ITERATIONS, deferring remainder");
+            deps.metrics.inc_rebuild_drain_capped();
+            deps.metrics.observe_drain_iterations(iteration as u64);
             return Ok(());
         }
     }
@@ -166,6 +181,7 @@ async fn synthesize_concepts<C: AnthropicClient>(
             async move {
                 if let Err(e) = synthesize_one(deps, &key, &concept, &new_raws, started_at).await {
                     error!(owner = ?key, %concept, error = ?e, "synthesize_one failed");
+                    deps.metrics.inc_concept_rebuild_failed();
                 }
             }
         })
@@ -236,6 +252,7 @@ async fn synthesize_one<C: AnthropicClient>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{MetricsSink, NoopMetricsSink};
     use llm_memory_core::scope::Scope;
     use llm_memory_llm::mock::MockClient;
     use llm_memory_storage::pool::init_pool;
@@ -248,6 +265,7 @@ mod tests {
             llm: mock,
             model_haiku: "haiku".into(),
             model_sonnet: "sonnet".into(),
+            metrics: Arc::new(NoopMetricsSink) as Arc<dyn MetricsSink>,
         })
     }
 
@@ -461,6 +479,7 @@ mod tests {
             llm,
             model_haiku: "haiku".into(),
             model_sonnet: "sonnet".into(),
+            metrics: Arc::new(NoopMetricsSink) as Arc<dyn MetricsSink>,
         });
         insert(
             &pool,
@@ -489,5 +508,56 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         panic!("state still running after PanicClient should have panicked the worker");
+    }
+
+    #[tokio::test]
+    async fn concept_failure_increments_metric() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingMetrics {
+            failed: AtomicUsize,
+        }
+        impl MetricsSink for CountingMetrics {
+            fn inc_rebuild_failed(&self) {}
+            fn inc_concept_rebuild_failed(&self) {
+                self.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            fn inc_rebuild_drain_capped(&self) {}
+            fn observe_drain_iterations(&self, _: u64) {}
+            fn rebuild_in_flight_inc(&self) {}
+            fn rebuild_in_flight_dec(&self) {}
+        }
+
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        wikis::upsert(&pool, Scope::Personal, "u1", "alpha", "old", "[]", 1)
+            .await
+            .unwrap();
+        let mock = Arc::new(MockClient::new());
+        // Manual{Some("alpha")} は Haiku 抽出をスキップして直接 Sonnet を呼ぶ。
+        // Sonnet 側の呼び出しを Api エラーで失敗させる。
+        mock.push_error("synthesize failed").await;
+
+        let metrics = Arc::new(CountingMetrics {
+            failed: AtomicUsize::new(0),
+        });
+        let deps_arc = Arc::new(WorkerDeps {
+            pool: pool.clone(),
+            state: StateMap::new(),
+            llm: mock,
+            model_haiku: "h".into(),
+            model_sonnet: "s".into(),
+            metrics: metrics.clone() as Arc<dyn MetricsSink>,
+        });
+        run_session(
+            &deps_arc,
+            &OwnerKey::personal("u1"),
+            RebuildMode::Manual {
+                concept: Some("alpha".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metrics.failed.load(Ordering::Relaxed), 1);
     }
 }

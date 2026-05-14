@@ -21,13 +21,17 @@ pub async fn call(state: AppState, user: AuthenticatedUser, args: Value) -> Resu
     // ORDER BY (created_at, id) ASC と整合させ、同一 ms 境界をスキップしないようにする。
     let (cursor_at, cursor_id) = match a.cursor.as_deref() {
         Some(s) if !s.is_empty() => {
-            let (at, id) = s
-                .split_once(':')
-                .ok_or_else(|| anyhow!("invalid cursor format"))?;
-            let at: i64 = at
+            // 旧形式 ("<created_at>") と新形式 ("<created_at>:<id>") の両方を許容。
+            // 旧形式の場合 cursor_id は空文字。同一 ms 境界スキップ問題は新形式でのみ
+            // 解消されるが、旧クライアントの 400 を防ぐため後方互換として受け入れる。
+            let (at_str, id) = match s.split_once(':') {
+                Some((at, id)) => (at, id.to_string()),
+                None => (s, String::new()),
+            };
+            let at: i64 = at_str
                 .parse()
                 .map_err(|_| anyhow!("invalid cursor created_at"))?;
-            (at, id.to_string())
+            (at, id)
         }
         _ => (0i64, String::new()),
     };
@@ -129,6 +133,29 @@ mod tests {
         assert_eq!(res["raws"].as_array().unwrap().len(), 1);
         assert!(res["wikis"].is_array());
         assert!(res["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn export_accepts_legacy_cursor_format() {
+        let s = state().await;
+        insert(
+            &s.pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "t",
+                content: "c",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        // 旧形式（数字のみ）を渡しても 400 にせず処理する。
+        // cursor_at=0, cursor_id="" として扱われ、全件取得できる。
+        let res = call(s, u(), json!({ "cursor": "0" })).await.unwrap();
+        assert_eq!(res["raws"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
