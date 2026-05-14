@@ -161,9 +161,13 @@ pub async fn list(id: Option<Value>) -> Json<JsonRpcResponse> {
 
 /// Wrap a tool's success value into the MCP `CallToolResult` shape.
 fn call_tool_result_ok(value: &Value) -> Value {
+    let text = serde_json::to_string(value).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "tool result serialization failed; emitting null");
+        "null".into()
+    });
     json!({
         "content": [
-            { "type": "text", "text": serde_json::to_string(value).unwrap_or_default() }
+            { "type": "text", "text": text }
         ],
         "isError": false
     })
