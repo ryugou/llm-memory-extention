@@ -448,10 +448,16 @@ fn bad_request(error: &str, description: &str) -> Response {
     )
         .into_response()
 }
-fn server_error(message: &str) -> Response {
+/// 内部の例外メッセージ (DB / JWT / filesystem / 等) を OAuth client に漏らさず、
+/// 安定したジェネリック message を返す。詳細は server-side ログにのみ書く。
+fn server_error(internal_detail: &str) -> Response {
+    tracing::warn!(detail = %internal_detail, "OAuth server_error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error":"server_error","error_description":message})),
+        Json(json!({
+            "error":"server_error",
+            "error_description":"internal error"
+        })),
     )
         .into_response()
 }
