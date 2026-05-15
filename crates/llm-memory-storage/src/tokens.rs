@@ -1,5 +1,15 @@
 use crate::error::StorageError;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+
+/// 32-byte SHA-256 digest of the refresh token. Stored at rest so that a DB /
+/// backup leak does not yield directly usable bearer tokens. Tokens are
+/// high-entropy ULIDs, so plain SHA-256 (no per-token salt) is adequate.
+fn hash_refresh(token: &str) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    h.finalize().to_vec()
+}
 
 pub async fn create_refresh(
     pool: &SqlitePool,
@@ -8,10 +18,11 @@ pub async fn create_refresh(
     client_id: &str,
     expires_at: i64,
 ) -> Result<(), StorageError> {
+    let token_hash = hash_refresh(token);
     sqlx::query(
-        "INSERT INTO tokens (refresh_token, user_id, client_id, expires_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO tokens (refresh_token_hash, user_id, client_id, expires_at) VALUES (?, ?, ?, ?)",
     )
-    .bind(token)
+    .bind(&token_hash)
     .bind(user_id)
     .bind(client_id)
     .bind(expires_at)
@@ -25,10 +36,11 @@ pub async fn validate_refresh(
     token: &str,
     now: i64,
 ) -> Result<Option<(String, String)>, StorageError> {
+    let token_hash = hash_refresh(token);
     let row: Option<(String, String, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT user_id, client_id, expires_at, revoked_at FROM tokens WHERE refresh_token = ?",
+        "SELECT user_id, client_id, expires_at, revoked_at FROM tokens WHERE refresh_token_hash = ?",
     )
-    .bind(token)
+    .bind(&token_hash)
     .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|(u, c, exp, rev)| {
@@ -41,9 +53,10 @@ pub async fn validate_refresh(
 }
 
 pub async fn revoke(pool: &SqlitePool, token: &str, now: i64) -> Result<(), StorageError> {
-    sqlx::query("UPDATE tokens SET revoked_at = ? WHERE refresh_token = ?")
+    let token_hash = hash_refresh(token);
+    sqlx::query("UPDATE tokens SET revoked_at = ? WHERE refresh_token_hash = ?")
         .bind(now)
-        .bind(token)
+        .bind(&token_hash)
         .execute(pool)
         .await?;
     Ok(())
@@ -127,5 +140,41 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn plain_token_not_stored_in_db() {
+        // 流出時に plain refresh token を再構築できないことを保証する回帰テスト。
+        // sqlite_master / 全 row を直接覗いても token 文字列が出ないこと。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let user = users::upsert(&pool, "01HJUSER000000000000000HSH", "google", "sub-h", None)
+            .await
+            .unwrap();
+        let client = oauth_clients::register(&pool, "[]", "[]", "none", None)
+            .await
+            .unwrap();
+        let token = "tok-leak-canary-xyzzy";
+        create_refresh(&pool, token, &user.id, &client.id, 2_000_000_000_000)
+            .await
+            .unwrap();
+
+        // hash として PK に入っているはず → token と一致する hash で row が引ける
+        let hash = hash_refresh(token);
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT user_id FROM tokens WHERE refresh_token_hash = ?")
+                .bind(&hash)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, Some((user.id.clone(),)));
+
+        // plain token 文字列で引いても何も出ない
+        let no_row: Option<(String,)> =
+            sqlx::query_as("SELECT user_id FROM tokens WHERE refresh_token_hash = ?")
+                .bind(token.as_bytes())
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(no_row.is_none(), "plain token must not match stored hash");
     }
 }

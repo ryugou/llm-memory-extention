@@ -393,6 +393,13 @@ async fn grant_refresh(state: AsState, body: TokenForm) -> Response {
             Ok(None) => return bad_request("invalid_grant", "refresh_token unknown or expired"),
             Err(e) => return server_error(&e.to_string()),
         };
+    // Rotation: 旧 refresh token を即座に revoke してから新 token を発行する。
+    // RFC 6749 §10.4 + RFC 6819 §5.2.2.3 で推奨される token theft 影響抑制策。
+    // ※ revoke 失敗時は server_error。新 token を発行しないので token テーブルの
+    //   整合性は保たれる (古い token はまだ有効だが、client は新 token を持たない)。
+    if let Err(e) = llm_memory_storage::tokens::revoke(&state.pool, &tok, now).await {
+        return server_error(&e.to_string());
+    }
     issue_tokens(state, &user_id, &client_id).await
 }
 
