@@ -13,11 +13,22 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
-    #[serde(default)]
+    /// JSON-RPC 2.0 §4 では「id 省略 → notification、`id: null` → null id を持つ
+    /// 通常 request」と区別される。serde の default 挙動だと両者が `None` に
+    /// 潰されるので、`deserialize_with` で「フィールドが現れたら必ず `Some` で
+    /// wrap」して absent と explicit null を区別する。
+    #[serde(default, deserialize_with = "deserialize_optional_id")]
     pub id: Option<Value>,
     pub method: String,
     #[serde(default)]
     pub params: Value,
+}
+
+fn deserialize_optional_id<'de, D>(d: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Value::deserialize(d)?))
 }
 
 impl JsonRpcRequest {
@@ -378,6 +389,22 @@ mod tests {
         let body = json!({"jsonrpc":"2.0","id":[1,2,3],"method":"ping"});
         let (_status, v) = invoke(state, body).await;
         assert_eq!(v["error"]["code"], -32600);
+    }
+
+    #[tokio::test]
+    async fn explicit_null_id_returns_response_not_notification() {
+        // JSON-RPC 2.0 §4: id が省略されたら Notification、`id: null` は
+        // 明示的に「null id を持つ通常 request」なので応答を返さなければならない。
+        let state = test_state().await;
+        let body = json!({"jsonrpc":"2.0","id":null,"method":"ping"});
+        let (status, v) = invoke(state, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "explicit id: null is a request, not a notification"
+        );
+        assert!(v["id"].is_null(), "response echoes id: null");
+        assert_eq!(v["result"], json!({}), "ping returns empty result");
     }
 
     #[tokio::test]

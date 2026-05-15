@@ -164,7 +164,11 @@ async fn run_worker<C: AnthropicClient + 'static>(
                         }
                     };
 
-                    if remaining_count.unwrap_or(0) > 0 && !remainder_drain_used {
+                    // lookup 成功で `> 0` か、lookup 失敗 (None) なら fail-safe で
+                    // 残 raw 有り扱い。後者は manual_pending に譲って watermark を進めて
+                    // 取りこぼすリスクを回避するための保守的挙動。
+                    let remainder_present = remaining_count.map(|n| n > 0).unwrap_or(true);
+                    if remainder_present && !remainder_drain_used {
                         // 残 raw がある状態で pending Manual{Some(c)} に譲ると
                         // c の synthesize で watermark が進んで他 concept 向け raw を
                         // 取りこぼすので、Append を 1 回だけ強制して全 concept を
@@ -174,6 +178,7 @@ async fn run_worker<C: AnthropicClient + 'static>(
                         consecutive_caps = 0;
                         warn!(
                             owner = ?key,
+                            lookup_failed = remaining_count.is_none(),
                             "forcing extra Append session to drain remainder before yielding to pending"
                         );
                         next_mode = Some(RebuildMode::Append);
