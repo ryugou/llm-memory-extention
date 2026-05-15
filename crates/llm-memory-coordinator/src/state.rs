@@ -37,7 +37,15 @@ impl StateMap {
     }
 
     /// Try to claim a worker slot for the given owner.
-    /// - If idle: marks running=true and returns Started(mode).
+    /// - If idle: 通常は running=true 化して Started(mode) を返す。
+    ///   ただし `append_missed=true` で incoming が Manual の場合、Manual を
+    ///   `manual_pending` に積んで Append を Started する。
+    ///   これは recoverable error 後の経路 (worker が Ok(Err(_)) で終了 →
+    ///   release_running_preserve_pending で running=false かつ
+    ///   `append_missed=true`、`manual_pending=Some(...)` を保持した状態で
+    ///   request_manual(Some(c)) が呼ばれる) で必要。append_missed を無視して
+    ///   Manual を直走させると global watermark が advance して他 concept の raw
+    ///   を取りこぼすため。
     /// - If running and mode is Append: sets `append_missed=true` and returns AlreadyRunning
     ///   (worker は session 終了時にこのフラグを見て drain 継続を判断する → race window で
     ///   届いた append 通知も取りこぼさない)。
@@ -61,8 +69,23 @@ impl StateMap {
                 }
             }
         } else {
+            // idle 再開: append_missed が立っている + incoming が Manual の場合、
+            // Manual を pending に積んで Append を先に走らせる (raw 取りこぼし防止)。
+            let starting_mode = if entry.append_missed && matches!(mode, RebuildMode::Manual { .. })
+            {
+                entry.append_missed = false;
+                entry.manual_pending = Some(merge_pending(entry.manual_pending.take(), mode));
+                RebuildMode::Append
+            } else {
+                // incoming が Append なら append_missed は冗長 (どっちにせよ Append)。
+                // クリアして同じ Append を Started で返す。
+                if entry.append_missed && matches!(mode, RebuildMode::Append) {
+                    entry.append_missed = false;
+                }
+                mode
+            };
             entry.running = true;
-            StartOutcome::Started(mode)
+            StartOutcome::Started(starting_mode)
         }
     }
 
@@ -292,23 +315,88 @@ mod tests {
         s.release_running_preserve_pending(&key()).await;
         assert!(!s.is_running(&key()).await, "running must be released");
 
-        // 次の worker spawn が pending を引き継げる
+        // 次の worker spawn が pending を引き継げる。
+        // Round 4 priority: idle Append start は append_missed を冗長としてクリア、
+        // manual_pending は次の mark_idle_or_continue で取り出される。
         let started = s.try_start(&key(), RebuildMode::Append).await;
         assert_eq!(started, StartOutcome::Started(RebuildMode::Append));
-        // append_missed が manual_pending より先に消費される (Round 3 priority 変更)
         let cont = s.mark_idle_or_continue(&key()).await;
         assert_eq!(
             cont,
-            Some(RebuildMode::Append),
-            "append_missed must survive a recoverable error and consume first"
-        );
-        let cont2 = s.mark_idle_or_continue(&key()).await;
-        assert_eq!(
-            cont2,
             Some(RebuildMode::Manual {
                 concept: Some("c".into())
             }),
             "manual_pending must survive a recoverable error"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_manual_start_yields_to_pending_append_missed() {
+        // recoverable error 後の再開シナリオ:
+        // running=false + append_missed=true + manual_pending=Some(...) で、
+        // request_manual が Manual を idle start しようとしたとき、
+        // append_missed を優先消化して Append を Started で返す。
+        // Manual は manual_pending に積まれて次の mark_idle_or_continue で取り出される。
+        let s = StateMap::new();
+        s.try_start(&key(), RebuildMode::Append).await;
+        // running 中に append 通知が来て append_missed が立つ
+        s.try_start(&key(), RebuildMode::Append).await;
+        // running 中に manual rebuild が来て pending に積まれる
+        s.try_start(
+            &key(),
+            RebuildMode::Manual {
+                concept: Some("c-prev".into()),
+            },
+        )
+        .await;
+        // recoverable error を模擬: running だけ下ろす
+        s.release_running_preserve_pending(&key()).await;
+        assert!(!s.is_running(&key()).await);
+
+        // 後発の request_manual: idle 再開ルートで Append が先に走るべき
+        let outcome = s
+            .try_start(
+                &key(),
+                RebuildMode::Manual {
+                    concept: Some("c-new".into()),
+                },
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            StartOutcome::Started(RebuildMode::Append),
+            "idle restart with append_missed must drain first, not Manual"
+        );
+        assert!(s.is_running(&key()).await);
+
+        // Append session 完了後、manual_pending を消費 (c-prev と c-new の merge 結果)
+        let cont = s.mark_idle_or_continue(&key()).await;
+        match cont {
+            Some(RebuildMode::Manual { concept }) => {
+                // merge_pending の挙動: 同じ Some(c) どうしは incoming で上書き
+                // c-prev → c-new (incoming) で上書きされている
+                assert_eq!(concept.as_deref(), Some("c-new"));
+            }
+            _ => panic!("expected Manual{{Some(_)}} pending, got {cont:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_append_start_clears_append_missed() {
+        // idle で append_missed=true + incoming Append なら冗長フラグをクリアして
+        // Append を直 Started する (manual_pending には積まない)。
+        let s = StateMap::new();
+        s.try_start(&key(), RebuildMode::Append).await;
+        s.try_start(&key(), RebuildMode::Append).await; // miss を立てる
+        s.release_running_preserve_pending(&key()).await;
+
+        let outcome = s.try_start(&key(), RebuildMode::Append).await;
+        assert_eq!(outcome, StartOutcome::Started(RebuildMode::Append));
+        // append_missed は冗長としてクリア
+        let cont = s.mark_idle_or_continue(&key()).await;
+        assert_eq!(
+            cont, None,
+            "append_missed must be cleared on idle Append start"
         );
     }
 
