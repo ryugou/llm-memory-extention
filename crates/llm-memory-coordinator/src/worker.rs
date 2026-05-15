@@ -62,16 +62,25 @@ pub fn spawn_worker<C: AnthropicClient + 'static>(
                 // ここで force_idle を呼ぶと後続 worker の状態を破壊するので何もしない。
             }
             Ok(Err(e)) => {
+                // 一過性 (LLM / DB) エラー: state は信頼できる。running フラグだけ
+                // 下ろして `manual_pending` / `append_missed` を温存し、次の
+                // notify / manual rebuild トリガで再 spawn される worker が
+                // 続きを引き継げるようにする。
                 error!(owner = ?key_outer, error = ?e, "rebuild worker returned error");
                 deps_outer.metrics.inc_rebuild_failed();
-                deps_outer.state.force_idle(&key_outer).await;
+                deps_outer
+                    .state
+                    .release_running_preserve_pending(&key_outer)
+                    .await;
             }
             Err(join_err) if join_err.is_panic() => {
+                // panic: state が信用できないので全クリア (force_idle)。
                 error!(owner = ?key_outer, ?join_err, "rebuild worker panicked");
                 deps_outer.metrics.inc_rebuild_failed();
                 deps_outer.state.force_idle(&key_outer).await;
             }
             Err(e) => {
+                // join error (cancellation 等): state が信用できないので全クリア。
                 error!(owner = ?key_outer, error = ?e, "rebuild worker join error");
                 deps_outer.metrics.inc_rebuild_failed();
                 deps_outer.state.force_idle(&key_outer).await;
@@ -104,6 +113,15 @@ async fn run_worker<C: AnthropicClient + 'static>(
 ) -> Result<(), CoordinatorError> {
     let mut next_mode: Option<RebuildMode> = Some(initial_mode);
     let mut consecutive_caps: usize = 0;
+    // 残 raw を保ったまま mark_idle_or_continue に進むと、`manual_pending` =
+    // `Manual{Some(c)}` が pending している場合に c だけが last_rebuilt_at を
+    // started_at に進めて owner 全体の watermark を Advance してしまい、
+    // c 以外の concept 向けの残 raw が永久に list_since 範囲外になる
+    // (= per-owner MAX watermark architecture の制約)。
+    // 対策として、cap streak が limit に達した直後に残 raw が観測されたら、
+    // pending に譲る前に 1 回だけ Append を強制して全 concept を Haiku で
+    // 走査させる。1 回までに制限することで worker の寿命を有界に保つ。
+    let mut remainder_drain_used = false;
     while let Some(mode) = next_mode.take() {
         let outcome = run_session(&deps, &key, mode).await?;
         match outcome {
@@ -114,35 +132,56 @@ async fn run_worker<C: AnthropicClient + 'static>(
             SessionOutcome::DrainCapped => {
                 consecutive_caps += 1;
                 if consecutive_caps >= MAX_CONSECUTIVE_CAPS {
-                    // 安全停止前に残 raw 数を取得して error ログ + アラート用に出す。
-                    // DB エラーは黙殺せず remaining_raws_lookup_error として明示。
+                    // 残 raw 数を取得 (アラート + drain-before-yield 判定)。
                     let watermark =
                         wikis::max_last_rebuilt_at(&deps.pool, key.scope, &key.owner_id).await?;
                     let lookup_result =
                         raws::list_since(&deps.pool, key.scope, &key.owner_id, watermark, now_ms())
                             .await;
-                    match lookup_result {
-                        Ok(remaining) => error!(
+                    let remaining_count: Option<usize> = match &lookup_result {
+                        Ok(remaining) => {
+                            error!(
+                                owner = ?key,
+                                consecutive_caps,
+                                remaining_raws = remaining.len(),
+                                "drain cap streak exceeded MAX_CONSECUTIVE_CAPS; \
+                                 remaining raws will be picked up by `append_missed` race-recovery \
+                                 or next append/manual rebuild. \
+                                 Operator action: check `rebuild_drain_capped` metric and consider manual rebuild."
+                            );
+                            Some(remaining.len())
+                        }
+                        Err(e) => {
+                            error!(
+                                owner = ?key,
+                                consecutive_caps,
+                                error = ?e,
+                                "drain cap streak exceeded MAX_CONSECUTIVE_CAPS; \
+                                 remaining_raws lookup failed. \
+                                 Operator action: check `rebuild_drain_capped` metric and consider manual rebuild."
+                            );
+                            None
+                        }
+                    };
+
+                    if remaining_count.unwrap_or(0) > 0 && !remainder_drain_used {
+                        // 残 raw がある状態で pending Manual{Some(c)} に譲ると
+                        // c の synthesize で watermark が進んで他 concept 向け raw を
+                        // 取りこぼすので、Append を 1 回だけ強制して全 concept を
+                        // Haiku 経由で走査させる。worker 寿命を有界化するため
+                        // remainder_drain_used で 1 回に制限。
+                        remainder_drain_used = true;
+                        consecutive_caps = 0;
+                        warn!(
                             owner = ?key,
-                            consecutive_caps,
-                            remaining_raws = remaining.len(),
-                            "drain cap streak exceeded MAX_CONSECUTIVE_CAPS; \
-                             remaining raws will be picked up by `append_missed` race-recovery \
-                             or next append/manual rebuild. \
-                             Operator action: check `rebuild_drain_capped` metric and consider manual rebuild."
-                        ),
-                        Err(e) => error!(
-                            owner = ?key,
-                            consecutive_caps,
-                            error = ?e,
-                            "drain cap streak exceeded MAX_CONSECUTIVE_CAPS; \
-                             remaining_raws lookup failed. \
-                             Operator action: check `rebuild_drain_capped` metric and consider manual rebuild."
-                        ),
+                            "forcing extra Append session to drain remainder before yielding to pending"
+                        );
+                        next_mode = Some(RebuildMode::Append);
+                    } else {
+                        // 残 raw なし、または既に追加 Append を試行済み → 通常通り
+                        // mark_idle_or_continue で append_missed / manual_pending を消費。
+                        next_mode = deps.state.mark_idle_or_continue(&key).await;
                     }
-                    // mark_idle_or_continue は append_missed を mutex 内で原子的に拾うため、
-                    // 解放直前に来た append 通知も取りこぼさない。
-                    next_mode = deps.state.mark_idle_or_continue(&key).await;
                 } else {
                     // mark_idle_or_continue を経由しないので running=true は維持される。
                     // 既存 manual_pending は次 Done セッションで評価される。
@@ -1001,6 +1040,75 @@ mod tests {
         assert!(
             deps_arc.state.is_running(&key).await,
             "A's outer wrapper must not clobber B's running flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_inner_error_preserves_pending() {
+        // 一過性 (LLM) エラーで worker が Err(_) を返した場合、
+        // 並行して届いていた manual_pending / append_missed が消えずに
+        // 次の worker spawn まで温存されること (release_running_preserve_pending 経由)。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let mock = Arc::new(MockClient::new());
+        // mock 応答を push しない → 最初の Haiku で LlmError::Api
+        let deps_arc = deps(pool.clone(), mock).await;
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u-err",
+                title: "x",
+                content: "y",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u-err"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let key = OwnerKey::personal("u-err");
+        // worker 起動準備: running=true、その上で manual_pending を投入
+        deps_arc.state.try_start(&key, RebuildMode::Append).await;
+        deps_arc
+            .state
+            .try_start(
+                &key,
+                RebuildMode::Manual {
+                    concept: Some("alpha".into()),
+                },
+            )
+            .await;
+        // append 通知が落とされた状態も再現
+        deps_arc.state.try_start(&key, RebuildMode::Append).await;
+
+        spawn_worker(deps_arc.clone(), key.clone(), RebuildMode::Append);
+
+        // worker が Err で終わって running=false になるまで待つ
+        let mut ended = false;
+        for _ in 0..50 {
+            if !deps_arc.state.is_running(&key).await {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(ended, "worker should release running after inner error");
+
+        // manual_pending と append_missed が残っているはず
+        let cont = deps_arc.state.mark_idle_or_continue(&key).await;
+        assert_eq!(
+            cont,
+            Some(RebuildMode::Manual {
+                concept: Some("alpha".into())
+            }),
+            "manual_pending must survive recoverable error"
+        );
+        let cont2 = deps_arc.state.mark_idle_or_continue(&key).await;
+        assert_eq!(
+            cont2,
+            Some(RebuildMode::Append),
+            "append_missed must survive recoverable error"
         );
     }
 

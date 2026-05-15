@@ -100,6 +100,16 @@ impl StateMap {
         }
     }
 
+    /// Release the running slot but preserve `manual_pending` / `append_missed`
+    /// (used for recoverable errors returned by run_worker — LLM / DB transient
+    /// failures shouldn't drop user-issued manual rebuilds or notify_append).
+    pub async fn release_running_preserve_pending(&self, key: &OwnerKey) {
+        let mut map = self.inner.lock().await;
+        if let Some(entry) = map.get_mut(key) {
+            entry.running = false;
+        }
+    }
+
     pub async fn is_running(&self, key: &OwnerKey) -> bool {
         let map = self.inner.lock().await;
         map.get(key).map(|s| s.running).unwrap_or(false)
@@ -245,6 +255,43 @@ mod tests {
         // manual_pending を消費した後でも append_missed は残っている
         let cont2 = s.mark_idle_or_continue(&key()).await;
         assert_eq!(cont2, Some(RebuildMode::Append));
+    }
+
+    #[tokio::test]
+    async fn release_running_preserve_pending_keeps_manual_and_missed() {
+        // 一過性エラー回復用 API: running フラグだけ下げ、pending は温存する。
+        let s = StateMap::new();
+        s.try_start(&key(), RebuildMode::Append).await;
+        // running 中に manual_pending と append_missed の両方を立てる
+        s.try_start(
+            &key(),
+            RebuildMode::Manual {
+                concept: Some("c".into()),
+            },
+        )
+        .await;
+        s.try_start(&key(), RebuildMode::Append).await;
+
+        s.release_running_preserve_pending(&key()).await;
+        assert!(!s.is_running(&key()).await, "running must be released");
+
+        // 次の worker spawn が pending を引き継げる
+        let started = s.try_start(&key(), RebuildMode::Append).await;
+        assert_eq!(started, StartOutcome::Started(RebuildMode::Append));
+        let cont = s.mark_idle_or_continue(&key()).await;
+        assert_eq!(
+            cont,
+            Some(RebuildMode::Manual {
+                concept: Some("c".into())
+            }),
+            "manual_pending must survive a recoverable error"
+        );
+        let cont2 = s.mark_idle_or_continue(&key()).await;
+        assert_eq!(
+            cont2,
+            Some(RebuildMode::Append),
+            "append_missed must survive a recoverable error"
+        );
     }
 
     #[tokio::test]
