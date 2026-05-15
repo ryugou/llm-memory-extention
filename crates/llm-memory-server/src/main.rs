@@ -1,4 +1,5 @@
 use anyhow::Result;
+use llm_memory_auth::jwt::JwtKeys;
 use llm_memory_server::{app, config};
 use tracing_subscriber::EnvFilter;
 
@@ -13,7 +14,10 @@ async fn main() -> Result<()> {
 
     let cfg = config::ServerConfig::from_env()?;
     let bind = cfg.bind_addr.clone();
-    let state = app::build_state(cfg).await?;
+    // Fail-fast: missing or weak JWT signing keys must surface as a startup
+    // error rather than a confusing MissingKid at the first OAuth call.
+    let jwt_keys = JwtKeys::from_env()?;
+    let state = app::build_state(cfg, jwt_keys).await?;
     let router = app::build_router(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "server starting");

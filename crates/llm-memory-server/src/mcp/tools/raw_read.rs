@@ -25,14 +25,14 @@ pub async fn call(state: AppState, user: AuthenticatedUser, args: Value) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::build_state;
+    use crate::app::build_state_for_tests;
     use crate::config::ServerConfig;
     use llm_memory_core::scope::Scope;
     use llm_memory_storage::raws::{NewRaw, insert};
     use serde_json::json;
 
     async fn state() -> AppState {
-        build_state(ServerConfig {
+        build_state_for_tests(ServerConfig {
             database_url: "sqlite::memory:".into(),
             bind_addr: "x".into(),
             public_url: "x".into(),

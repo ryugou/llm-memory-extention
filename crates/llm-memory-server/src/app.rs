@@ -22,7 +22,12 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
 }
 
-pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
+/// Build the shared app state.
+///
+/// JWT signing keys are passed in explicitly (rather than loaded inside) so
+/// callers can fail fast on configuration errors (`main`) or substitute a
+/// deterministic test key (`build_state_for_tests`).
+pub async fn build_state(cfg: ServerConfig, jwt_keys: JwtKeys) -> anyhow::Result<AppState> {
     let pool = llm_memory_storage::pool::init_pool(&cfg.database_url).await?;
     let llm = Arc::new(AnthropicHttp::new(cfg.anthropic_api_key.clone()));
     // Metrics は worker と /metrics ハンドラの両方で同じインスタンスを共有する。
@@ -36,7 +41,6 @@ pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
         metrics: metrics.clone() as Arc<dyn llm_memory_coordinator::metrics::MetricsSink>,
     });
     let coordinator = Coordinator::new(deps);
-    let jwt_keys = JwtKeys::from_env();
     Ok(AppState {
         pool,
         coordinator,
@@ -45,6 +49,13 @@ pub async fn build_state(cfg: ServerConfig) -> anyhow::Result<AppState> {
         rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
         metrics,
     })
+}
+
+/// Convenience wrapper for tests that injects a deterministic `JwtKeys`.
+/// Production code should use `build_state(cfg, JwtKeys::from_env()?)`.
+#[doc(hidden)]
+pub async fn build_state_for_tests(cfg: ServerConfig) -> anyhow::Result<AppState> {
+    build_state(cfg, JwtKeys::for_tests()).await
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -109,7 +120,7 @@ mod tests {
             model_sonnet: "s".into(),
             trusted_proxy_count: 1,
         };
-        build_state(cfg).await.unwrap()
+        build_state_for_tests(cfg).await.unwrap()
     }
 
     #[tokio::test]

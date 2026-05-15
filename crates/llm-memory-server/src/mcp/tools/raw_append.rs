@@ -46,7 +46,7 @@ pub async fn call(state: AppState, user: AuthenticatedUser, args: Value) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::build_state;
+    use crate::app::build_state_for_tests;
     use crate::config::ServerConfig;
 
     async fn state() -> AppState {
@@ -61,7 +61,7 @@ mod tests {
             model_sonnet: "s".into(),
             trusted_proxy_count: 1,
         };
-        build_state(cfg).await.unwrap()
+        build_state_for_tests(cfg).await.unwrap()
     }
 
     fn user() -> AuthenticatedUser {

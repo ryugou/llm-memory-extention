@@ -208,7 +208,7 @@ async fn dispatch_one(state: AppState, user: AuthenticatedUser, req: JsonRpcRequ
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::build_state;
+    use crate::app::build_state_for_tests;
     use crate::config::ServerConfig;
     use axum::body::Body;
     use axum::http::Request;
@@ -226,7 +226,7 @@ mod tests {
             model_sonnet: "s".into(),
             trusted_proxy_count: 1,
         };
-        build_state(cfg).await.unwrap()
+        build_state_for_tests(cfg).await.unwrap()
     }
 
     fn user() -> AuthenticatedUser {
