@@ -39,3 +39,11 @@ regex = "1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# target/ 肥大化抑制。codegen-units を絞って .rcgu.o の数を減らし、
+# 依存クレートの debug info を落として DWARF を捨てる。
+[profile.dev]
+codegen-units = 16
+
+[profile.dev.package."*"]
+debug = false
