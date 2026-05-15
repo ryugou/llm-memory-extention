@@ -67,22 +67,28 @@ impl StateMap {
     }
 
     /// Called by worker after a session ends.
-    /// 優先順位:
-    /// 1. `manual_pending` があれば取り出して継続 (running=true 維持)
-    /// 2. `append_missed` が true なら Append で継続 (running=true 維持) — running 中に
-    ///    取りこぼした append 通知を mutex 内で原子的に拾い上げる
+    /// 優先順位 (append_missed 優先):
+    /// 1. `append_missed` が true なら Append で継続 (running=true 維持)
+    /// 2. `manual_pending` があれば取り出して継続 (running=true 維持)
     /// 3. どちらも無ければ running=false にして worker 解放
+    ///
+    /// `append_missed` を `manual_pending` より先に消費する理由:
+    /// `Manual{Some(c)}` セッションは c の `last_rebuilt_at` を session 開始時刻に
+    /// 進めるため、`wikis::max_last_rebuilt_at` (owner 全体 MAX) が advance する。
+    /// すると次の Append が `raws::list_since(watermark, ...)` で旧 watermark〜
+    /// 新 watermark 間の raw を範囲外として落とし、他 concept (c2, c3, ...) に
+    /// その raw が反映されない (= raw 取りこぼし)。append_missed を先に消化して
+    /// 全 concept を Haiku 経由で走査することでこの window を閉じる。
+    /// Manual rebuild の到着は遅延するが、user は再実行できる (再度 wiki_rebuild
+    /// を呼べば次の mark_idle_or_continue で取り出される)。
     pub async fn mark_idle_or_continue(&self, key: &OwnerKey) -> Option<RebuildMode> {
         let mut map = self.inner.lock().await;
         let entry = map.entry(key.clone()).or_default();
-        if let Some(m) = entry.manual_pending.take() {
-            // append_missed は manual rebuild 完了後の append drain でも拾われるよう、
-            // ここでは消費しない (継続セッション中の running=true 期間は次の
-            // mark_idle_or_continue まで append_missed が積み上がる可能性がある)。
-            Some(m)
-        } else if entry.append_missed {
+        if entry.append_missed {
             entry.append_missed = false;
             Some(RebuildMode::Append)
+        } else if let Some(m) = entry.manual_pending.take() {
+            Some(m)
         } else {
             entry.running = false;
             None
@@ -229,9 +235,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_pending_takes_priority_over_append_missed() {
+    async fn append_missed_takes_priority_over_manual_pending() {
         // manual_pending と append_missed の両方が立っている場合、
-        // manual_pending を優先 (user intent の方を尊重)。
+        // append_missed を優先する (Manual{Some(c)} が global watermark を
+        // advance して他 concept の raw を取りこぼすのを防ぐため)。
+        // Manual 側は遅延するが次の mark_idle_or_continue で取り出される。
         let s = StateMap::new();
         s.try_start(&key(), RebuildMode::Append).await;
         // append 通知が落とされる
@@ -248,13 +256,22 @@ mod tests {
         let cont = s.mark_idle_or_continue(&key()).await;
         assert_eq!(
             cont,
+            Some(RebuildMode::Append),
+            "append_missed must drain before Manual{{Some(c)}} runs to prevent raw loss"
+        );
+        // Append session 後に manual_pending が取り出される
+        let cont2 = s.mark_idle_or_continue(&key()).await;
+        assert_eq!(
+            cont2,
             Some(RebuildMode::Manual {
                 concept: Some("c".into())
-            })
+            }),
+            "manual_pending survives the prepended Append session"
         );
-        // manual_pending を消費した後でも append_missed は残っている
-        let cont2 = s.mark_idle_or_continue(&key()).await;
-        assert_eq!(cont2, Some(RebuildMode::Append));
+        // 三度目は何も残らず running 解放
+        let cont3 = s.mark_idle_or_continue(&key()).await;
+        assert_eq!(cont3, None);
+        assert!(!s.is_running(&key()).await);
     }
 
     #[tokio::test]
@@ -278,19 +295,20 @@ mod tests {
         // 次の worker spawn が pending を引き継げる
         let started = s.try_start(&key(), RebuildMode::Append).await;
         assert_eq!(started, StartOutcome::Started(RebuildMode::Append));
+        // append_missed が manual_pending より先に消費される (Round 3 priority 変更)
         let cont = s.mark_idle_or_continue(&key()).await;
         assert_eq!(
             cont,
-            Some(RebuildMode::Manual {
-                concept: Some("c".into())
-            }),
-            "manual_pending must survive a recoverable error"
+            Some(RebuildMode::Append),
+            "append_missed must survive a recoverable error and consume first"
         );
         let cont2 = s.mark_idle_or_continue(&key()).await;
         assert_eq!(
             cont2,
-            Some(RebuildMode::Append),
-            "append_missed must survive a recoverable error"
+            Some(RebuildMode::Manual {
+                concept: Some("c".into())
+            }),
+            "manual_pending must survive a recoverable error"
         );
     }
 

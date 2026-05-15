@@ -1100,20 +1100,21 @@ mod tests {
         }
         assert!(ended, "worker should release running after inner error");
 
-        // manual_pending と append_missed が残っているはず
+        // append_missed と manual_pending が残っているはず (Round 3 priority で
+        // append_missed 先取り)
         let cont = deps_arc.state.mark_idle_or_continue(&key).await;
         assert_eq!(
             cont,
-            Some(RebuildMode::Manual {
-                concept: Some("alpha".into())
-            }),
-            "manual_pending must survive recoverable error"
+            Some(RebuildMode::Append),
+            "append_missed must survive recoverable error and consume first"
         );
         let cont2 = deps_arc.state.mark_idle_or_continue(&key).await;
         assert_eq!(
             cont2,
-            Some(RebuildMode::Append),
-            "append_missed must survive recoverable error"
+            Some(RebuildMode::Manual {
+                concept: Some("alpha".into())
+            }),
+            "manual_pending must survive recoverable error"
         );
     }
 
