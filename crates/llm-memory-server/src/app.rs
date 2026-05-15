@@ -77,6 +77,10 @@ pub fn build_router(state: AppState) -> Router {
     let as_router = llm_memory_auth::authorization_server::router().with_state(as_state);
 
     // /mcp and /v1/account require auth; /healthz does not.
+    // AuthState は JWT 鍵に加えて users 表参照用の pool を持つ
+    // (削除済み user の token を弾くため毎リクエストで users::find_by_id を引く)。
+    let auth_state =
+        llm_memory_auth::middleware::AuthState::new(state.jwt_keys.clone(), state.pool.clone());
     let protected_router = Router::new()
         .route("/mcp", axum::routing::post(crate::mcp::transport::handle))
         .route(
@@ -84,7 +88,7 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::delete(crate::account::delete_me),
         )
         .route_layer(axum::middleware::from_fn_with_state(
-            state.jwt_keys.clone(),
+            auth_state,
             llm_memory_auth::middleware::require_auth,
         ))
         .with_state(state.clone());
