@@ -62,6 +62,32 @@ pub async fn revoke(pool: &SqlitePool, token: &str, now: i64) -> Result<(), Stor
     Ok(())
 }
 
+/// Atomically validate-and-revoke a refresh token in a single UPDATE statement.
+/// 並行 2 リクエストが同じ token を提示しても、片方しか結果を取れないため
+/// rotation race (両方が新 token を発行する) を閉じる。SQLite 3.35+ の
+/// `RETURNING` を利用。
+pub async fn validate_and_revoke(
+    pool: &SqlitePool,
+    token: &str,
+    now: i64,
+) -> Result<Option<(String, String)>, StorageError> {
+    let token_hash = hash_refresh(token);
+    let row: Option<(String, String)> = sqlx::query_as(
+        "UPDATE tokens
+         SET revoked_at = ?
+         WHERE refresh_token_hash = ?
+           AND revoked_at IS NULL
+           AND expires_at > ?
+         RETURNING user_id, client_id",
+    )
+    .bind(now)
+    .bind(&token_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +166,30 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn validate_and_revoke_is_atomic() {
+        // 同じ token を 2 回 validate_and_revoke すると、1 回目だけが成功して
+        // 2 回目は None を返す。これが rotation race 防止の根拠。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let user = users::upsert(&pool, "01HJUSER0000000000ROTATION", "google", "sub-r", None)
+            .await
+            .unwrap();
+        let client = oauth_clients::register(&pool, "[]", "[]", "none", None)
+            .await
+            .unwrap();
+        create_refresh(&pool, "tok-r", &user.id, &client.id, 2_000_000_000_000)
+            .await
+            .unwrap();
+        let now = 1_700_000_000_000;
+
+        let first = validate_and_revoke(&pool, "tok-r", now).await.unwrap();
+        assert_eq!(first, Some((user.id.clone(), client.id.clone())));
+
+        // 同じ token で 2 回目はもう取れない (atomic revoke 済み)
+        let second = validate_and_revoke(&pool, "tok-r", now).await.unwrap();
+        assert_eq!(second, None, "second attempt must not yield tokens");
     }
 
     #[tokio::test]

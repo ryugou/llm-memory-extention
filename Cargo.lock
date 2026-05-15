@@ -1168,6 +1168,7 @@ version = "0.0.0"
 dependencies = [
  "regex",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "ulid",
 ]

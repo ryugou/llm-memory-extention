@@ -10,9 +10,23 @@ pub struct UserId(String);
 #[serde(transparent)]
 pub struct RawId(String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SharedMemoryId(String);
+
+// 手動実装: derive(Deserialize) だと parse() の format validation
+// (`^[a-z0-9][a-z0-9-]{0,63}$`) を bypass して任意文字列を生成できてしまう。
+// 必ず parse() を通すことで「parse 経由でのみ生成可能」という invariant を
+// シリアル化境界でも保つ。
+impl<'de> Deserialize<'de> for SharedMemoryId {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(d)?;
+        SharedMemoryId::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum IdError {
@@ -103,6 +117,17 @@ mod tests {
         assert!(SharedMemoryId::parse("").is_err());
         let too_long = "a".repeat(65);
         assert!(SharedMemoryId::parse(&too_long).is_err());
+    }
+
+    #[test]
+    fn shared_memory_id_deserialize_runs_validation() {
+        // derive(Deserialize) を捨てた回帰テスト: 不正値は deserialize 段階で reject。
+        let bad = serde_json::from_str::<SharedMemoryId>(r#""UPPER""#);
+        assert!(bad.is_err(), "uppercase must fail at deserialize time");
+        let with_space = serde_json::from_str::<SharedMemoryId>(r#""has space""#);
+        assert!(with_space.is_err());
+        let good = serde_json::from_str::<SharedMemoryId>(r#""team-frontend""#).unwrap();
+        assert_eq!(good.as_str(), "team-frontend");
     }
 
     #[test]

@@ -47,6 +47,14 @@ pub fn validate(req: &DcrRequest) -> Result<DcrResponse, AuthError> {
         if parsed.scheme() != "https" {
             return Err(AuthError::OAuth(format!("redirect_uri must be https: {u}")));
         }
+        // OAuth 2.0 §3.1.2 で redirect_uri にフラグメントを含めることは禁止。
+        // 後段で `?code=...` を query 連結する経路があり、fragment が残っていると
+        // `cb#frag?code=...` のような壊れた URL になるので reject。
+        if parsed.fragment().is_some() {
+            return Err(AuthError::OAuth(format!(
+                "redirect_uri must not contain a fragment: {u}"
+            )));
+        }
     }
     for g in &req.grant_types {
         if !ALLOWED_GRANT_TYPES.contains(&g.as_str()) {
@@ -129,6 +137,14 @@ mod tests {
         let mut r = base();
         r.token_endpoint_auth_method = Some("client_secret_basic".into());
         assert!(validate(&r).is_err());
+    }
+
+    #[test]
+    fn rejects_redirect_uri_with_fragment() {
+        let mut r = base();
+        r.redirect_uris = vec!["https://example.com/cb#frag".into()];
+        let err = validate(&r).unwrap_err();
+        assert!(matches!(err, AuthError::OAuth(_)));
     }
 
     #[test]

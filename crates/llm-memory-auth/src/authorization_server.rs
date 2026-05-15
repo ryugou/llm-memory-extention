@@ -66,6 +66,12 @@ struct AuthCode {
     expires_at_ms: i64,
 }
 
+/// In-mem セッション 1 owner あたりの hard cap。abandoned `/authorize` で
+/// `put_pending` / `put_code` が無限に増える DoS を防ぐ。
+/// 通常運用ではユーザー × 同時 OAuth flow の積で数十〜数百を超えない。
+const MAX_PENDING_AUTHS: usize = 10_000;
+const MAX_AUTH_CODES: usize = 10_000;
+
 #[derive(Clone, Default)]
 struct InMemorySessions {
     pending: Arc<Mutex<HashMap<String, PendingAuth>>>,
@@ -74,7 +80,20 @@ struct InMemorySessions {
 
 impl InMemorySessions {
     fn put_pending(&self, key: String, p: PendingAuth) {
-        self.pending.lock().unwrap().insert(key, p);
+        let mut m = self.pending.lock().unwrap();
+        let now = now_ms();
+        m.retain(|_, p| p.expires_at_ms > now);
+        // hard cap: 期限切れ pruning 後でも上限超なら最古を 1 件落として枠を作る。
+        if m.len() >= MAX_PENDING_AUTHS {
+            if let Some(oldest_key) = m
+                .iter()
+                .min_by_key(|(_, p)| p.expires_at_ms)
+                .map(|(k, _)| k.clone())
+            {
+                m.remove(&oldest_key);
+            }
+        }
+        m.insert(key, p);
     }
     fn take_pending(&self, key: &str) -> Option<PendingAuth> {
         let mut m = self.pending.lock().unwrap();
@@ -83,7 +102,19 @@ impl InMemorySessions {
         m.remove(key)
     }
     fn put_code(&self, key: String, c: AuthCode) {
-        self.codes.lock().unwrap().insert(key, c);
+        let mut m = self.codes.lock().unwrap();
+        let now = now_ms();
+        m.retain(|_, c| c.expires_at_ms > now);
+        if m.len() >= MAX_AUTH_CODES {
+            if let Some(oldest_key) = m
+                .iter()
+                .min_by_key(|(_, c)| c.expires_at_ms)
+                .map(|(k, _)| k.clone())
+            {
+                m.remove(&oldest_key);
+            }
+        }
+        m.insert(key, c);
     }
     fn take_code(&self, key: &str) -> Option<AuthCode> {
         let mut m = self.codes.lock().unwrap();
@@ -206,7 +237,7 @@ async fn authorize(State(state): State<AsState>, Query(p): Query<AuthorizeParams
     if p.code_challenge_method != "S256" {
         return bad_request("invalid_request", "code_challenge_method must be S256");
     }
-    // Verify client exists + redirect_uri is registered.
+    // Verify client exists + redirect_uri is registered + grant_types includes authorization_code.
     let client = match llm_memory_storage::oauth_clients::get(&state.pool, &p.client_id).await {
         Ok(Some(c)) => c,
         _ => return bad_request("invalid_client", "unknown client_id"),
@@ -214,6 +245,15 @@ async fn authorize(State(state): State<AsState>, Query(p): Query<AuthorizeParams
     let allowed: Vec<String> = serde_json::from_str(&client.redirect_uris).unwrap_or_default();
     if !allowed.contains(&p.redirect_uri) {
         return bad_request("invalid_request", "redirect_uri not registered");
+    }
+    // DCR 時に登録された grant_types を enforce する。authorization_code を
+    // 持たないクライアントは /authorize を踏ませない (OAuth 2.0 §3.1, §3.2.2)。
+    let grants: Vec<String> = serde_json::from_str(&client.grant_types).unwrap_or_default();
+    if !grants.iter().any(|g| g == "authorization_code") {
+        return bad_request(
+            "unauthorized_client",
+            "client did not register the authorization_code grant",
+        );
     }
 
     // Touch the client's last-seen timestamp.
@@ -332,7 +372,10 @@ struct TokenResponse {
     access_token: String,
     token_type: &'static str,
     expires_in: i64,
-    refresh_token: String,
+    /// `refresh_token` は client が DCR で `refresh_token` grant を登録した
+    /// 場合のみ発行する。未登録クライアントには `None` で field 自体を省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
 }
 
 async fn token(State(state): State<AsState>, Form(body): Form<TokenForm>) -> Response {
@@ -344,6 +387,17 @@ async fn token(State(state): State<AsState>, Form(body): Form<TokenForm>) -> Res
             "only authorization_code or refresh_token",
         ),
     }
+}
+
+/// Look up a registered client and return its `grant_types` array.
+/// Returns `None` if the client is unknown — caller should respond with
+/// `invalid_client`.
+async fn client_grant_types(pool: &SqlitePool, client_id: &str) -> Option<Vec<String>> {
+    let client = llm_memory_storage::oauth_clients::get(pool, client_id)
+        .await
+        .ok()
+        .flatten()?;
+    Some(serde_json::from_str(&client.grant_types).unwrap_or_default())
 }
 
 async fn grant_auth_code(state: AsState, body: TokenForm) -> Response {
@@ -378,7 +432,13 @@ async fn grant_auth_code(state: AsState, body: TokenForm) -> Response {
             return bad_request("invalid_grant", "redirect_uri mismatch");
         }
     }
-    issue_tokens(state, &entry.user_id, &entry.client_id).await
+    // refresh_token grant が登録されていれば一緒に発行、そうでなければ access のみ。
+    let grants = match client_grant_types(&state.pool, &entry.client_id).await {
+        Some(g) => g,
+        None => return bad_request("invalid_client", "unknown client_id"),
+    };
+    let include_refresh = grants.iter().any(|g| g == "refresh_token");
+    issue_tokens(state, &entry.user_id, &entry.client_id, include_refresh).await
 }
 
 async fn grant_refresh(state: AsState, body: TokenForm) -> Response {
@@ -387,40 +447,58 @@ async fn grant_refresh(state: AsState, body: TokenForm) -> Response {
         None => return bad_request("invalid_request", "refresh_token required"),
     };
     let now = now_ms();
+    // Atomic validate+revoke: 同 token を提示した並行 2 リクエストのうち、
+    // 1 つだけが (user_id, client_id) を取れる。これで rotation race を閉じる。
     let (user_id, client_id) =
-        match llm_memory_storage::tokens::validate_refresh(&state.pool, &tok, now).await {
+        match llm_memory_storage::tokens::validate_and_revoke(&state.pool, &tok, now).await {
             Ok(Some(x)) => x,
             Ok(None) => return bad_request("invalid_grant", "refresh_token unknown or expired"),
             Err(e) => return server_error(&e.to_string()),
         };
-    // Rotation: 旧 refresh token を即座に revoke してから新 token を発行する。
-    // RFC 6749 §10.4 + RFC 6819 §5.2.2.3 で推奨される token theft 影響抑制策。
-    // ※ revoke 失敗時は server_error。新 token を発行しないので token テーブルの
-    //   整合性は保たれる (古い token はまだ有効だが、client は新 token を持たない)。
-    if let Err(e) = llm_memory_storage::tokens::revoke(&state.pool, &tok, now).await {
-        return server_error(&e.to_string());
+    // 登録された grant_types に refresh_token が含まれていなければ refuse。
+    // (旧 token は既に revoke 済みなので、reject 時はクライアントは再認可が必要)
+    let grants = match client_grant_types(&state.pool, &client_id).await {
+        Some(g) => g,
+        None => return bad_request("invalid_client", "unknown client_id"),
+    };
+    if !grants.iter().any(|g| g == "refresh_token") {
+        return bad_request(
+            "unauthorized_client",
+            "client did not register the refresh_token grant",
+        );
     }
-    issue_tokens(state, &user_id, &client_id).await
+    issue_tokens(state, &user_id, &client_id, true).await
 }
 
-async fn issue_tokens(state: AsState, user_id: &str, client_id: &str) -> Response {
+/// Issue access + (optionally) refresh tokens.
+async fn issue_tokens(
+    state: AsState,
+    user_id: &str,
+    client_id: &str,
+    include_refresh: bool,
+) -> Response {
     let access = match jwt::issue(&state.jwt_keys, user_id, client_id, ACCESS_TOKEN_TTL_SECS) {
         Ok(t) => t,
         Err(e) => return server_error(&e.to_string()),
     };
-    let refresh = new_ulid();
-    let expires_at = now_ms() + REFRESH_TOKEN_TTL_SECS * 1000;
-    if let Err(e) = llm_memory_storage::tokens::create_refresh(
-        &state.pool,
-        &refresh,
-        user_id,
-        client_id,
-        expires_at,
-    )
-    .await
-    {
-        return server_error(&e.to_string());
-    }
+    let refresh = if include_refresh {
+        let r = new_ulid();
+        let expires_at = now_ms() + REFRESH_TOKEN_TTL_SECS * 1000;
+        if let Err(e) = llm_memory_storage::tokens::create_refresh(
+            &state.pool,
+            &r,
+            user_id,
+            client_id,
+            expires_at,
+        )
+        .await
+        {
+            return server_error(&e.to_string());
+        }
+        Some(r)
+    } else {
+        None
+    };
     Json(TokenResponse {
         access_token: access,
         token_type: "Bearer",
@@ -559,6 +637,32 @@ mod tests {
         let s = test_state().await;
         let app = router().with_state(s);
         let q = "response_type=code&client_id=unknown&redirect_uri=https%3A%2F%2Fc%2Fcb&code_challenge=x&code_challenge_method=S256";
+        let req = Request::get(format!("/oauth/authorize?{q}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_client_without_authorization_code_grant() {
+        // 登録された grant_types が refresh_token しか持っていない client が
+        // /authorize を踏むと 400 を返す (grant_types enforce 回帰)。
+        let s = test_state().await;
+        let client = llm_memory_storage::oauth_clients::register(
+            &s.pool,
+            r#"["https://app.example.com/cb"]"#,
+            r#"["refresh_token"]"#,
+            "none",
+            None,
+        )
+        .await
+        .unwrap();
+        let app = router().with_state(s);
+        let q = format!(
+            "response_type=code&client_id={}&redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb&code_challenge=x&code_challenge_method=S256",
+            client.id
+        );
         let req = Request::get(format!("/oauth/authorize?{q}"))
             .body(Body::empty())
             .unwrap();
