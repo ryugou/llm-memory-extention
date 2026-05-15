@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/llm-memory-core",
+    "crates/llm-memory-storage",
+    "crates/llm-memory-llm",
+    "crates/llm-memory-coordinator",
+    "crates/llm-memory-auth",
+    "crates/llm-memory-server",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ulid = { version = "1", features = ["serde"] }
+jsonwebtoken = "9"
+oauth2 = "4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "1"
+anyhow = "1"
+async-trait = "0.1"
+prometheus = "0.13"
+sha2 = "0.10"
+base64 = "0.22"
+url = "2"
+regex = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# target/ 肥大化抑制。codegen-units を絞って .rcgu.o の数を減らし、
+# 依存クレートの debug info を落として DWARF を捨てる。
+[profile.dev]
+codegen-units = 16
+
+[profile.dev.package."*"]
+debug = false

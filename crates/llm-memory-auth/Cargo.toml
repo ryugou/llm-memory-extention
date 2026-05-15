@@ -1,0 +1,27 @@
+[package]
+name = "llm-memory-auth"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+llm-memory-core = { path = "../llm-memory-core" }
+llm-memory-storage = { path = "../llm-memory-storage" }
+axum.workspace = true
+axum-extra.workspace = true
+jsonwebtoken.workspace = true
+oauth2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+reqwest.workspace = true
+url.workspace = true
+base64.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+futures = "0.3"
