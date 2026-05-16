@@ -175,7 +175,6 @@ RUST_LOG=info
 PUBLIC_DOMAIN=34-146-12-34.nip.io
 PUBLIC_URL=https://34-146-12-34.nip.io
 LITESTREAM_BUCKET=<your-gcp-project>-memory-backup
-COMPOSE_PROJECT_NAME=llm-memory-extention
 ```
 
 `34-146-12-34` は §3 で予約した IP の `.` を `-` に置換した値。`<your-gcp-project>` はローカルで設定した `${GCP_PROJECT_ID}` の値で置換する。
@@ -190,10 +189,13 @@ chmod 600 ~/llm-memory-extention/.env
 
 ```bash
 cd ~/llm-memory-extention/docker
-sudo docker compose --env-file ../.env config | grep -E '^[[:space:]]+PUBLIC_URL:'
+sudo docker compose -p llm-memory-extention --env-file ../.env config \
+  | grep -E '^[[:space:]]+PUBLIC_URL:'
 # 期待値: PUBLIC_URL: https://34-146-12-34.nip.io (完全な URL)
 # 失敗: PUBLIC_URL: https://${PUBLIC_DOMAIN} などのリテラルが残る → .env が誤り
 ```
+
+以降、すべての `docker compose ...` コマンドに `-p llm-memory-extention --env-file ../.env` を付ける。`COMPOSE_PROJECT_NAME` は compose CLI の挙動を変える環境変数で、`--env-file` 経由では読まれないため、フラグで明示する必要がある。
 
 ## 7. Google OAuth Console に redirect URI 追加
 
@@ -207,7 +209,7 @@ VM 内で:
 
 ```bash
 cd ~/llm-memory-extention/docker
-sudo docker compose --env-file ../.env up --build -d
+sudo docker compose -p llm-memory-extention --env-file ../.env up --build -d
 ```
 
 初回ビルドは e2-medium で 5〜10 分かかる (Rust 全クレートを release プロファイルで compile)。`sudo` を毎回付けるのは Accepted Risk セクションの方針通り。
@@ -227,7 +229,7 @@ VM 内のサーバーログ:
 
 ```bash
 cd ~/llm-memory-extention/docker
-sudo docker compose logs -f --tail=200 server caddy
+sudo docker compose -p llm-memory-extention --env-file ../.env logs -f --tail=200 server caddy
 ```
 
 ## 10. Claude Desktop 連携
@@ -252,7 +254,7 @@ sudo docker run --rm \
   restore -if-replica-exists /data/db.sqlite
 ```
 
-`llm-memory-extention_data` は docker-compose の named volume 名 (`<COMPOSE_PROJECT_NAME>_<volume>`)。`.env` の `COMPOSE_PROJECT_NAME=llm-memory-extention` で project 名を固定しているのでこの名前で OK。固定していない場合は cwd ディレクトリ名が project 名になる (例: `docker_data`) ので、念のため `sudo docker volume ls` で実名を確認すること。
+`llm-memory-extention_data` は docker-compose の named volume 名 (`<project>_<volume>`)。本ガイドでは compose CLI に `-p llm-memory-extention` を毎回付けることで project 名を固定しているのでこの名前で OK。念のため `sudo docker volume ls` で実名確認できる。
 
 ## 12. スケール上限
 
@@ -282,12 +284,12 @@ cd ~/llm-memory-extention/docker
 ### `curl https://${DOMAIN}/healthz` が応答しない
 - DNS 解決確認: `nslookup ${DOMAIN}` → VM の static IP が返るか
 - ファイアウォール: `gcloud compute firewall-rules list --filter='name=allow-https-llm-memory'`
-- Caddy ログ: `sudo docker compose logs caddy | tail -50`
+- Caddy ログ: `sudo docker compose -p llm-memory-extention --env-file ../.env logs caddy | tail -50`
 - Let's Encrypt rate limit (週 50 cert/domain) に当たっていれば 5 日待つか staging endpoint を試す
 
 ### サーバー起動時に「`no JWT_SIGNING_KEY_<kid> environment variable configured`」エラー
 - `.env` に `JWT_SIGNING_KEY_v1=...` (base64, decode 後 >= 32 bytes) があるか確認
-- `sudo docker compose --env-file ../.env config | grep JWT` で env 注入を確認
+- `sudo docker compose -p llm-memory-extention --env-file ../.env config | grep JWT` で env 注入を確認
 
 ### OAuth callback で `invalid_grant` / `redirect_uri mismatch`
 - Google OAuth Console の Authorized redirect URIs と `${PUBLIC_URL}/oauth/callback/google` が一致するか確認
@@ -295,21 +297,21 @@ cd ~/llm-memory-extention/docker
 
 ### litestream が GCS に書き込めない
 - VM の Instance SA が GCS bucket に `roles/storage.objectAdmin` を持つか: `gsutil iam get gs://${GCP_PROJECT_ID}-memory-backup`
-- litestream ログ: `sudo docker compose logs litestream`
+- litestream ログ: `sudo docker compose -p llm-memory-extention --env-file ../.env logs litestream`
 
 ### Caddy が証明書を取得できない (`tls: no certificate found`)
 - `tcp/80` が開放されているか (HTTP-01 challenge 用)
 - DNS 確認 (nip.io が解決するか): `nslookup ${PUBLIC_DOMAIN}`
-- caddy ログを確認: `sudo docker compose logs caddy | grep -E 'acme|tls'`
+- caddy ログを確認: `sudo docker compose -p llm-memory-extention --env-file ../.env logs caddy | grep -E 'acme|tls'`
 
 **最終手段** として caddy_data volume を削除すると ACME account + cert cache が消えて再発行が走る。ただし:
 
 - Let's Encrypt の rate limit (`50 cert / domain / week` 等) に近い状況だと悪化する
-- volume 名は compose project 名 (= ディレクトリ名) 依存なので `sudo docker volume ls | grep caddy` で実名を確認してから削除
+- volume 名は compose project 名依存。本ガイドは `-p llm-memory-extention` で固定しているので `llm-memory-extention_caddy_data` のはずだが、念のため `sudo docker volume ls | grep caddy` で実名確認してから削除
 
 ```bash
-sudo docker compose down
-sudo docker volume ls | grep caddy   # 実名確認 (COMPOSE_PROJECT_NAME 固定なら llm-memory-extention_caddy_data)
+sudo docker compose -p llm-memory-extention --env-file ../.env down
+sudo docker volume ls | grep caddy   # 実名確認 (`-p llm-memory-extention` 経由なら llm-memory-extention_caddy_data)
 sudo docker volume rm <実名>          # 例: llm-memory-extention_caddy_data
-sudo docker compose --env-file ../.env up -d
+sudo docker compose -p llm-memory-extention --env-file ../.env up -d
 ```

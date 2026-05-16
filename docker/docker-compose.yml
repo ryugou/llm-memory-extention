@@ -31,8 +31,12 @@ services:
       - ./litestream.yml:/etc/litestream.yml:ro
     # GCE VM の instance service account を ADC で読むので、SA key ファイルは
     # マウントしない (gcp-sa.json をディスクに置く運用を避ける)。
-    depends_on:
-      - server
+    #
+    # `depends_on: server` は付けない: dependents 先停止のルールで
+    # `docker compose down` 時に litestream が server より先に止まり、
+    # server がまだ DB に書き込んでいる窓で replicate が止まる race を
+    # 避けるため (litestream 自体は DB ファイル不在でも起動可能なので
+    # 起動順依存はない)。
     restart: unless-stopped
 
   caddy:
