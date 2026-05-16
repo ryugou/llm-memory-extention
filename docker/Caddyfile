@@ -3,6 +3,10 @@
 {$PUBLIC_DOMAIN} {
     encode zstd gzip
 
+    # OAuth callback の URL クエリには `code` / `state` (機密情報) が
+    # 含まれるため、access log には残さない。
+    log_skip /oauth/callback/google
+
     # `server` は docker-compose 内のサービス名。8080 にプロキシ。
     reverse_proxy server:8080
 

@@ -65,10 +65,11 @@ openssl rand -base64 32
 
 `https://console.cloud.google.com/apis/credentials` で:
 
-1. OAuth consent screen 設定 (User Type: External, Test mode)
-2. Credentials → Create credentials → OAuth client ID → Web application
-3. Authorized redirect URIs に **後で** `https://<IP>.nip.io/oauth/callback/google` を追加 (VM 作成後に IP が確定するため)
-4. client_id と client_secret をメモ
+1. OAuth consent screen 設定 (User Type: External, Publishing status: Testing)
+2. **Test users に自分の Google アカウント (Claude Desktop から sign-in する予定のアドレス) を追加** — External + Testing アプリは Test users に登録されたアドレスしか sign-in を許可しない。漏らすと callback まで届かない
+3. Credentials → Create credentials → OAuth client ID → Web application
+4. Authorized redirect URIs に **後で** `https://<IP>.nip.io/oauth/callback/google` を追加 (VM 作成後に IP が確定するため)
+5. client_id と client_secret をメモ
 
 ## 2. インスタンス用 Service Account 作成
 
@@ -139,13 +140,25 @@ gcloud compute ssh llm-memory --zone=asia-northeast1-a
 VM 内で:
 
 ```bash
-# Docker と git をインストール
+# git と curl のインストール
 sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-plugin git
+sudo apt-get install -y git curl ca-certificates
+
+# Docker と Compose v2 plugin を Docker 公式 repo から取得 (Debian 12 の
+# default repo には docker-compose-plugin が無いため、`apt-get install
+# docker-compose-plugin` では失敗する)。公式の get.docker.com スクリプトを
+# 使うのが最小手数。
+curl -fsSL https://get.docker.com | sudo sh
 
 # (注意) ユーザを `docker` group に入れる慣例があるが、`docker` group メンバー
 # は実質 root 権限になる (docker 経由でホストを bind-mount できる)。本ガイドは
 # 個人 VM 想定のため、毎回 `sudo docker compose ...` で実行する方針にする。
+```
+
+インストール確認:
+
+```bash
+sudo docker compose version    # e.g. Docker Compose version v2.x.x
 ```
 
 VM 内で続行:
