@@ -20,9 +20,10 @@ services:
     # 起動順を litestream → server に、停止順を server → litestream に固定する
     # (順序保証のみ)。litestream の終端 sync が成功するかは別問題で、graceful
     # shutdown (SIGTERM) なら litestream が最後の sync を実行するが、kill -9 や
-    # OOM では `sync-interval` (5m) 分の write が GCS 未反映で失われ得る。
-    # ロス窓を縮めたければ `litestream.yml` の sync-interval を短くするか、停止
-    # 前に手動 `litestream snapshot` を打つ運用にする (deploy/gce/README §11-1)。
+    # OOM では `sync-interval` (5m) 分の write が GCS 未反映で失われ得る (= RPO 5m)。
+    # ロス窓を縮めたければ `litestream.yml` の `sync-interval` を短くする
+    # (例: 30s) — Litestream 0.3.x には push trigger サブコマンドが無いので
+    # 定期 sync の間隔を絞るしかない。詳細は deploy/gce/README §11-1。
     depends_on:
       - litestream
     restart: unless-stopped

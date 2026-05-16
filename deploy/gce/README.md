@@ -283,7 +283,7 @@ sudo docker run --rm \
 - graceful shutdown: ほぼロスレス (server stop → litestream 最終 sync → litestream stop)
 - ungraceful (kill -9 / OOM / VM クラッシュ): `sync-interval: 5m` 分まで replica に未反映の write が失われ得る (= RPO 5 分)
 
-ロス窓を縮めたければ `docker/litestream.yml` の `sync-interval` を短く (例: `30s`) するか、停止前に手動で `sudo docker exec <litestream> litestream snapshot /data/db.sqlite` を打つ運用に切り替える。
+ロス窓を縮めたい場合、Litestream 0.3.x には外部から sync を強制する push trigger コマンドが無いので、`docker/litestream.yml` の `sync-interval` を短く (例: `30s`) するのが唯一の手段。間隔を絞ると GCS API quota の月次消費が増えるので運用適正値とのトレードオフ。
 
 ## 12. スケール上限
 

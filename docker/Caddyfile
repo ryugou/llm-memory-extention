@@ -1,10 +1,13 @@
 # nip.io 等の public hostname を `.env` の `PUBLIC_DOMAIN` で指定する。
 # Let's Encrypt HTTP-01 / TLS-ALPN-01 で証明書を自動取得する。
+# 必要バージョン: Caddy 2.5+ (`log_skip` directive 利用のため)。
+# docker-compose.yml の image: caddy:2-alpine は 2.7+ 系を pull するので OK。
 {$PUBLIC_DOMAIN} {
     encode zstd gzip
 
     # OAuth callback の URL クエリには `code` / `state` (機密情報) が
-    # 含まれるため、access log には残さない。
+    # 含まれるため、access log の対象から外す。
+    # 公式 directive: https://caddyserver.com/docs/caddyfile/directives/log_skip
     log_skip /oauth/callback/google
 
     # `server` は docker-compose 内のサービス名。8080 にプロキシ。
@@ -13,5 +16,6 @@
     log {
         output stdout
         format json
+        # access log は上の `log_skip` で /oauth/callback/google を抑止済み
     }
 }
