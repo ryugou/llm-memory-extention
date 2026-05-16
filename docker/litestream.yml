@@ -4,5 +4,7 @@ dbs:
       - type: gcs
         bucket: ${LITESTREAM_BUCKET}
         path: db.sqlite
-        retention: 24h
-        sync-interval: 1s
+        # 個人用: 5 分 RPO・1 週間 retention で GCS API quota / ストレージ使用量を抑える。
+        # 業務用に切り替える場合は短くする (1s / 24h など)。
+        retention: 168h
+        sync-interval: 5m
