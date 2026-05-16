@@ -182,10 +182,17 @@ LITESTREAM_BUCKET=<your-gcp-project>-memory-backup
 書き込み後、secret 漏洩防止のためファイル権限を絞る:
 
 ```bash
-chmod 600 .env
+chmod 600 ~/llm-memory-extention/.env
 ```
 
-確認: `sudo docker compose --env-file ../.env config | grep -E '^\s+PUBLIC_URL:'` で `PUBLIC_URL: https://34-146-12-34.nip.io` のように **完全な URL** が表示されること (`${PUBLIC_DOMAIN}` の文字列が残っていたら .env が誤り)。
+`.env` 展開の確認 (compose は env-file 内の `${...}` を展開しないので、文字列リテラル混入を検出する):
+
+```bash
+cd ~/llm-memory-extention/docker
+sudo docker compose --env-file ../.env config | grep -E '^\s+PUBLIC_URL:'
+# 期待値: PUBLIC_URL: https://34-146-12-34.nip.io (完全な URL)
+# 失敗: PUBLIC_URL: https://${PUBLIC_DOMAIN} などのリテラルが残る → .env が誤り
+```
 
 ## 7. Google OAuth Console に redirect URI 追加
 
@@ -206,7 +213,7 @@ sudo docker compose --env-file ../.env up --build -d
 
 ## 9. 動作確認
 
-ローカルマシンから (`jq` 未導入なら `brew install jq` / `apt-get install jq`、または最後の `| jq` を省く):
+ローカルマシンから (素の `curl` のみ。整形して読みたければ `| jq` を付けて OK):
 
 ```bash
 DOMAIN=34-146-12-34.nip.io   # ← 実際の値に置換
@@ -261,6 +268,12 @@ SQLite + シングルプロセスのため:
 
 ## 14. トラブルシューティング
 
+以下のコマンドはすべて **VM 上の `~/llm-memory-extention/docker` ディレクトリで実行** することを前提とする (compose file がそこに存在するため):
+
+```bash
+cd ~/llm-memory-extention/docker
+```
+
 ### `docker compose up --build` が OOM で落ちる
 - `dmesg | grep -i kill` で OOM Kill を確認
 - 解決策: VM を `e2-medium` 以上に変更 (`gcloud compute instances set-machine-type`)、または `--build` 中だけ swap 2 GB を一時追加
@@ -294,7 +307,6 @@ SQLite + シングルプロセスのため:
 - volume 名は compose project 名 (= ディレクトリ名) 依存なので `sudo docker volume ls | grep caddy` で実名を確認してから削除
 
 ```bash
-cd ~/llm-memory-extention/docker
 sudo docker compose down
 sudo docker volume ls | grep caddy   # 実名確認
 sudo docker volume rm <実名>          # 例: llm-memory-extention_caddy_data
