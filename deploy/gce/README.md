@@ -12,9 +12,9 @@ export GCP_PROJECT_ID=<your-gcp-project>
 
 このガイドは **Phase 1 個人用** を想定。以下は意図的に受容しているリスクで、業務利用時は再評価が必要:
 
-- **Firewall `0.0.0.0/0` で 80/443 を公開**: OAuth/MCP endpoint は public な前提。DCR スパム / 認可エンドポイント DoS は rate-limit + Copilot Round 3 Critical fix で吸収する想定 (in-mem session map は cap + pruning 済み)。
+- **Firewall `0.0.0.0/0` で 80/443 を公開**: OAuth/MCP endpoint は public な前提。OAuth/DCR 側に in-memory session/code map の cap + expiry pruning (`crates/llm-memory-auth/src/authorization_server.rs`) は入っているが、token 発行や DCR 自体に per-IP rate-limit は無いため、悪意ある相手が DCR スパム / authorize spam を投げると CPU/log の負荷は受ける。MCP tool 呼び出しは認証後 per-user の rate-limit が効く。本格運用に出すなら Cloud Armor 等で前段制限を入れる。
 - **nip.io + Let's Encrypt CT log**: 取得した cert が `crt.sh` 等で永続記録されるため VM の external IP が公開ログに残る。GCE IP は scan で見つかるので追加リスクは軽微。
-- **`.env` 平文で secret 保持**: Secret Manager 連携は overkill。VM 内 root 等価権限を持つユーザだけがアクセス可能。
+- **`.env` 平文で secret 保持**: Secret Manager 連携は overkill。手順では `.env` 作成後に `chmod 600 .env` でファイル所有者以外を読めない状態にする。`sudo docker compose` を踏める権限 (= 実質 root) を持つユーザだけ secret に到達できる。
 - **VM の Instance SA に `--scopes=cloud-platform`**: scope はあくまでメタデータ token 経由で叩ける API の上限を定めるだけ。実際の権限は SA に付与した IAM role (本ガイドでは `roles/storage.objectAdmin` のみ) で制御。
 
 ## アーキテクチャ
@@ -146,6 +146,12 @@ sudo apt-get install -y docker.io docker-compose-plugin git
 VM 内で続行:
 
 ```bash
+# README 内で参照する project ID を VM 側でも export する
+# (`${GCP_PROJECT_ID}` を含むコマンドを VM で実行するため)
+export GCP_PROJECT_ID=<your-gcp-project>
+# ログイン毎に有効化したいなら ~/.bashrc に追記:
+echo "export GCP_PROJECT_ID=${GCP_PROJECT_ID}" >> ~/.bashrc
+
 # リポジトリ取得 (public repo を前提)。private repo なら deploy key を別途設定。
 git clone https://github.com/ryugou/llm-memory-extention.git
 cd llm-memory-extention
@@ -154,7 +160,7 @@ cd llm-memory-extention
 nano .env
 ```
 
-`.env` の内容:
+`.env` の内容 (compose の env-file はシェル展開しないので、`${...}` は **使わず** すべて直書き):
 
 ```
 DATABASE_URL=sqlite:///data/db.sqlite
@@ -166,12 +172,20 @@ TRUSTED_PROXY_COUNT=1
 MODEL_HAIKU=claude-haiku-4-5-20251001
 MODEL_SONNET=claude-sonnet-4-6
 RUST_LOG=info
-PUBLIC_DOMAIN=<IP の `.` を `-` に置換>.nip.io
-PUBLIC_URL=https://${PUBLIC_DOMAIN}
+PUBLIC_DOMAIN=34-146-12-34.nip.io
+PUBLIC_URL=https://34-146-12-34.nip.io
 LITESTREAM_BUCKET=<your-gcp-project>-memory-backup
 ```
 
-`<your-gcp-project>` はローカルで設定した `${GCP_PROJECT_ID}` の値で置換する。
+`34-146-12-34` は §3 で予約した IP の `.` を `-` に置換した値。`<your-gcp-project>` はローカルで設定した `${GCP_PROJECT_ID}` の値で置換する。
+
+書き込み後、secret 漏洩防止のためファイル権限を絞る:
+
+```bash
+chmod 600 .env
+```
+
+確認: `sudo docker compose --env-file ../.env config | grep -E '^\s+PUBLIC_URL:'` で `PUBLIC_URL: https://34-146-12-34.nip.io` のように **完全な URL** が表示されること (`${PUBLIC_DOMAIN}` の文字列が残っていたら .env が誤り)。
 
 ## 7. Google OAuth Console に redirect URI 追加
 
@@ -192,12 +206,12 @@ sudo docker compose --env-file ../.env up --build -d
 
 ## 9. 動作確認
 
-ローカルマシンから:
+ローカルマシンから (`jq` 未導入なら `brew install jq` / `apt-get install jq`、または最後の `| jq` を省く):
 
 ```bash
 DOMAIN=34-146-12-34.nip.io   # ← 実際の値に置換
 curl https://${DOMAIN}/healthz                              # → ok
-curl https://${DOMAIN}/.well-known/oauth-authorization-server | jq
+curl https://${DOMAIN}/.well-known/oauth-authorization-server
 curl https://${DOMAIN}/metrics | head
 ```
 
@@ -220,7 +234,8 @@ Claude Desktop の MCP 設定に追加 (詳細は `docs/superpowers/runbooks/e2e
 新しい VM に移行する場合、初回起動前に GCS から `db.sqlite` を復元:
 
 ```bash
-# VM 内、docker compose up する前に。${GCP_PROJECT_ID} は .env と揃える。
+# VM 上で実行。docker compose up する前に。
+cd ~/llm-memory-extention/docker
 sudo docker run --rm \
   -v llm-memory-extention_data:/data \
   -v "$PWD/litestream.yml:/etc/litestream.yml:ro" \
@@ -229,7 +244,7 @@ sudo docker run --rm \
   restore -if-replica-exists /data/db.sqlite
 ```
 
-`llm-memory-extention_data` は docker-compose の named volume 名 (`<project>_<volume>`)。
+`llm-memory-extention_data` は docker-compose の named volume 名 (compose 規約: `<project>_<volume>`)。`project` 部分はディレクトリ名から自動で付くため、実環境では `sudo docker volume ls` で正しい名前を確認すること。
 
 ## 12. スケール上限
 
@@ -270,5 +285,18 @@ SQLite + シングルプロセスのため:
 
 ### Caddy が証明書を取得できない (`tls: no certificate found`)
 - `tcp/80` が開放されているか (HTTP-01 challenge 用)
-- DNS 確認 (nip.io が解決するか)
-- caddy_data volume を削除して retry: `sudo docker compose down && sudo docker volume rm llm-memory-extention_caddy_data && sudo docker compose up -d`
+- DNS 確認 (nip.io が解決するか): `nslookup ${PUBLIC_DOMAIN}`
+- caddy ログを確認: `sudo docker compose logs caddy | grep -E 'acme|tls'`
+
+**最終手段** として caddy_data volume を削除すると ACME account + cert cache が消えて再発行が走る。ただし:
+
+- Let's Encrypt の rate limit (`50 cert / domain / week` 等) に近い状況だと悪化する
+- volume 名は compose project 名 (= ディレクトリ名) 依存なので `sudo docker volume ls | grep caddy` で実名を確認してから削除
+
+```bash
+cd ~/llm-memory-extention/docker
+sudo docker compose down
+sudo docker volume ls | grep caddy   # 実名確認
+sudo docker volume rm <実名>          # 例: llm-memory-extention_caddy_data
+sudo docker compose --env-file ../.env up -d
+```
