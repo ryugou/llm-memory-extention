@@ -175,6 +175,7 @@ RUST_LOG=info
 PUBLIC_DOMAIN=34-146-12-34.nip.io
 PUBLIC_URL=https://34-146-12-34.nip.io
 LITESTREAM_BUCKET=<your-gcp-project>-memory-backup
+COMPOSE_PROJECT_NAME=llm-memory-extention
 ```
 
 `34-146-12-34` は §3 で予約した IP の `.` を `-` に置換した値。`<your-gcp-project>` はローカルで設定した `${GCP_PROJECT_ID}` の値で置換する。
@@ -189,7 +190,7 @@ chmod 600 ~/llm-memory-extention/.env
 
 ```bash
 cd ~/llm-memory-extention/docker
-sudo docker compose --env-file ../.env config | grep -E '^\s+PUBLIC_URL:'
+sudo docker compose --env-file ../.env config | grep -E '^[[:space:]]+PUBLIC_URL:'
 # 期待値: PUBLIC_URL: https://34-146-12-34.nip.io (完全な URL)
 # 失敗: PUBLIC_URL: https://${PUBLIC_DOMAIN} などのリテラルが残る → .env が誤り
 ```
@@ -251,7 +252,7 @@ sudo docker run --rm \
   restore -if-replica-exists /data/db.sqlite
 ```
 
-`llm-memory-extention_data` は docker-compose の named volume 名 (compose 規約: `<project>_<volume>`)。`project` 部分はディレクトリ名から自動で付くため、実環境では `sudo docker volume ls` で正しい名前を確認すること。
+`llm-memory-extention_data` は docker-compose の named volume 名 (`<COMPOSE_PROJECT_NAME>_<volume>`)。`.env` の `COMPOSE_PROJECT_NAME=llm-memory-extention` で project 名を固定しているのでこの名前で OK。固定していない場合は cwd ディレクトリ名が project 名になる (例: `docker_data`) ので、念のため `sudo docker volume ls` で実名を確認すること。
 
 ## 12. スケール上限
 
@@ -308,7 +309,7 @@ cd ~/llm-memory-extention/docker
 
 ```bash
 sudo docker compose down
-sudo docker volume ls | grep caddy   # 実名確認
+sudo docker volume ls | grep caddy   # 実名確認 (COMPOSE_PROJECT_NAME 固定なら llm-memory-extention_caddy_data)
 sudo docker volume rm <実名>          # 例: llm-memory-extention_caddy_data
 sudo docker compose --env-file ../.env up -d
 ```

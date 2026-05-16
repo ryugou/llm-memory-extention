@@ -4,18 +4,15 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     image: llm-memory-server:local
+    # JWT key rotation (JWT_SIGNING_KEY_v1, v2, ...) を後から追加できるよう、
+    # 個別列挙ではなく `.env` 全体を環境変数として流し込む。container は app
+    # 起動時に `JWT_SIGNING_KEY_<kid>` を std::env::vars() で全列挙して読む。
+    # `.env` 例 / 必須 key の説明はリポジトリ root の `.env.example` 参照。
+    env_file: ../.env
+    # Docker 内固定値の上書き (env_file より優先される)。
     environment:
       - DATABASE_URL=sqlite:///data/db.sqlite
       - BIND_ADDR=0.0.0.0:8080
-      - PUBLIC_URL=${PUBLIC_URL}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}
-      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
-      - JWT_SIGNING_KEY_v1=${JWT_SIGNING_KEY_v1}
-      - TRUSTED_PROXY_COUNT=${TRUSTED_PROXY_COUNT:-1}
-      - MODEL_HAIKU=${MODEL_HAIKU:-claude-haiku-4-5-20251001}
-      - MODEL_SONNET=${MODEL_SONNET:-claude-sonnet-4-6}
-      - RUST_LOG=${RUST_LOG:-info}
     volumes:
       - data:/data
     expose:
