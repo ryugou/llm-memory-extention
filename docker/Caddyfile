@@ -1,0 +1,13 @@
+# nip.io 等の public hostname を `.env` の `PUBLIC_DOMAIN` で指定する。
+# Let's Encrypt HTTP-01 / TLS-ALPN-01 で証明書を自動取得する。
+{$PUBLIC_DOMAIN} {
+    encode zstd gzip
+
+    # `server` は docker-compose 内のサービス名。8080 にプロキシ。
+    reverse_proxy server:8080
+
+    log {
+        output stdout
+        format json
+    }
+}

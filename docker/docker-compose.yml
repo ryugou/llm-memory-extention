@@ -1,10 +1,9 @@
-version: "3.9"
-
 services:
   server:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: llm-memory-server:local
     environment:
       - DATABASE_URL=sqlite:///data/db.sqlite
       - BIND_ADDR=0.0.0.0:8080
@@ -14,25 +13,48 @@ services:
       - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
       - JWT_SIGNING_KEY_v1=${JWT_SIGNING_KEY_v1}
       - TRUSTED_PROXY_COUNT=${TRUSTED_PROXY_COUNT:-1}
+      - MODEL_HAIKU=${MODEL_HAIKU:-claude-haiku-4-5-20251001}
+      - MODEL_SONNET=${MODEL_SONNET:-claude-sonnet-4-6}
       - RUST_LOG=${RUST_LOG:-info}
     volumes:
       - data:/data
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
     restart: unless-stopped
 
   litestream:
     image: litestream/litestream:0.3.13
+    # litestream.yml が `${LITESTREAM_BUCKET}` を参照するので、コンテナ環境に
+    # 確実に注入する必要がある (compose の .env interpolation はファイルにしか効かない)。
+    environment:
+      - LITESTREAM_BUCKET=${LITESTREAM_BUCKET}
     command: ["replicate"]
     volumes:
       - data:/data
       - ./litestream.yml:/etc/litestream.yml:ro
-      - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/etc/gcp-sa.json:ro
+    # GCE VM の instance service account を ADC で読むので、SA key ファイルは
+    # マウントしない (gcp-sa.json をディスクに置く運用を避ける)。
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
     environment:
-      - GOOGLE_APPLICATION_CREDENTIALS=/etc/gcp-sa.json
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN}
     depends_on:
       - server
     restart: unless-stopped
 
 volumes:
   data:
+  caddy_data:
+  caddy_config:
