@@ -1,38 +1,65 @@
-version: "3.9"
-
 services:
   server:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: llm-memory-server:local
+    # JWT key rotation (JWT_SIGNING_KEY_v1, v2, ...) を後から追加できるよう、
+    # 個別列挙ではなく `.env` 全体を環境変数として流し込む。container は app
+    # 起動時に `JWT_SIGNING_KEY_<kid>` を std::env::vars() で全列挙して読む。
+    # `.env` 例 / 必須 key の説明はリポジトリ root の `.env.example` 参照。
+    env_file: ../.env
+    # Docker 内固定値の上書き (env_file より優先される)。
     environment:
       - DATABASE_URL=sqlite:///data/db.sqlite
       - BIND_ADDR=0.0.0.0:8080
-      - PUBLIC_URL=${PUBLIC_URL}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}
-      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
-      - JWT_SIGNING_KEY_v1=${JWT_SIGNING_KEY_v1}
-      - TRUSTED_PROXY_COUNT=${TRUSTED_PROXY_COUNT:-1}
-      - RUST_LOG=${RUST_LOG:-info}
     volumes:
       - data:/data
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
+    # 起動順を litestream → server に、停止順を server → litestream に固定する
+    # (順序保証のみ)。litestream の終端 sync が成功するかは別問題で、graceful
+    # shutdown (SIGTERM) なら litestream が最後の sync を実行するが、kill -9 や
+    # OOM では `sync-interval` (5m) 分の write が GCS 未反映で失われ得る (= RPO 5m)。
+    # ロス窓を縮めたければ `litestream.yml` の `sync-interval` を短くする
+    # (例: 30s) — Litestream 0.3.x には push trigger サブコマンドが無いので
+    # 定期 sync の間隔を絞るしかない。詳細は deploy/gce/README §11-1。
+    depends_on:
+      - litestream
     restart: unless-stopped
 
   litestream:
     image: litestream/litestream:0.3.13
+    # litestream.yml が `${LITESTREAM_BUCKET}` を参照するので、コンテナ環境に
+    # 確実に注入する必要がある (compose の .env interpolation はファイルにしか効かない)。
+    environment:
+      - LITESTREAM_BUCKET=${LITESTREAM_BUCKET}
     command: ["replicate"]
     volumes:
       - data:/data
       - ./litestream.yml:/etc/litestream.yml:ro
-      - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/etc/gcp-sa.json:ro
+    # GCE VM の instance service account を ADC で読むので、SA key ファイルは
+    # マウントしない (gcp-sa.json をディスクに置く運用を避ける)。
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    # HTTP/3 (UDP/443) は Claude Desktop には不要なので open しない。
+    # tcp/80 は Let's Encrypt HTTP-01 challenge と http → https redirect 用。
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
     environment:
-      - GOOGLE_APPLICATION_CREDENTIALS=/etc/gcp-sa.json
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN}
     depends_on:
       - server
     restart: unless-stopped
 
 volumes:
   data:
+  caddy_data:
+  caddy_config:
