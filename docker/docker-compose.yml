@@ -17,6 +17,12 @@ services:
       - data:/data
     expose:
       - "8080"
+    # litestream が先に起動してから server を起こすことで、起動順を確定させる。
+    # 副次効果として `docker compose down` 時の停止順が dependents 先 (= server
+    # 先) になり、server の DB 書き込みが終わってから litestream を止める形に
+    # なるので、最後の write が GCS replica に届かないまま停止する race を防ぐ。
+    depends_on:
+      - litestream
     restart: unless-stopped
 
   litestream:
@@ -31,12 +37,6 @@ services:
       - ./litestream.yml:/etc/litestream.yml:ro
     # GCE VM の instance service account を ADC で読むので、SA key ファイルは
     # マウントしない (gcp-sa.json をディスクに置く運用を避ける)。
-    #
-    # `depends_on: server` は付けない: dependents 先停止のルールで
-    # `docker compose down` 時に litestream が server より先に止まり、
-    # server がまだ DB に書き込んでいる窓で replicate が止まる race を
-    # 避けるため (litestream 自体は DB ファイル不在でも起動可能なので
-    # 起動順依存はない)。
     restart: unless-stopped
 
   caddy:

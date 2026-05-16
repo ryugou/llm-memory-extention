@@ -39,8 +39,13 @@ gcloud config set project "${GCP_PROJECT_ID}"
 
 ### 1-2. API 有効化
 
+新規 project では IAM API も default 無効化されているので、後段の `gcloud iam service-accounts create` が失敗しないよう一緒に有効化する。
+
 ```bash
-gcloud services enable compute.googleapis.com storage.googleapis.com
+gcloud services enable \
+  compute.googleapis.com \
+  storage.googleapis.com \
+  iam.googleapis.com
 ```
 
 ### 1-3. GCS バックアップバケット作成
