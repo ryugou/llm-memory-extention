@@ -246,6 +246,8 @@ Claude Desktop の MCP 設定に追加 (詳細は `docs/superpowers/runbooks/e2e
 
 ## 11. バックアップからの復元
 
+**前提**: §8 の起動コマンドで `-p llm-memory-extention` を付けているため、compose project 名は `llm-memory-extention`、named volume は `llm-memory-extention_data` で作られている。下記 `docker run` はその volume 名にハードコードで attach する。`-p` を変えた場合は `sudo docker volume ls` で実名を確認して書き換えること。
+
 新しい VM に移行する場合、初回起動前に GCS から `db.sqlite` を復元:
 
 ```bash
@@ -259,7 +261,16 @@ sudo docker run --rm \
   restore -if-replica-exists /data/db.sqlite
 ```
 
-`llm-memory-extention_data` は docker-compose の named volume 名 (`<project>_<volume>`)。本ガイドでは compose CLI に `-p llm-memory-extention` を毎回付けることで project 名を固定しているのでこの名前で OK。念のため `sudo docker volume ls` で実名確認できる。
+## 11-1. Shutdown 時のデータ整合性 (note)
+
+`server.depends_on: - litestream` で停止順は **server → litestream** に固定されている。これにより graceful shutdown (`docker compose down`、SIGTERM 等) では server の最後の DB 書き込み完了後に litestream が止まり、litestream は SIGTERM 受領時に終端 sync を試みる。
+
+ただし `depends_on` は **順序保証のみ** で sync 完了は保証しない。具体的には:
+
+- graceful shutdown: ほぼロスレス (server stop → litestream 最終 sync → litestream stop)
+- ungraceful (kill -9 / OOM / VM クラッシュ): `sync-interval: 5m` 分まで replica に未反映の write が失われ得る (= RPO 5 分)
+
+ロス窓を縮めたければ `docker/litestream.yml` の `sync-interval` を短く (例: `30s`) するか、停止前に手動で `sudo docker exec <litestream> litestream snapshot /data/db.sqlite` を打つ運用に切り替える。
 
 ## 12. スケール上限
 

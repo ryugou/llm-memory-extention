@@ -17,10 +17,12 @@ services:
       - data:/data
     expose:
       - "8080"
-    # litestream が先に起動してから server を起こすことで、起動順を確定させる。
-    # 副次効果として `docker compose down` 時の停止順が dependents 先 (= server
-    # 先) になり、server の DB 書き込みが終わってから litestream を止める形に
-    # なるので、最後の write が GCS replica に届かないまま停止する race を防ぐ。
+    # 起動順を litestream → server に、停止順を server → litestream に固定する
+    # (順序保証のみ)。litestream の終端 sync が成功するかは別問題で、graceful
+    # shutdown (SIGTERM) なら litestream が最後の sync を実行するが、kill -9 や
+    # OOM では `sync-interval` (5m) 分の write が GCS 未反映で失われ得る。
+    # ロス窓を縮めたければ `litestream.yml` の sync-interval を短くするか、停止
+    # 前に手動 `litestream snapshot` を打つ運用にする (deploy/gce/README §11-1)。
     depends_on:
       - litestream
     restart: unless-stopped
