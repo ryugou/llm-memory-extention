@@ -124,11 +124,12 @@ mod tests {
             database_url: "sqlite::memory:".into(),
             bind_addr: "x".into(),
             public_url: "x".into(),
-            anthropic_api_key: "x".into(),
             google_client_id: "x".into(),
             google_client_secret: "x".into(),
-            model_haiku: "h".into(),
-            model_sonnet: "s".into(),
+            vertex_project: "test-project".into(),
+            vertex_location: "us-central1".into(),
+            model_extract: "h".into(),
+            model_synth: "s".into(),
             trusted_proxy_count: 1,
         })
         .await

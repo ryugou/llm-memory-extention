@@ -60,7 +60,7 @@
 
 ## 7. 障害確認
 
-- [ ] Anthropic API キーを一時的に無効化 → `raw_append` 後 rebuild が失敗、`concept_rebuild_failed_total` が増加
+- [ ] Vertex AI ADC を一時的に無効化 (VM の SA から `roles/aiplatform.user` を外す) → `raw_append` 後 rebuild が失敗、`concept_rebuild_failed_total` が増加
 - [ ] サーバ再起動 → 中断ジョブが次の append で再開
 - [ ] DB ファイル肥大 → `sqlite_db_size_bytes` メトリクスで観測
 

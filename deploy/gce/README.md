@@ -39,14 +39,17 @@ gcloud config set project "${GCP_PROJECT_ID}"
 
 ### 1-2. API 有効化
 
-新規 project では IAM API も default 無効化されているので、後段の `gcloud iam service-accounts create` が失敗しないよう一緒に有効化する。
+新規 project では IAM / Vertex AI API も default 無効化されているので、後段で必要になる API をまとめて有効化する。
 
 ```bash
 gcloud services enable \
   compute.googleapis.com \
   storage.googleapis.com \
-  iam.googleapis.com
+  iam.googleapis.com \
+  aiplatform.googleapis.com
 ```
+
+`aiplatform.googleapis.com` は Vertex AI (Gemini Flash / Pro 経由の概念抽出と wiki 合成) 用。
 
 ### 1-3. GCS バックアップバケット作成
 
@@ -83,6 +86,11 @@ gcloud iam service-accounts create "${SA_NAME}" \
 gsutil iam ch \
   "serviceAccount:${SA_NAME}@${GCP_PROJECT_ID}.iam.gserviceaccount.com:roles/storage.objectAdmin" \
   "gs://${GCP_PROJECT_ID}-memory-backup"
+
+# Vertex AI (Gemini) を ADC 経由で呼び出すための権限
+gcloud projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
+  --member="serviceAccount:${SA_NAME}@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/aiplatform.user"
 ```
 
 ## 3. 静的 IP 予約
@@ -182,13 +190,14 @@ nano .env
 
 ```
 DATABASE_URL=sqlite:///data/db.sqlite
-ANTHROPIC_API_KEY=sk-ant-...
 GOOGLE_OAUTH_CLIENT_ID=...
 GOOGLE_OAUTH_CLIENT_SECRET=...
 JWT_SIGNING_KEY_v1=<openssl rand -base64 32 の出力>
 TRUSTED_PROXY_COUNT=1
-MODEL_HAIKU=claude-haiku-4-5-20251001
-MODEL_SONNET=claude-sonnet-4-6
+VERTEX_PROJECT=<your-gcp-project>
+VERTEX_LOCATION=us-central1
+MODEL_EXTRACT=gemini-2.5-flash
+MODEL_SYNTH=gemini-2.5-pro
 RUST_LOG=info
 PUBLIC_DOMAIN=34-146-12-34.nip.io
 PUBLIC_URL=https://34-146-12-34.nip.io

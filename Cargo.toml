@@ -35,6 +35,7 @@ sha2 = "0.10"
 base64 = "0.22"
 url = "2"
 regex = "1"
+gcp_auth = "0.12"
 
 [profile.release]
 lto = "thin"

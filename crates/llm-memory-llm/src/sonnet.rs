@@ -1,8 +1,9 @@
-use crate::client::{AnthropicClient, CompleteRequest, Message};
+use crate::client::{CompleteRequest, LlmClient, Message};
 use crate::error::LlmError;
 use crate::haiku::extract_json;
-use crate::prompts::SONNET_WIKI_SYNTHESIZE_SYSTEM;
+use crate::prompts::SYNTHESIZE_WIKI_SYSTEM;
 use serde::Deserialize;
+use serde_json::json;
 
 #[derive(Debug, Deserialize)]
 pub struct WikiSynth {
@@ -10,7 +11,10 @@ pub struct WikiSynth {
     pub source_refs: Vec<String>,
 }
 
-pub struct SonnetSynthesizer<'a, C: AnthropicClient> {
+/// Wiki synthesizer (Gemini Pro 想定の本格モデル経由)。
+/// 互換性のため struct 名は `SonnetSynthesizer` のまま保持しているが、
+/// 実体は LLM provider に依存しない (LlmClient 経由)。
+pub struct SonnetSynthesizer<'a, C: LlmClient + ?Sized> {
     pub client: &'a C,
     pub model: String,
 }
@@ -21,29 +25,44 @@ pub struct SynthInput<'a> {
     pub raws: &'a [(String, String, String)], // (raw_id, title, content)
 }
 
-impl<'a, C: AnthropicClient> SonnetSynthesizer<'a, C> {
+fn synth_response_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "content": {"type": "string"},
+            "source_refs": {
+                "type": "array",
+                "items": {"type": "string"}
+            }
+        },
+        "required": ["content", "source_refs"]
+    })
+}
+
+impl<'a, C: LlmClient + ?Sized> SonnetSynthesizer<'a, C> {
     pub async fn synthesize(&self, input: SynthInput<'_>) -> Result<WikiSynth, LlmError> {
-        let user = serde_json::to_string(&serde_json::json!({
+        let user = serde_json::to_string(&json!({
             "concept": input.concept,
             "existing_wiki": input.existing_wiki,
-            "raws": input.raws.iter().map(|(id, t, c)| serde_json::json!({"id": id, "title": t, "content": c})).collect::<Vec<_>>(),
+            "raws": input.raws.iter().map(|(id, t, c)| json!({"id": id, "title": t, "content": c})).collect::<Vec<_>>(),
         }))?;
 
         let resp = self
             .client
             .complete(CompleteRequest {
                 model: self.model.clone(),
-                system: SONNET_WIKI_SYNTHESIZE_SYSTEM.into(),
+                system: SYNTHESIZE_WIKI_SYSTEM.into(),
                 messages: vec![Message {
                     role: "user".into(),
                     content: user,
                 }],
                 max_tokens: 8192,
+                response_schema: Some(synth_response_schema()),
             })
             .await?;
 
         let json_text = extract_json(&resp.content).ok_or_else(|| {
-            LlmError::Parse(format!("sonnet: no JSON in response: {}", resp.content))
+            LlmError::Parse(format!("synthesize: no JSON in response: {}", resp.content))
         })?;
         Ok(serde_json::from_str(&json_text)?)
     }
@@ -61,7 +80,7 @@ mod tests {
             .await;
         let s = SonnetSynthesizer {
             client: &mock,
-            model: "claude-sonnet-4-6".into(),
+            model: "gemini-2.5-pro".into(),
         };
         let raws = vec![(
             "01HJ1".to_string(),

@@ -7,7 +7,9 @@ use llm_memory_auth::jwt::JwtKeys;
 use llm_memory_coordinator::coordinator::Coordinator;
 use llm_memory_coordinator::state::StateMap;
 use llm_memory_coordinator::worker::WorkerDeps;
-use llm_memory_llm::client_http::AnthropicHttp;
+use llm_memory_llm::client::LlmClient;
+use llm_memory_llm::client_http::VertexAi;
+use llm_memory_llm::mock::MockClient;
 
 use crate::config::ServerConfig;
 use crate::metrics::Metrics;
@@ -15,7 +17,7 @@ use crate::metrics::Metrics;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
-    pub coordinator: Coordinator<AnthropicHttp>,
+    pub coordinator: Coordinator,
     pub jwt_keys: JwtKeys,
     pub cfg: Arc<ServerConfig>,
     pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
@@ -28,16 +30,31 @@ pub struct AppState {
 /// callers can fail fast on configuration errors (`main`) or substitute a
 /// deterministic test key (`build_state_for_tests`).
 pub async fn build_state(cfg: ServerConfig, jwt_keys: JwtKeys) -> anyhow::Result<AppState> {
+    let llm: Arc<dyn LlmClient> = Arc::new(
+        VertexAi::new(cfg.vertex_project.clone(), cfg.vertex_location.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("VertexAi init failed: {e}"))?,
+    );
+    build_state_with_llm(cfg, jwt_keys, llm).await
+}
+
+/// Shared builder used by both production (`build_state`) and tests
+/// (`build_state_for_tests`). The LLM client is injected so that tests can use
+/// `MockClient` without needing ADC credentials.
+async fn build_state_with_llm(
+    cfg: ServerConfig,
+    jwt_keys: JwtKeys,
+    llm: Arc<dyn LlmClient>,
+) -> anyhow::Result<AppState> {
     let pool = llm_memory_storage::pool::init_pool(&cfg.database_url).await?;
-    let llm = Arc::new(AnthropicHttp::new(cfg.anthropic_api_key.clone()));
     // Metrics は worker と /metrics ハンドラの両方で同じインスタンスを共有する。
     let metrics = Arc::new(Metrics::new());
     let deps = Arc::new(WorkerDeps {
         pool: pool.clone(),
         state: StateMap::new(),
         llm,
-        model_haiku: cfg.model_haiku.clone(),
-        model_sonnet: cfg.model_sonnet.clone(),
+        model_extract: cfg.model_extract.clone(),
+        model_synth: cfg.model_synth.clone(),
         metrics: metrics.clone() as Arc<dyn llm_memory_coordinator::metrics::MetricsSink>,
     });
     let coordinator = Coordinator::new(deps);
@@ -51,11 +68,12 @@ pub async fn build_state(cfg: ServerConfig, jwt_keys: JwtKeys) -> anyhow::Result
     })
 }
 
-/// Convenience wrapper for tests that injects a deterministic `JwtKeys`.
-/// Production code should use `build_state(cfg, JwtKeys::from_env()?)`.
+/// Convenience wrapper for tests: injects deterministic `JwtKeys` + `MockClient`.
+/// 単体テスト用 (ADC 不要、外部 API 呼ばない)。
 #[doc(hidden)]
 pub async fn build_state_for_tests(cfg: ServerConfig) -> anyhow::Result<AppState> {
-    build_state(cfg, JwtKeys::for_tests()).await
+    let llm: Arc<dyn LlmClient> = Arc::new(MockClient::new());
+    build_state_with_llm(cfg, JwtKeys::for_tests(), llm).await
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -117,11 +135,12 @@ mod tests {
             database_url: "sqlite::memory:".into(),
             bind_addr: "0.0.0.0:8080".into(),
             public_url: "https://test.example.com".into(),
-            anthropic_api_key: "test".into(),
             google_client_id: "id".into(),
             google_client_secret: "s".into(),
-            model_haiku: "h".into(),
-            model_sonnet: "s".into(),
+            vertex_project: "test-project".into(),
+            vertex_location: "us-central1".into(),
+            model_extract: "h".into(),
+            model_synth: "s".into(),
             trusted_proxy_count: 1,
         };
         build_state_for_tests(cfg).await.unwrap()

@@ -1,7 +1,8 @@
-use crate::client::{AnthropicClient, CompleteRequest, Message};
+use crate::client::{CompleteRequest, LlmClient, Message};
 use crate::error::LlmError;
-use crate::prompts::HAIKU_CONCEPT_EXTRACT_SYSTEM;
+use crate::prompts::EXTRACT_CONCEPTS_SYSTEM;
 use serde::Deserialize;
+use serde_json::json;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct AffectedConcepts {
@@ -9,19 +10,39 @@ pub struct AffectedConcepts {
     pub new_concepts: Vec<String>,
 }
 
-pub struct HaikuExtractor<'a, C: AnthropicClient> {
+/// Concept extractor (Gemini Flash 想定の軽量モデル経由)。
+/// 互換性のため struct 名は `HaikuExtractor` のまま保持しているが、
+/// 実体は LLM provider に依存しない (LlmClient 経由)。
+pub struct HaikuExtractor<'a, C: LlmClient + ?Sized> {
     pub client: &'a C,
     pub model: String,
 }
 
-impl<'a, C: AnthropicClient> HaikuExtractor<'a, C> {
+fn extract_response_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "affected_existing": {
+                "type": "array",
+                "items": {"type": "string"}
+            },
+            "new_concepts": {
+                "type": "array",
+                "items": {"type": "string"}
+            }
+        },
+        "required": ["affected_existing", "new_concepts"]
+    })
+}
+
+impl<'a, C: LlmClient + ?Sized> HaikuExtractor<'a, C> {
     pub async fn extract(
         &self,
         new_raws: &[(&str, &str)],
         existing_concepts: &[String],
     ) -> Result<AffectedConcepts, LlmError> {
-        let user = serde_json::to_string(&serde_json::json!({
-            "new_raws": new_raws.iter().map(|(t, c)| serde_json::json!({"title": t, "content": c})).collect::<Vec<_>>(),
+        let user = serde_json::to_string(&json!({
+            "new_raws": new_raws.iter().map(|(t, c)| json!({"title": t, "content": c})).collect::<Vec<_>>(),
             "existing_concepts": existing_concepts,
         }))?;
 
@@ -29,17 +50,20 @@ impl<'a, C: AnthropicClient> HaikuExtractor<'a, C> {
             .client
             .complete(CompleteRequest {
                 model: self.model.clone(),
-                system: HAIKU_CONCEPT_EXTRACT_SYSTEM.into(),
+                system: EXTRACT_CONCEPTS_SYSTEM.into(),
                 messages: vec![Message {
                     role: "user".into(),
                     content: user,
                 }],
                 max_tokens: 1024,
+                response_schema: Some(extract_response_schema()),
             })
             .await?;
 
+        // structured output モードでも、たまに JSON の前後に空白や fence が
+        // 残るプロバイダがあるので、念のため JSON 抽出を試みる。
         let json_text = extract_json(&resp.content).ok_or_else(|| {
-            LlmError::Parse(format!("haiku: no JSON in response: {}", resp.content))
+            LlmError::Parse(format!("extract: no JSON in response: {}", resp.content))
         })?;
         let parsed: AffectedConcepts = serde_json::from_str(&json_text)?;
         Ok(parsed)
@@ -68,7 +92,7 @@ mod tests {
             .await;
         let e = HaikuExtractor {
             client: &mock,
-            model: "claude-haiku-4-5".into(),
+            model: "gemini-2.5-flash".into(),
         };
         let r = e.extract(&[("t", "c")], &["alpha".into()]).await.unwrap();
         assert_eq!(r.affected_existing, vec!["alpha".to_string()]);

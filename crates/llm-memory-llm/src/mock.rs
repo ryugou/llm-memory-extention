@@ -1,4 +1,4 @@
-use crate::client::{AnthropicClient, CompleteRequest, CompleteResponse};
+use crate::client::{CompleteRequest, CompleteResponse, LlmClient};
 use crate::error::LlmError;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ impl MockClient {
 }
 
 #[async_trait]
-impl AnthropicClient for MockClient {
+impl LlmClient for MockClient {
     async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse, LlmError> {
         self.captured.lock().await.push(req);
         let mut responses = self.responses.lock().await;
@@ -53,7 +53,6 @@ impl AnthropicClient for MockClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::AnthropicClient;
 
     #[tokio::test]
     async fn mock_returns_pushed_responses_in_order() {
@@ -65,6 +64,7 @@ mod tests {
                 system: "".into(),
                 messages: vec![],
                 max_tokens: 10,
+                response_schema: None,
             })
             .await
             .unwrap();
@@ -81,6 +81,7 @@ mod tests {
                 system: "".into(),
                 messages: vec![],
                 max_tokens: 10,
+                response_schema: None,
             })
             .await;
         assert!(r.is_err());
