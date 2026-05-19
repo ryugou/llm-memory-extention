@@ -28,8 +28,9 @@ impl VertexAi {
         project: impl Into<String>,
         location: impl Into<String>,
     ) -> Result<Self, LlmError> {
+        // HTTP status ではなく内部エラーだが、観測しやすいよう 503 を割り当てる。
         let token_provider = gcp_auth::provider().await.map_err(|e| LlmError::Api {
-            status: 0,
+            status: 503,
             message: format!("ADC provider init failed: {e}"),
         })?;
         let location = location.into();
@@ -59,7 +60,8 @@ impl VertexAi {
             .token(scopes)
             .await
             .map_err(|e| LlmError::Api {
-                status: 0,
+                // HTTP status ではなく ADC 内部エラーだが、観測しやすいよう 503。
+                status: 503,
                 message: format!("ADC token fetch failed: {e}"),
             })?;
         Ok(token.as_str().to_string())
@@ -176,16 +178,21 @@ impl LlmClient for VertexAi {
             });
         }
         let resp: GeminiResponse = res.json().await?;
+        // candidates が空 / content 不在 / parts 空配列 / parts が全て text:null のいずれも
+        // 「実質空」とみなして Parse error にする (空文字列を呼び元に返すと extract_json
+        // が必ず失敗するので、より早く・分かりやすく検出する)。
         let content = resp
             .candidates
-            .and_then(|cs| cs.into_iter().next())
+            .and_then(|mut cs| cs.pop())
             .and_then(|c| c.content)
             .and_then(|c| c.parts)
-            .map(|ps| {
-                ps.into_iter()
-                    .filter_map(|p| p.text)
-                    .collect::<Vec<_>>()
-                    .join("")
+            .and_then(|ps| {
+                let joined: String = ps.into_iter().filter_map(|p| p.text).collect();
+                if joined.is_empty() {
+                    None
+                } else {
+                    Some(joined)
+                }
             })
             .ok_or_else(|| LlmError::Parse("vertex: empty candidate content".into()))?;
         Ok(CompleteResponse { content })
