@@ -138,7 +138,9 @@ struct PromptFeedback {
 #[async_trait]
 impl LlmClient for VertexAi {
     async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse, LlmError> {
-        // Gemini は "user" / "model" の 2 role のみ。input message は user 固定で扱う。
+        // Gemini が許容するのは "user" / "model" の 2 role のみ。
+        // Anthropic 由来の "assistant" は "model" にマップ、その他はすべて "user"
+        // として扱う (今回の用途では multi-turn を組まないので user 中心)。
         let contents: Vec<GeminiContent> = req
             .messages
             .iter()

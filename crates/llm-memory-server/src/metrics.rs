@@ -122,6 +122,9 @@ impl MetricsSink for Metrics {
     fn rebuild_in_flight_dec(&self) {
         self.rebuild_in_flight.dec();
     }
+    fn inc_llm_api_error(&self) {
+        self.llm_api_error.inc();
+    }
 }
 
 pub async fn handler(

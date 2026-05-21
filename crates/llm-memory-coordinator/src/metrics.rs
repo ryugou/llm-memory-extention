@@ -17,6 +17,10 @@ pub trait MetricsSink: Send + Sync {
     fn rebuild_in_flight_inc(&self);
     /// worker タスク終了時に -1。
     fn rebuild_in_flight_dec(&self);
+    /// LLM provider (Vertex AI) からのレスポンスがエラーだったときに +1。
+    /// 個別 concept 失敗 (`inc_concept_rebuild_failed`) のうち LLM 原因に絞った
+    /// メトリクス。クォータ枯渇 / safety filter 等の運用判断に使う。
+    fn inc_llm_api_error(&self);
 }
 
 /// テスト/メトリクス無効時用の no-op 実装。
@@ -29,4 +33,5 @@ impl MetricsSink for NoopMetricsSink {
     fn observe_drain_iterations(&self, _n: u64) {}
     fn rebuild_in_flight_inc(&self) {}
     fn rebuild_in_flight_dec(&self) {}
+    fn inc_llm_api_error(&self) {}
 }

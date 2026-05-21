@@ -350,6 +350,11 @@ async fn synthesize_concepts(
                 {
                     error!(owner = ?key, %concept, error = ?e, "synthesize_one failed");
                     deps.metrics.inc_concept_rebuild_failed();
+                    // LLM provider 由来の error (quota / safety filter / 5xx) は
+                    // 専用カウンタにも記録して運用判断材料にする。
+                    if matches!(e, CoordinatorError::Llm(_)) {
+                        deps.metrics.inc_llm_api_error();
+                    }
                 }
             }
         })
@@ -1130,6 +1135,7 @@ mod tests {
             fn observe_drain_iterations(&self, _: u64) {}
             fn rebuild_in_flight_inc(&self) {}
             fn rebuild_in_flight_dec(&self) {}
+            fn inc_llm_api_error(&self) {}
         }
 
         let pool = init_pool("sqlite::memory:").await.unwrap();
