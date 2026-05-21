@@ -4,7 +4,9 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Message {
-    pub role: String, // "user" or "model"
+    /// `"user"` または `"model"`。互換性のため `"assistant"` も受け取り、
+    /// Vertex AI 実装側で `"model"` にマップする (Anthropic 由来の表記対策)。
+    pub role: String,
     pub content: String,
 }
 

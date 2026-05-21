@@ -350,9 +350,13 @@ async fn synthesize_concepts(
                 {
                     error!(owner = ?key, %concept, error = ?e, "synthesize_one failed");
                     deps.metrics.inc_concept_rebuild_failed();
-                    // LLM provider 由来の error (quota / safety filter / 5xx) は
-                    // 専用カウンタにも記録して運用判断材料にする。
-                    if matches!(e, CoordinatorError::Llm(_)) {
+                    // LLM provider の HTTP / quota error (LlmError::Api) のみを
+                    // 専用カウンタに記録。Parse / Reqwest / Json は API 障害では
+                    // ないので除外 (`inc_concept_rebuild_failed` だけにする)。
+                    if matches!(
+                        e,
+                        CoordinatorError::Llm(llm_memory_llm::error::LlmError::Api { .. })
+                    ) {
                         deps.metrics.inc_llm_api_error();
                     }
                 }

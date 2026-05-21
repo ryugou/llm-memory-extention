@@ -192,51 +192,58 @@ impl LlmClient for VertexAi {
             });
         }
         let resp: GeminiResponse = res.json().await?;
-
-        // prompt 自体が safety filter で reject された場合
-        if let Some(fb) = resp.prompt_feedback.as_ref() {
-            if let Some(reason) = fb.block_reason.as_deref() {
-                return Err(LlmError::Parse(format!(
-                    "vertex: prompt blocked by safety filter ({reason})"
-                )));
-            }
-        }
-
-        // 最初の candidate を取り出す (Gemini は通常 1 candidate のみ返す)
-        let candidate = resp
-            .candidates
-            .and_then(|mut cs| cs.pop())
-            .ok_or_else(|| LlmError::Parse("vertex: no candidate in response".into()))?;
-
-        // finish_reason が `STOP` (正常終了) でない場合は明示的にエラー化。
-        // - `MAX_TOKENS`: max_output_tokens に到達して切れた (JSON が途中で破損)
-        // - `SAFETY`: safety filter に引っかかって部分出力
-        // - `RECITATION` / `OTHER` 等
-        // これらを通すと extract_json が「壊れた JSON」を後で失敗するだけ
-        // なので、早めに reason を含めて Err にする。
-        if let Some(reason) = candidate.finish_reason.as_deref() {
-            if reason != "STOP" {
-                return Err(LlmError::Parse(format!(
-                    "vertex: candidate finishReason={reason} (output may be truncated or blocked)"
-                )));
-            }
-        }
-
-        // candidates の content / parts を text に展開。空なら Parse error。
-        let content = candidate
-            .content
-            .and_then(|c| c.parts)
-            .and_then(|ps| {
-                let joined: String = ps.into_iter().filter_map(|p| p.text).collect();
-                if joined.is_empty() {
-                    None
-                } else {
-                    Some(joined)
-                }
-            })
-            .ok_or_else(|| LlmError::Parse("vertex: empty candidate content".into()))?;
+        let content = parse_gemini_response(resp)?;
         Ok(CompleteResponse { content })
     }
+}
+
+/// Vertex AI Gemini レスポンスを text に展開する純関数。
+/// HTTP I/O から切り離してあるので、`finishReason` / `promptFeedback` /
+/// 空 parts などの分岐を unit test で固定 JSON 経由で検証できる。
+fn parse_gemini_response(resp: GeminiResponse) -> Result<String, LlmError> {
+    // prompt 自体が safety filter で reject された場合
+    if let Some(fb) = resp.prompt_feedback.as_ref() {
+        if let Some(reason) = fb.block_reason.as_deref() {
+            return Err(LlmError::Parse(format!(
+                "vertex: prompt blocked by safety filter ({reason})"
+            )));
+        }
+    }
+
+    // 最初の candidate を取り出す (Gemini は通常 1 candidate のみだが、
+    // 仕様上は複数返り得るので「先頭」を明示的に選ぶ)。
+    let candidate = resp
+        .candidates
+        .and_then(|cs| cs.into_iter().next())
+        .ok_or_else(|| LlmError::Parse("vertex: no candidate in response".into()))?;
+
+    // finish_reason が `STOP` (正常終了) でない場合は明示的にエラー化。
+    // - `MAX_TOKENS`: max_output_tokens に到達して切れた (JSON が途中で破損)
+    // - `SAFETY`: safety filter に引っかかって部分出力
+    // - `RECITATION` / `OTHER` 等
+    // これらを通すと extract_json が「壊れた JSON」を後で失敗するだけ
+    // なので、早めに reason を含めて Err にする。
+    if let Some(reason) = candidate.finish_reason.as_deref() {
+        if reason != "STOP" {
+            return Err(LlmError::Parse(format!(
+                "vertex: candidate finishReason={reason} (output may be truncated or blocked)"
+            )));
+        }
+    }
+
+    // candidates の content / parts を text に展開。空なら Parse error。
+    candidate
+        .content
+        .and_then(|c| c.parts)
+        .and_then(|ps| {
+            let joined: String = ps.into_iter().filter_map(|p| p.text).collect();
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        })
+        .ok_or_else(|| LlmError::Parse("vertex: empty candidate content".into()))
 }
 
 #[cfg(test)]
@@ -282,5 +289,93 @@ mod tests {
         assert!(s.contains("\"systemInstruction\""));
         assert!(s.contains("\"responseMimeType\":\"application/json\""));
         assert!(s.contains("\"maxOutputTokens\":100"));
+    }
+
+    fn parse_from_json(raw: &str) -> Result<String, LlmError> {
+        let resp: GeminiResponse = serde_json::from_str(raw).expect("test fixture parses");
+        parse_gemini_response(resp)
+    }
+
+    #[test]
+    fn parse_returns_text_on_normal_stop() {
+        let raw = r#"{
+          "candidates": [{
+            "content": { "parts": [{"text": "hello world"}] },
+            "finishReason": "STOP"
+          }]
+        }"#;
+        assert_eq!(parse_from_json(raw).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn parse_picks_first_candidate_not_last() {
+        // 万一複数 candidate が返っても「先頭」を選ぶこと (pop ではない)。
+        let raw = r#"{
+          "candidates": [
+            { "content": { "parts": [{"text": "first"}] }, "finishReason": "STOP" },
+            { "content": { "parts": [{"text": "second"}] }, "finishReason": "STOP" }
+          ]
+        }"#;
+        assert_eq!(parse_from_json(raw).unwrap(), "first");
+    }
+
+    #[test]
+    fn parse_rejects_prompt_blocked_by_safety_filter() {
+        // prompt 自体が reject → candidates 不在、promptFeedback.blockReason のみ
+        let raw = r#"{
+          "promptFeedback": { "blockReason": "SAFETY" }
+        }"#;
+        let err = parse_from_json(raw).unwrap_err();
+        match err {
+            LlmError::Parse(msg) => assert!(msg.contains("SAFETY")),
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_max_tokens_truncation() {
+        let raw = r#"{
+          "candidates": [{
+            "content": { "parts": [{"text": "{\"content\":\"truncated"}] },
+            "finishReason": "MAX_TOKENS"
+          }]
+        }"#;
+        let err = parse_from_json(raw).unwrap_err();
+        match err {
+            LlmError::Parse(msg) => assert!(msg.contains("MAX_TOKENS")),
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_safety_finish_reason() {
+        let raw = r#"{
+          "candidates": [{
+            "content": { "parts": [{"text": "partial"}] },
+            "finishReason": "SAFETY"
+          }]
+        }"#;
+        let err = parse_from_json(raw).unwrap_err();
+        match err {
+            LlmError::Parse(msg) => assert!(msg.contains("SAFETY")),
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_empty_candidates() {
+        let raw = r#"{ "candidates": [] }"#;
+        assert!(matches!(parse_from_json(raw), Err(LlmError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_rejects_empty_parts() {
+        let raw = r#"{
+          "candidates": [{
+            "content": { "parts": [] },
+            "finishReason": "STOP"
+          }]
+        }"#;
+        assert!(matches!(parse_from_json(raw), Err(LlmError::Parse(_))));
     }
 }
