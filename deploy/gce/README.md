@@ -15,7 +15,7 @@ export GCP_PROJECT_ID=<your-gcp-project>
 - **Firewall `0.0.0.0/0` で 80/443 を公開**: OAuth/MCP endpoint は public な前提。OAuth/DCR 側に in-memory session/code map の cap + expiry pruning (`crates/llm-memory-auth/src/authorization_server.rs`) は入っているが、token 発行や DCR 自体に per-IP rate-limit は無いため、悪意ある相手が DCR スパム / authorize spam を投げると CPU/log の負荷は受ける。MCP tool 呼び出しは認証後 per-user の rate-limit が効く。本格運用に出すなら Cloud Armor 等で前段制限を入れる。
 - **nip.io + Let's Encrypt CT log**: 取得した cert が `crt.sh` 等で永続記録されるため VM の external IP が公開ログに残る。GCE IP は scan で見つかるので追加リスクは軽微。
 - **`.env` 平文で secret 保持**: Secret Manager 連携は overkill。手順では `.env` 作成後に `chmod 600 .env` でファイル所有者以外を読めない状態にする。`sudo docker compose` を踏める権限 (= 実質 root) を持つユーザだけ secret に到達できる。
-- **VM の Instance SA に `--scopes=cloud-platform`**: scope はあくまでメタデータ token 経由で叩ける API の上限を定めるだけ。実際の権限は SA に付与した IAM role (本ガイドでは `roles/storage.objectAdmin` のみ) で制御。
+- **VM の Instance SA に `--scopes=cloud-platform`**: scope はあくまでメタデータ token 経由で叩ける API の上限を定めるだけ。実際の権限は SA に付与した IAM role (本ガイドでは `roles/storage.objectAdmin` (GCS バックアップ書込み) と `roles/aiplatform.user` (Vertex AI 呼び出し) の 2 つのみ) で制御。
 
 ## アーキテクチャ
 

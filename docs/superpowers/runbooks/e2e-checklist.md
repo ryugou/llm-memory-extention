@@ -60,7 +60,7 @@
 
 ## 7. 障害確認
 
-- [ ] Vertex AI ADC を一時的に無効化 (VM の SA から `roles/aiplatform.user` を外す) → `raw_append` 後 rebuild が失敗、`concept_rebuild_failed_total` が増加
+- [ ] Vertex AI ADC を一時的に無効化 (VM の SA から `roles/aiplatform.user` を外す) → `raw_append` 後 rebuild が失敗。Haiku 抽出が 401/403 で run_session が早期 Err になるので `rebuild_failed_total` と `llm_api_error_total` が増加 (concept 単位の `concept_rebuild_failed_total` は extract で session 全体が失敗するため増えない)
 - [ ] サーバ再起動 → 中断ジョブが次の append で再開
 - [ ] DB ファイル肥大 → `sqlite_db_size_bytes` メトリクスで観測
 

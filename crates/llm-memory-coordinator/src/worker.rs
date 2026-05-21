@@ -242,7 +242,15 @@ pub(crate) async fn run_session(
                     .collect();
                 let extracted = extractor
                     .extract(&titles_contents, &existing_concepts)
-                    .await?;
+                    .await
+                    .map_err(|e| {
+                        // LLM provider の HTTP/quota error は session 全体を落とす
+                        // 経路でも `llm_api_error_total` に計上する。
+                        if matches!(e, llm_memory_llm::error::LlmError::Api { .. }) {
+                            deps.metrics.inc_llm_api_error();
+                        }
+                        e
+                    })?;
                 // 安全対策: Haiku が `affected_existing` に existing でない concept を入れて
                 // 返してきても、それは無視する (そうしないと set 経由で Sonnet に投げられ
                 // CONCEPT_LIMIT_PER_OWNER を bypass して wiki が新規作成されてしまう)。
