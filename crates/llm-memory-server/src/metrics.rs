@@ -10,7 +10,7 @@ pub struct Metrics {
     pub concept_rebuild_failed: IntCounter,
     pub rebuild_drain_iterations: Histogram,
     pub rebuild_drain_capped: IntCounter,
-    pub anthropic_api_error: IntCounter,
+    pub llm_api_error: IntCounter,
     pub oauth_login_failure: IntCounter,
     pub dcr_registration: IntCounter,
     pub sqlite_db_size_bytes: IntGauge,
@@ -38,8 +38,11 @@ impl Metrics {
         .unwrap();
         let rebuild_drain_capped =
             IntCounter::new("rebuild_drain_capped_total", "drain MAX_ITERATIONS hits").unwrap();
-        let anthropic_api_error =
-            IntCounter::new("anthropic_api_error_total", "anthropic api errors").unwrap();
+        let llm_api_error = IntCounter::new(
+            "llm_api_error_total",
+            "LLM provider failures wrapped in LlmError::Api (HTTP non-2xx, quota, ADC/auth token errors). Parse/reqwest errors excluded",
+        )
+        .unwrap();
         let oauth_login_failure =
             IntCounter::new("oauth_login_failure_total", "oauth login failures").unwrap();
         let dcr_registration =
@@ -51,7 +54,7 @@ impl Metrics {
             &rebuild_failed,
             &concept_rebuild_failed,
             &rebuild_drain_capped,
-            &anthropic_api_error,
+            &llm_api_error,
             &oauth_login_failure,
             &dcr_registration,
             &http_5xx,
@@ -79,7 +82,7 @@ impl Metrics {
             concept_rebuild_failed,
             rebuild_drain_iterations,
             rebuild_drain_capped,
-            anthropic_api_error,
+            llm_api_error,
             oauth_login_failure,
             dcr_registration,
             sqlite_db_size_bytes,
@@ -121,6 +124,9 @@ impl MetricsSink for Metrics {
     }
     fn rebuild_in_flight_dec(&self) {
         self.rebuild_in_flight.dec();
+    }
+    fn inc_llm_api_error(&self) {
+        self.llm_api_error.inc();
     }
 }
 

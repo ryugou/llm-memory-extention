@@ -17,6 +17,12 @@ pub trait MetricsSink: Send + Sync {
     fn rebuild_in_flight_inc(&self);
     /// worker タスク終了時に -1。
     fn rebuild_in_flight_dec(&self);
+    /// LLM provider 関連の失敗 (`LlmError::Api`) が起きたときに +1。
+    /// 含まれるもの: HTTP non-2xx (5xx / quota / 認可エラー) と、ADC token
+    /// 初期化・取得失敗 (status=503 で wrap)。
+    /// 含まれないもの: safety filter / response parse 異常 (`LlmError::Parse`)、
+    /// reqwest 通信エラー (`LlmError::Reqwest`)、JSON 異常 (`LlmError::Json`)。
+    fn inc_llm_api_error(&self);
 }
 
 /// テスト/メトリクス無効時用の no-op 実装。
@@ -29,4 +35,5 @@ impl MetricsSink for NoopMetricsSink {
     fn observe_drain_iterations(&self, _n: u64) {}
     fn rebuild_in_flight_inc(&self) {}
     fn rebuild_in_flight_dec(&self) {}
+    fn inc_llm_api_error(&self) {}
 }

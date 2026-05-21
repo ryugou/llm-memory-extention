@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use llm_memory_core::scope::OwnerKey;
 use llm_memory_core::time::now_ms;
-use llm_memory_llm::client::AnthropicClient;
+use llm_memory_llm::client::LlmClient;
 use llm_memory_llm::haiku::HaikuExtractor;
 use llm_memory_llm::sonnet::{SonnetSynthesizer, SynthInput};
 use llm_memory_storage::{raws, wikis};
@@ -18,12 +18,12 @@ pub const MAX_ITERATIONS: usize = 10;
 pub const CONCEPT_LIMIT_PER_OWNER: i64 = 200;
 pub const CONCEPT_CONCURRENCY: usize = 4;
 
-pub struct WorkerDeps<C: AnthropicClient + 'static> {
+pub struct WorkerDeps {
     pub pool: SqlitePool,
     pub state: StateMap,
-    pub llm: Arc<C>,
-    pub model_haiku: String,
-    pub model_sonnet: String,
+    pub llm: Arc<dyn LlmClient>,
+    pub model_extract: String,
+    pub model_synth: String,
     /// 外部メトリクス層への薄い抽象。テストでは `NoopMetricsSink` を渡す。
     pub metrics: Arc<dyn MetricsSink>,
 }
@@ -36,11 +36,7 @@ pub struct WorkerDeps<C: AnthropicClient + 'static> {
 /// running フラグが下りており、その直後に新規 append が来て新 worker が起動した場合、
 /// ここで force_idle を呼ぶと「新 worker の running フラグまで巻き戻して clear」してしまい
 /// owner ごとに複数 worker が並走する race が発生する。
-pub fn spawn_worker<C: AnthropicClient + 'static>(
-    deps: Arc<WorkerDeps<C>>,
-    key: OwnerKey,
-    initial_mode: RebuildMode,
-) {
+pub fn spawn_worker(deps: Arc<WorkerDeps>, key: OwnerKey, initial_mode: RebuildMode) {
     let deps_outer = deps.clone();
     let key_outer = key.clone();
     deps_outer.metrics.rebuild_in_flight_inc();
@@ -106,8 +102,8 @@ pub fn spawn_worker<C: AnthropicClient + 'static>(
 /// notify_append を呼ばない異常系では残 raw が次の append/manual rebuild まで放置される
 /// 可能性があるが、これは spec § 7.3 の安全停止要件と整合。運用側はメトリクス
 /// `rebuild_drain_capped` のアラート設定と manual rebuild 経路でフォローする。
-async fn run_worker<C: AnthropicClient + 'static>(
-    deps: Arc<WorkerDeps<C>>,
+async fn run_worker(
+    deps: Arc<WorkerDeps>,
     key: OwnerKey,
     initial_mode: RebuildMode,
 ) -> Result<(), CoordinatorError> {
@@ -216,8 +212,8 @@ pub const MAX_CONSECUTIVE_CAPS: usize = 3;
 /// 戻り値:
 /// - `SessionOutcome::Done` — drain 完了 or affected 空 or budget reject 等で session 終了
 /// - `SessionOutcome::DrainCapped` — MAX_ITERATIONS に到達 (呼び元が即座に Append で再起動する)
-pub(crate) async fn run_session<C: AnthropicClient>(
-    deps: &WorkerDeps<C>,
+pub(crate) async fn run_session(
+    deps: &WorkerDeps,
     key: &OwnerKey,
     starting_mode: RebuildMode,
 ) -> Result<SessionOutcome, CoordinatorError> {
@@ -238,7 +234,7 @@ pub(crate) async fn run_session<C: AnthropicClient>(
                 }
                 let extractor = HaikuExtractor {
                     client: deps.llm.as_ref(),
-                    model: deps.model_haiku.clone(),
+                    model: deps.model_extract.clone(),
                 };
                 let titles_contents: Vec<(&str, &str)> = new_raws
                     .iter()
@@ -246,7 +242,15 @@ pub(crate) async fn run_session<C: AnthropicClient>(
                     .collect();
                 let extracted = extractor
                     .extract(&titles_contents, &existing_concepts)
-                    .await?;
+                    .await
+                    .map_err(|e| {
+                        // LLM provider の HTTP/quota error は session 全体を落とす
+                        // 経路でも `llm_api_error_total` に計上する。
+                        if matches!(e, llm_memory_llm::error::LlmError::Api { .. }) {
+                            deps.metrics.inc_llm_api_error();
+                        }
+                        e
+                    })?;
                 // 安全対策: Haiku が `affected_existing` に existing でない concept を入れて
                 // 返してきても、それは無視する (そうしないと set 経由で Sonnet に投げられ
                 // CONCEPT_LIMIT_PER_OWNER を bypass して wiki が新規作成されてしまう)。
@@ -332,8 +336,8 @@ pub(crate) async fn run_session<C: AnthropicClient>(
     Ok(SessionOutcome::Done)
 }
 
-async fn synthesize_concepts<C: AnthropicClient>(
-    deps: &WorkerDeps<C>,
+async fn synthesize_concepts(
+    deps: &WorkerDeps,
     key: &OwnerKey,
     affected: &[String],
     new_raws: &[raws::Raw],
@@ -354,6 +358,15 @@ async fn synthesize_concepts<C: AnthropicClient>(
                 {
                     error!(owner = ?key, %concept, error = ?e, "synthesize_one failed");
                     deps.metrics.inc_concept_rebuild_failed();
+                    // LLM provider の HTTP / quota error (LlmError::Api) のみを
+                    // 専用カウンタに記録。Parse / Reqwest / Json は API 障害では
+                    // ないので除外 (`inc_concept_rebuild_failed` だけにする)。
+                    if matches!(
+                        e,
+                        CoordinatorError::Llm(llm_memory_llm::error::LlmError::Api { .. })
+                    ) {
+                        deps.metrics.inc_llm_api_error();
+                    }
                 }
             }
         })
@@ -361,8 +374,8 @@ async fn synthesize_concepts<C: AnthropicClient>(
     Ok(())
 }
 
-async fn synthesize_one<C: AnthropicClient>(
-    deps: &WorkerDeps<C>,
+async fn synthesize_one(
+    deps: &WorkerDeps,
     key: &OwnerKey,
     concept: &str,
     new_raws: &[raws::Raw],
@@ -385,7 +398,7 @@ async fn synthesize_one<C: AnthropicClient>(
 
     let synth = SonnetSynthesizer {
         client: deps.llm.as_ref(),
-        model: deps.model_sonnet.clone(),
+        model: deps.model_synth.clone(),
     };
     let raws_tuple: Vec<(String, String, String)> = inputs
         .iter()
@@ -430,13 +443,13 @@ mod tests {
     use llm_memory_storage::pool::init_pool;
     use llm_memory_storage::raws::{NewRaw, insert};
 
-    async fn deps(pool: SqlitePool, mock: Arc<MockClient>) -> Arc<WorkerDeps<MockClient>> {
+    async fn deps(pool: SqlitePool, mock: Arc<MockClient>) -> Arc<WorkerDeps> {
         Arc::new(WorkerDeps {
             pool,
             state: StateMap::new(),
-            llm: mock,
-            model_haiku: "haiku".into(),
-            model_sonnet: "sonnet".into(),
+            llm: mock as Arc<dyn LlmClient>,
+            model_extract: "haiku".into(),
+            model_synth: "sonnet".into(),
             metrics: Arc::new(NoopMetricsSink) as Arc<dyn MetricsSink>,
         })
     }
@@ -579,7 +592,7 @@ mod tests {
     struct PanicClient;
 
     #[async_trait::async_trait]
-    impl llm_memory_llm::client::AnthropicClient for PanicClient {
+    impl llm_memory_llm::client::LlmClient for PanicClient {
         async fn complete(
             &self,
             _req: llm_memory_llm::client::CompleteRequest,
@@ -649,8 +662,8 @@ mod tests {
             pool: pool.clone(),
             state: StateMap::new(),
             llm,
-            model_haiku: "haiku".into(),
-            model_sonnet: "sonnet".into(),
+            model_extract: "haiku".into(),
+            model_synth: "sonnet".into(),
             metrics: Arc::new(NoopMetricsSink) as Arc<dyn MetricsSink>,
         });
         insert(
@@ -1118,24 +1131,35 @@ mod tests {
         );
     }
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingMetrics {
+        concept_failed: AtomicUsize,
+        llm_api_failed: AtomicUsize,
+    }
+    impl MetricsSink for CountingMetrics {
+        fn inc_rebuild_failed(&self) {}
+        fn inc_concept_rebuild_failed(&self) {
+            self.concept_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        fn inc_rebuild_drain_capped(&self) {}
+        fn observe_drain_iterations(&self, _: u64) {}
+        fn rebuild_in_flight_inc(&self) {}
+        fn rebuild_in_flight_dec(&self) {}
+        fn inc_llm_api_error(&self) {
+            self.llm_api_failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn counting_metrics() -> Arc<CountingMetrics> {
+        Arc::new(CountingMetrics {
+            concept_failed: AtomicUsize::new(0),
+            llm_api_failed: AtomicUsize::new(0),
+        })
+    }
+
     #[tokio::test]
     async fn concept_failure_increments_metric() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CountingMetrics {
-            failed: AtomicUsize,
-        }
-        impl MetricsSink for CountingMetrics {
-            fn inc_rebuild_failed(&self) {}
-            fn inc_concept_rebuild_failed(&self) {
-                self.failed.fetch_add(1, Ordering::Relaxed);
-            }
-            fn inc_rebuild_drain_capped(&self) {}
-            fn observe_drain_iterations(&self, _: u64) {}
-            fn rebuild_in_flight_inc(&self) {}
-            fn rebuild_in_flight_dec(&self) {}
-        }
-
         let pool = init_pool("sqlite::memory:").await.unwrap();
         wikis::upsert(&pool, Scope::Personal, "u1", "alpha", "old", "[]", 1)
             .await
@@ -1145,15 +1169,13 @@ mod tests {
         // Sonnet 側の呼び出しを Api エラーで失敗させる。
         mock.push_error("synthesize failed").await;
 
-        let metrics = Arc::new(CountingMetrics {
-            failed: AtomicUsize::new(0),
-        });
+        let metrics = counting_metrics();
         let deps_arc = Arc::new(WorkerDeps {
             pool: pool.clone(),
             state: StateMap::new(),
             llm: mock,
-            model_haiku: "h".into(),
-            model_sonnet: "s".into(),
+            model_extract: "h".into(),
+            model_synth: "s".into(),
             metrics: metrics.clone() as Arc<dyn MetricsSink>,
         });
         run_session(
@@ -1166,6 +1188,63 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(metrics.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.concept_failed.load(Ordering::Relaxed),
+            1,
+            "concept failure counter must increment"
+        );
+        assert_eq!(
+            metrics.llm_api_failed.load(Ordering::Relaxed),
+            1,
+            "LlmError::Api on synthesize must also count llm_api_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_llm_api_error_increments_llm_api_metric() {
+        // Haiku 抽出 (extract) で LlmError::Api が起きた場合、session 全体が
+        // 早期 Err になるが、`inc_llm_api_error` は呼ばれる必要がある (worker.rs
+        // 244 の map_err 経路)。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u-extract-fail",
+                title: "t",
+                content: "c",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u-extract-fail"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mock = Arc::new(MockClient::new());
+        // mock の push_error は LlmError::Api を返す
+        mock.push_error("extract failed").await;
+
+        let metrics = counting_metrics();
+        let deps_arc = Arc::new(WorkerDeps {
+            pool: pool.clone(),
+            state: StateMap::new(),
+            llm: mock,
+            model_extract: "h".into(),
+            model_synth: "s".into(),
+            metrics: metrics.clone() as Arc<dyn MetricsSink>,
+        });
+        let result = run_session(
+            &deps_arc,
+            &OwnerKey::personal("u-extract-fail"),
+            RebuildMode::Append,
+        )
+        .await;
+        assert!(result.is_err(), "extract failure should propagate as Err");
+        assert_eq!(
+            metrics.llm_api_failed.load(Ordering::Relaxed),
+            1,
+            "LlmError::Api on extract must count llm_api_error"
+        );
     }
 }

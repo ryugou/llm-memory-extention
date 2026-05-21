@@ -1,3 +1,8 @@
+# GCE VM 上での運用を前提とした構成。Vertex AI / GCS の認証は VM の Instance
+# Service Account を ADC (Application Default Credentials) 経由で利用する。
+# ローカル PC で `docker compose up` する場合は、`~/.config/gcloud/application_default_credentials.json`
+# を server / litestream container にマウントして `GOOGLE_APPLICATION_CREDENTIALS`
+# を設定するアレンジが別途必要 (現状の compose は未対応)。
 services:
   server:
     build:
@@ -17,6 +22,13 @@ services:
       - data:/data
     expose:
       - "8080"
+    # gcp_auth crate が GCE Instance SA token を取得する際、metadata server
+    # (169.254.169.254) を `metadata.google.internal` という FQDN で解決する。
+    # docker bridge network 内では DNS では解決されないので、host エイリアスで
+    # 169.254.169.254 を指す。これがないと VertexAi::new() で「ADC token fetch
+    # failed」のエラーになる。
+    extra_hosts:
+      - "metadata.google.internal:169.254.169.254"
     # 起動順を litestream → server に、停止順を server → litestream に固定する
     # (順序保証のみ)。litestream の終端 sync が成功するかは別問題で、graceful
     # shutdown (SIGTERM) なら litestream が最後の sync を実行するが、kill -9 や
@@ -40,6 +52,10 @@ services:
       - ./litestream.yml:/etc/litestream.yml:ro
     # GCE VM の instance service account を ADC で読むので、SA key ファイルは
     # マウントしない (gcp-sa.json をディスクに置く運用を避ける)。
+    # litestream も内部で gcloud SDK が metadata server を叩くので、server と
+    # 同じ extra_hosts を追加する。
+    extra_hosts:
+      - "metadata.google.internal:169.254.169.254"
     restart: unless-stopped
 
   caddy:

@@ -1,18 +1,17 @@
 use std::sync::Arc;
 
 use llm_memory_core::scope::OwnerKey;
-use llm_memory_llm::client::AnthropicClient;
 
 use crate::state::{RebuildMode, StartOutcome};
 use crate::worker::{WorkerDeps, spawn_worker};
 
 #[derive(Clone)]
-pub struct Coordinator<C: AnthropicClient + 'static> {
-    deps: Arc<WorkerDeps<C>>,
+pub struct Coordinator {
+    deps: Arc<WorkerDeps>,
 }
 
-impl<C: AnthropicClient + 'static> Coordinator<C> {
-    pub fn new(deps: Arc<WorkerDeps<C>>) -> Self {
+impl Coordinator {
+    pub fn new(deps: Arc<WorkerDeps>) -> Self {
         Self { deps }
     }
 
@@ -47,7 +46,7 @@ impl<C: AnthropicClient + 'static> Coordinator<C> {
     }
 
     /// For tests / introspection
-    pub fn deps(&self) -> &Arc<WorkerDeps<C>> {
+    pub fn deps(&self) -> &Arc<WorkerDeps> {
         &self.deps
     }
 }
@@ -63,18 +62,19 @@ mod tests {
     use super::*;
     use crate::metrics::{MetricsSink, NoopMetricsSink};
     use crate::state::StateMap;
+    use llm_memory_llm::client::LlmClient;
     use llm_memory_llm::mock::MockClient;
     use llm_memory_storage::pool::init_pool;
 
-    async fn make_coord() -> Coordinator<MockClient> {
+    async fn make_coord() -> Coordinator {
         let pool = init_pool("sqlite::memory:").await.unwrap();
-        let mock = Arc::new(MockClient::new());
+        let mock: Arc<dyn LlmClient> = Arc::new(MockClient::new());
         let deps = Arc::new(WorkerDeps {
             pool,
             state: StateMap::new(),
             llm: mock,
-            model_haiku: "haiku".into(),
-            model_sonnet: "sonnet".into(),
+            model_extract: "haiku".into(),
+            model_synth: "sonnet".into(),
             metrics: Arc::new(NoopMetricsSink) as Arc<dyn MetricsSink>,
         });
         Coordinator::new(deps)
