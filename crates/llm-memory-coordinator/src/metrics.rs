@@ -17,9 +17,11 @@ pub trait MetricsSink: Send + Sync {
     fn rebuild_in_flight_inc(&self);
     /// worker タスク終了時に -1。
     fn rebuild_in_flight_dec(&self);
-    /// LLM provider (Vertex AI) からのレスポンスがエラーだったときに +1。
-    /// 個別 concept 失敗 (`inc_concept_rebuild_failed`) のうち LLM 原因に絞った
-    /// メトリクス。クォータ枯渇 / safety filter 等の運用判断に使う。
+    /// LLM provider の HTTP / quota レスポンスがエラーだったときに +1。
+    /// 個別 concept 失敗 (`inc_concept_rebuild_failed`) のうち、`LlmError::Api`
+    /// (5xx / quota / API error) のみに絞ったメトリクス。
+    /// safety filter / parse error 等 (`LlmError::Parse`) は別 variant に
+    /// 落ちるためこのカウンタには含まれない。
     fn inc_llm_api_error(&self);
 }
 
