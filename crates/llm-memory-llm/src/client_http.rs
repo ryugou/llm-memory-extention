@@ -116,11 +116,23 @@ struct RespContent {
 #[derive(Deserialize)]
 struct RespCandidate {
     content: Option<RespContent>,
+    #[serde(rename = "finishReason")]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct GeminiResponse {
     candidates: Option<Vec<RespCandidate>>,
+    /// safety filter で prompt 自体がブロックされた場合、candidates が無く
+    /// `promptFeedback.blockReason` のみが返る。
+    #[serde(rename = "promptFeedback")]
+    prompt_feedback: Option<PromptFeedback>,
+}
+
+#[derive(Deserialize)]
+struct PromptFeedback {
+    #[serde(rename = "blockReason")]
+    block_reason: Option<String>,
 }
 
 #[async_trait]
@@ -178,13 +190,39 @@ impl LlmClient for VertexAi {
             });
         }
         let resp: GeminiResponse = res.json().await?;
-        // candidates が空 / content 不在 / parts 空配列 / parts が全て text:null のいずれも
-        // 「実質空」とみなして Parse error にする (空文字列を呼び元に返すと extract_json
-        // が必ず失敗するので、より早く・分かりやすく検出する)。
-        let content = resp
+
+        // prompt 自体が safety filter で reject された場合
+        if let Some(fb) = resp.prompt_feedback.as_ref() {
+            if let Some(reason) = fb.block_reason.as_deref() {
+                return Err(LlmError::Parse(format!(
+                    "vertex: prompt blocked by safety filter ({reason})"
+                )));
+            }
+        }
+
+        // 最初の candidate を取り出す (Gemini は通常 1 candidate のみ返す)
+        let candidate = resp
             .candidates
             .and_then(|mut cs| cs.pop())
-            .and_then(|c| c.content)
+            .ok_or_else(|| LlmError::Parse("vertex: no candidate in response".into()))?;
+
+        // finish_reason が `STOP` (正常終了) でない場合は明示的にエラー化。
+        // - `MAX_TOKENS`: max_output_tokens に到達して切れた (JSON が途中で破損)
+        // - `SAFETY`: safety filter に引っかかって部分出力
+        // - `RECITATION` / `OTHER` 等
+        // これらを通すと extract_json が「壊れた JSON」を後で失敗するだけ
+        // なので、早めに reason を含めて Err にする。
+        if let Some(reason) = candidate.finish_reason.as_deref() {
+            if reason != "STOP" {
+                return Err(LlmError::Parse(format!(
+                    "vertex: candidate finishReason={reason} (output may be truncated or blocked)"
+                )));
+            }
+        }
+
+        // candidates の content / parts を text に展開。空なら Parse error。
+        let content = candidate
+            .content
             .and_then(|c| c.parts)
             .and_then(|ps| {
                 let joined: String = ps.into_iter().filter_map(|p| p.text).collect();

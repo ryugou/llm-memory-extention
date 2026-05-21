@@ -1,3 +1,8 @@
+# GCE VM 上での運用を前提とした構成。Vertex AI / GCS の認証は VM の Instance
+# Service Account を ADC (Application Default Credentials) 経由で利用する。
+# ローカル PC で `docker compose up` する場合は、`~/.config/gcloud/application_default_credentials.json`
+# を server / litestream container にマウントして `GOOGLE_APPLICATION_CREDENTIALS`
+# を設定するアレンジが別途必要 (現状の compose は未対応)。
 services:
   server:
     build:
