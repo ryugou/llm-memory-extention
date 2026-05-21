@@ -40,7 +40,7 @@ impl Metrics {
             IntCounter::new("rebuild_drain_capped_total", "drain MAX_ITERATIONS hits").unwrap();
         let llm_api_error = IntCounter::new(
             "llm_api_error_total",
-            "LLM provider HTTP/quota errors (LlmError::Api only; parse/reqwest errors excluded)",
+            "LLM provider failures wrapped in LlmError::Api (HTTP non-2xx, quota, ADC/auth token errors). Parse/reqwest errors excluded",
         )
         .unwrap();
         let oauth_login_failure =

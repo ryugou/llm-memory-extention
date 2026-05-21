@@ -1131,25 +1131,35 @@ mod tests {
         );
     }
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingMetrics {
+        concept_failed: AtomicUsize,
+        llm_api_failed: AtomicUsize,
+    }
+    impl MetricsSink for CountingMetrics {
+        fn inc_rebuild_failed(&self) {}
+        fn inc_concept_rebuild_failed(&self) {
+            self.concept_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        fn inc_rebuild_drain_capped(&self) {}
+        fn observe_drain_iterations(&self, _: u64) {}
+        fn rebuild_in_flight_inc(&self) {}
+        fn rebuild_in_flight_dec(&self) {}
+        fn inc_llm_api_error(&self) {
+            self.llm_api_failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn counting_metrics() -> Arc<CountingMetrics> {
+        Arc::new(CountingMetrics {
+            concept_failed: AtomicUsize::new(0),
+            llm_api_failed: AtomicUsize::new(0),
+        })
+    }
+
     #[tokio::test]
     async fn concept_failure_increments_metric() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CountingMetrics {
-            failed: AtomicUsize,
-        }
-        impl MetricsSink for CountingMetrics {
-            fn inc_rebuild_failed(&self) {}
-            fn inc_concept_rebuild_failed(&self) {
-                self.failed.fetch_add(1, Ordering::Relaxed);
-            }
-            fn inc_rebuild_drain_capped(&self) {}
-            fn observe_drain_iterations(&self, _: u64) {}
-            fn rebuild_in_flight_inc(&self) {}
-            fn rebuild_in_flight_dec(&self) {}
-            fn inc_llm_api_error(&self) {}
-        }
-
         let pool = init_pool("sqlite::memory:").await.unwrap();
         wikis::upsert(&pool, Scope::Personal, "u1", "alpha", "old", "[]", 1)
             .await
@@ -1159,9 +1169,7 @@ mod tests {
         // Sonnet 側の呼び出しを Api エラーで失敗させる。
         mock.push_error("synthesize failed").await;
 
-        let metrics = Arc::new(CountingMetrics {
-            failed: AtomicUsize::new(0),
-        });
+        let metrics = counting_metrics();
         let deps_arc = Arc::new(WorkerDeps {
             pool: pool.clone(),
             state: StateMap::new(),
@@ -1180,6 +1188,63 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(metrics.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.concept_failed.load(Ordering::Relaxed),
+            1,
+            "concept failure counter must increment"
+        );
+        assert_eq!(
+            metrics.llm_api_failed.load(Ordering::Relaxed),
+            1,
+            "LlmError::Api on synthesize must also count llm_api_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_llm_api_error_increments_llm_api_metric() {
+        // Haiku 抽出 (extract) で LlmError::Api が起きた場合、session 全体が
+        // 早期 Err になるが、`inc_llm_api_error` は呼ばれる必要がある (worker.rs
+        // 244 の map_err 経路)。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u-extract-fail",
+                title: "t",
+                content: "c",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u-extract-fail"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mock = Arc::new(MockClient::new());
+        // mock の push_error は LlmError::Api を返す
+        mock.push_error("extract failed").await;
+
+        let metrics = counting_metrics();
+        let deps_arc = Arc::new(WorkerDeps {
+            pool: pool.clone(),
+            state: StateMap::new(),
+            llm: mock,
+            model_extract: "h".into(),
+            model_synth: "s".into(),
+            metrics: metrics.clone() as Arc<dyn MetricsSink>,
+        });
+        let result = run_session(
+            &deps_arc,
+            &OwnerKey::personal("u-extract-fail"),
+            RebuildMode::Append,
+        )
+        .await;
+        assert!(result.is_err(), "extract failure should propagate as Err");
+        assert_eq!(
+            metrics.llm_api_failed.load(Ordering::Relaxed),
+            1,
+            "LlmError::Api on extract must count llm_api_error"
+        );
     }
 }

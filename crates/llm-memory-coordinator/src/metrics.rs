@@ -17,11 +17,11 @@ pub trait MetricsSink: Send + Sync {
     fn rebuild_in_flight_inc(&self);
     /// worker タスク終了時に -1。
     fn rebuild_in_flight_dec(&self);
-    /// LLM provider の HTTP / quota レスポンスがエラーだったときに +1。
-    /// 個別 concept 失敗 (`inc_concept_rebuild_failed`) のうち、`LlmError::Api`
-    /// (5xx / quota / API error) のみに絞ったメトリクス。
-    /// safety filter / parse error 等 (`LlmError::Parse`) は別 variant に
-    /// 落ちるためこのカウンタには含まれない。
+    /// LLM provider 関連の失敗 (`LlmError::Api`) が起きたときに +1。
+    /// 含まれるもの: HTTP non-2xx (5xx / quota / 認可エラー) と、ADC token
+    /// 初期化・取得失敗 (status=503 で wrap)。
+    /// 含まれないもの: safety filter / response parse 異常 (`LlmError::Parse`)、
+    /// reqwest 通信エラー (`LlmError::Reqwest`)、JSON 異常 (`LlmError::Json`)。
     fn inc_llm_api_error(&self);
 }
 

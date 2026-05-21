@@ -223,6 +223,9 @@ fn parse_gemini_response(resp: GeminiResponse) -> Result<String, LlmError> {
     // - `RECITATION` / `OTHER` 等
     // これらを通すと extract_json が「壊れた JSON」を後で失敗するだけ
     // なので、早めに reason を含めて Err にする。
+    // 注: `finish_reason` が `None` のレスポンスは Vertex AI の挙動として
+    //   想定外だが、互換性のため通している (空 parts ガードが後段で拾う)。
+    //   将来 API 仕様が変わったら厳格化を検討する。
     if let Some(reason) = candidate.finish_reason.as_deref() {
         if reason != "STOP" {
             return Err(LlmError::Parse(format!(
