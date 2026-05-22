@@ -1,4 +1,4 @@
-use axum::{Json, extract::State, response::IntoResponse};
+use axum::{Json, body::Bytes, extract::State, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -120,11 +120,23 @@ impl Outcome {
 ///
 /// Accepts both single JSON-RPC requests and JSON-RPC 2.0 batch arrays
 /// (MCP 2025-03-26 Streamable HTTP MUST).
+///
+/// 本文 JSON parse 失敗は JSON-RPC 2.0 §5.1 に従い HTTP 200 で `-32700 Parse error`
+/// envelope (`id: null`) を返す。axum の `Json<Value>` extractor だと HTTP 400 で
+/// reject されてしまうため、`Bytes` 受けで手動 parse する。
 pub async fn handle(
     State(state): State<AppState>,
     axum::Extension(user): axum::Extension<AuthenticatedUser>,
-    Json(body): Json<Value>,
+    body: Bytes,
 ) -> axum::response::Response {
+    let body: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
+            return Json(err).into_response();
+        }
+    };
+
     // Single object → process as one entry; array → process each entry, collect.
     let is_batch = body.is_array();
     let entries: Vec<Value> = if is_batch {
@@ -406,6 +418,33 @@ mod tests {
         );
         assert!(v["id"].is_null(), "response echoes id: null");
         assert_eq!(v["result"], json!({}), "ping returns empty result");
+    }
+
+    #[tokio::test]
+    async fn malformed_json_body_returns_parse_error_envelope() {
+        // JSON-RPC 2.0 §5.1: 完全に壊れた JSON は HTTP 200 で `-32700 Parse error`
+        // envelope を `id: null` で返さなければならない (HTTP 400 で reject しない)。
+        let state = test_state().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let app = axum::Router::new()
+            .route("/mcp", axum::routing::post(handle))
+            .layer(axum::middleware::from_fn(inject_user))
+            .with_state(state);
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let body_bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v["error"]["code"], -32700);
+        assert!(v["id"].is_null());
+        assert_eq!(v["jsonrpc"], "2.0");
     }
 
     #[tokio::test]
