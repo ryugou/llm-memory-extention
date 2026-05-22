@@ -177,7 +177,10 @@ mod tests {
             },
         )
         .await;
-        assert!(res.is_ok(), "FTS5 must accept hyphenated query after escape");
+        assert!(
+            res.is_ok(),
+            "FTS5 must accept hyphenated query after escape"
+        );
     }
 
     #[tokio::test]
@@ -207,7 +210,10 @@ mod tests {
             },
         )
         .await;
-        assert!(res.is_ok(), "FTS5 must accept query with inner double-quote");
+        assert!(
+            res.is_ok(),
+            "FTS5 must accept query with inner double-quote"
+        );
     }
 
     #[tokio::test]
