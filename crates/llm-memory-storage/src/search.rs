@@ -11,12 +11,24 @@ pub struct SearchQuery<'a> {
 }
 
 /// FTS5 MATCH 式に literal string を渡すための quoting。
-/// SQLite FTS5 のクエリ言語では `-`, `*`, `OR`, `"` などが演算子になるため、
-/// double-quote で囲んだ phrase に変換する。内部 `"` は `""` で escape する。
-/// 結果は単純な phrase query (フレーズ一致) になる。
+/// 空白区切りの各 token を `"..."` (FTS5 phrase) で個別に wrap し、空白 join する。
+/// FTS5 は空白区切りの phrase 列を implicit AND として扱うため、
+/// `foo bar` は `foo` と `bar` 両方を含む doc に hit する (term-AND 意味を維持)。
+/// token 内部の `-`, `*`, `OR`, `AND`, `NEAR` などは phrase の中で literal 扱いになる。
+/// 内部 `"` は `""` で escape する。
+/// 空 / whitespace-only 入力は空 phrase (`""`) を返し、no rows で安全に終わる。
 fn fts5_escape(s: &str) -> String {
-    let escaped = s.replace('"', "\"\"");
-    format!("\"{escaped}\"")
+    let tokens: Vec<String> = s
+        .split_whitespace()
+        .map(|tok| {
+            let escaped = tok.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        })
+        .collect();
+    if tokens.is_empty() {
+        return "\"\"".into();
+    }
+    tokens.join(" ")
 }
 
 pub async fn raws(pool: &SqlitePool, q: SearchQuery<'_>) -> Result<Vec<Raw>, StorageError> {
@@ -247,6 +259,44 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res.len(), 0, "empty query must produce no rows, not error");
+    }
+
+    #[tokio::test]
+    async fn multi_word_query_uses_and_of_terms_semantics() {
+        // raw_search の term-AND 意味を維持する回帰: `foo bar` で `foo baz bar` を
+        // 含む doc が hit する (token ごとに phrase 化 + 空白 join で FTS5 implicit AND)。
+        // 1 つの phrase で wrap すると adjacency 必須になり hit しなくなる。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "doc with foo baz bar",
+                content: "x",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "foo bar",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            res.len(),
+            1,
+            "multi-word query must AND terms, not require adjacency"
+        );
     }
 
     #[tokio::test]
