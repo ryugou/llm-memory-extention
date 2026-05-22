@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_with_hyphen_does_not_blow_up_or_match_unrelated() {
+    async fn query_with_hyphen_does_not_error() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
         insert(
             &pool,
@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_with_double_quote_does_not_break_sql() {
+    async fn query_with_double_quote_does_not_error() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
         insert(
             &pool,

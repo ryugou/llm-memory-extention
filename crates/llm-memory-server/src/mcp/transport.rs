@@ -132,7 +132,11 @@ pub async fn handle(
     let body: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            let err = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
+            // JSON-RPC 2.0 §5.1 規定の stable message を返し、serde 由来の詳細は
+            // server log に閉じる。client へ実装詳細を漏らさない & strict client が
+            // 期待する固定文字列に合わせる。
+            tracing::warn!(error = %e, "JSON-RPC body parse failed");
+            let err = JsonRpcResponse::error(None, -32700, "Parse error");
             return Json(err).into_response();
         }
     };
