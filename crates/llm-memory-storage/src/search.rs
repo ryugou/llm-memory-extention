@@ -217,6 +217,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_query_returns_no_rows_without_error() {
+        // 空文字 query は escape 後 `""` (empty phrase) になる。
+        // SQLite FTS5 では empty phrase は no match を返すだけで SQL error にならない。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "x",
+                content: "y",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.len(), 0, "empty query must produce no rows, not error");
+    }
+
+    #[tokio::test]
     async fn query_with_operator_keyword_is_literal() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
         insert(

@@ -283,6 +283,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_scope_arg_normalizes_known_values() {
+        assert!(matches!(parse_scope_arg(None), Ok(None)));
+        assert!(matches!(parse_scope_arg(Some("all")), Ok(None)));
+        assert!(matches!(
+            parse_scope_arg(Some("personal")),
+            Ok(Some(Scope::Personal))
+        ));
+        assert!(matches!(
+            parse_scope_arg(Some("shared")),
+            Ok(Some(Scope::Shared))
+        ));
+    }
+
+    #[test]
+    fn parse_scope_arg_rejects_unknown_with_invalid_scope_error() {
+        let err = parse_scope_arg(Some("bogus")).unwrap_err();
+        assert!(err.to_string().contains("invalid scope"));
+        assert!(err.to_string().contains("bogus"));
+    }
+
     #[tokio::test]
     async fn list_emits_input_schema_per_tool() {
         let r = list(Some(Value::from(1))).await;
