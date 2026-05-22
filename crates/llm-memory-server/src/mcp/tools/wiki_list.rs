@@ -1,10 +1,11 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use llm_memory_core::scope::Scope;
 use llm_memory_storage::{shared_memories, wikis};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::app::AppState;
+use crate::mcp::tools::parse_scope_arg;
 use llm_memory_auth::middleware::AuthenticatedUser;
 
 #[derive(Deserialize)]
@@ -14,18 +15,13 @@ struct Args {
 
 pub async fn call(state: AppState, user: AuthenticatedUser, args: Value) -> Result<Value> {
     let a: Args = serde_json::from_value(args)?;
-    let mode = match a.scope.as_deref() {
-        None | Some("all") => "all",
-        Some("personal") => "personal",
-        Some("shared") => "shared",
-        Some(s) => return Err(anyhow!("invalid scope: {s}")),
-    };
-    let personal = if matches!(mode, "all" | "personal") {
+    let scope = parse_scope_arg(a.scope.as_deref())?;
+    let personal = if matches!(scope, None | Some(Scope::Personal)) {
         wikis::list_concepts(&state.pool, Scope::Personal, &user.user_id).await?
     } else {
         vec![]
     };
-    let shared = if matches!(mode, "all" | "shared") {
+    let shared = if matches!(scope, None | Some(Scope::Shared)) {
         let sms = shared_memories::list_all(&state.pool).await?;
         let mut out = Vec::new();
         for sm in sms {

@@ -254,45 +254,27 @@ pub(crate) async fn run_session(
                 // 安全対策: Haiku が `affected_existing` に existing でない concept を入れて
                 // 返してきても、それは無視する (そうしないと set 経由で Sonnet に投げられ
                 // CONCEPT_LIMIT_PER_OWNER を bypass して wiki が新規作成されてしまう)。
+                // 加えて LLM 出力は trust boundary 外なので、2-64 chars / lowercase+hyphen の
+                // concept 名規約を満たさないものは upsert 前に drop し warn で観測する。
                 let existing_set: std::collections::HashSet<&String> =
                     existing_concepts.iter().collect();
-                // LLM 出力は trust boundary 外: 形式違反 (2-64 chars, lowercase + hyphen 以外)
-                // は upsert 前に drop。drop 件数は warn ログで観測。
-                let invalid_existing = extracted
-                    .affected_existing
-                    .iter()
-                    .filter(|c| !llm_memory_core::concept::is_valid(c))
-                    .count();
-                if invalid_existing > 0 {
-                    warn!(
-                        owner = ?key,
-                        invalid_existing,
-                        "Haiku returned invalid affected_existing names; dropped"
-                    );
-                }
                 let mut set: std::collections::BTreeSet<String> = extracted
                     .affected_existing
                     .into_iter()
-                    .filter(|c| llm_memory_core::concept::is_valid(c))
+                    .filter(|c| {
+                        if !llm_memory_core::concept::is_valid(c) {
+                            warn!(owner = ?key, concept = %c, "drop invalid affected_existing");
+                            return false;
+                        }
+                        true
+                    })
                     .filter(|c| existing_set.contains(c))
                     .collect();
                 let current_count =
                     wikis::count_concepts(&deps.pool, key.scope, &key.owner_id).await?;
                 // 残り枠だけ追加。current_count=199, new=100 でも 200 までで止める。
                 let remaining = (CONCEPT_LIMIT_PER_OWNER - current_count).max(0) as usize;
-                let new_concepts_validated: Vec<String> = extracted
-                    .new_concepts
-                    .into_iter()
-                    .filter(|c| {
-                        if llm_memory_core::concept::is_valid(c) {
-                            true
-                        } else {
-                            warn!(owner = ?key, concept = %c, "Haiku returned invalid new_concept name; dropped");
-                            false
-                        }
-                    })
-                    .collect();
-                let new_total = new_concepts_validated.len();
+                let new_total = extracted.new_concepts.len();
                 if remaining == 0 && new_total > 0 {
                     warn!(owner = ?key, current_count, "concept limit reached, ignoring new_concepts");
                 } else if new_total > remaining {
@@ -304,8 +286,16 @@ pub(crate) async fn run_session(
                         "concept limit approached, truncated new_concepts"
                     );
                 }
-                for c in new_concepts_validated.into_iter().take(remaining) {
-                    // 既存 concept と衝突する場合は set に入れるだけで新規 count を消費しない。
+                // budget 充足前に invalid を drop → take(remaining) で早期 break。
+                // 既存 concept と衝突する場合は set に入れるだけで新規 count を消費しない。
+                let valid_new = extracted.new_concepts.into_iter().filter(|c| {
+                    if !llm_memory_core::concept::is_valid(c) {
+                        warn!(owner = ?key, concept = %c, "drop invalid new_concept");
+                        return false;
+                    }
+                    true
+                });
+                for c in valid_new.take(remaining) {
                     set.insert(c);
                 }
                 set.into_iter().collect()

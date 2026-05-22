@@ -1,10 +1,11 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use llm_memory_core::scope::Scope;
 use llm_memory_storage::search::{self, SearchQuery};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::app::AppState;
+use crate::mcp::tools::parse_scope_arg;
 use llm_memory_auth::middleware::AuthenticatedUser;
 
 #[derive(Deserialize)]
@@ -16,12 +17,7 @@ struct Args {
 
 pub async fn call(state: AppState, user: AuthenticatedUser, args: Value) -> Result<Value> {
     let a: Args = serde_json::from_value(args)?;
-    let scope = match a.scope.as_deref() {
-        None | Some("all") => None,
-        Some("personal") => Some(Scope::Personal),
-        Some("shared") => Some(Scope::Shared),
-        Some(s) => return Err(anyhow!("invalid scope: {s}")),
-    };
+    let scope = parse_scope_arg(a.scope.as_deref())?;
     let limit = a.limit.unwrap_or(20).clamp(1, 100);
     let mut results = Vec::new();
     if matches!(scope, None | Some(Scope::Personal)) {

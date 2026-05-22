@@ -8,8 +8,11 @@
 /// - first char `[a-z0-9]`
 /// - remaining chars `[a-z0-9-]`
 ///
-/// Matches the format declared in `EXTRACT_CONCEPTS_SYSTEM` prompt and the
-/// `^[a-z0-9][a-z0-9-]{1,63}$` regex shape used elsewhere for short identifiers.
+/// Matches the format declared in `EXTRACT_CONCEPTS_SYSTEM` prompt.
+/// 同形の regex を持つ [`crate::id::SharedMemoryId`] は最小長 1 だが、こちらは
+/// 最小長 2 にしている: concept 名は LLM 生成が中心で 1 文字は hallucination /
+/// garbage がほとんどなので reject、一方 SharedMemoryId は運用者が手で割り当てる
+/// 識別子なので 1 文字を許容する (例: `a`)。
 pub fn is_valid(s: &str) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| regex::Regex::new(r"^[a-z0-9][a-z0-9-]{1,63}$").unwrap());

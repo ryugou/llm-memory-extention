@@ -1,10 +1,24 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::Json;
+use llm_memory_core::scope::Scope;
 use serde_json::{Value, json};
 
 use crate::app::AppState;
 use crate::mcp::transport::JsonRpcResponse;
 use llm_memory_auth::middleware::AuthenticatedUser;
+
+/// MCP ツール引数 `scope` を `Option<Scope>` に正規化する。
+/// `None` または `"all"` → `Ok(None)` (= 全 scope)、`"personal"` / `"shared"` →
+/// `Ok(Some(...))`、それ以外は typo の早期検知のため `invalid scope` で reject。
+/// raw_search / wiki_read / wiki_list が共有する。
+pub(crate) fn parse_scope_arg(s: Option<&str>) -> Result<Option<Scope>> {
+    match s {
+        None | Some("all") => Ok(None),
+        Some("personal") => Ok(Some(Scope::Personal)),
+        Some("shared") => Ok(Some(Scope::Shared)),
+        Some(other) => Err(anyhow!("invalid scope: {other}")),
+    }
+}
 
 pub mod export;
 pub mod raw_append;
