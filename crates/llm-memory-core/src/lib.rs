@@ -1,3 +1,4 @@
+pub mod concept;
 pub mod error;
 pub mod id;
 pub mod scope;
