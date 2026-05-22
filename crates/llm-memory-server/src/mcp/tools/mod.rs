@@ -361,6 +361,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wiki_rebuild_invalid_concept_is_tool_error() {
+        let s = state().await;
+        let r = call(
+            s,
+            user(),
+            None,
+            json!({"name": "wiki_rebuild", "arguments": {"concept": "INVALID UPPER"}}),
+        )
+        .await;
+        let body = serde_json::to_value(&r.0).unwrap();
+        assert!(body["error"].is_null());
+        assert_eq!(body["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn wiki_rebuild_omitted_concept_is_accepted() {
+        // concept 省略 (= 全 concept 再合成) は引き続き有効
+        let s = state().await;
+        let r = call(
+            s,
+            user(),
+            None,
+            json!({"name": "wiki_rebuild", "arguments": {}}),
+        )
+        .await;
+        let body = serde_json::to_value(&r.0).unwrap();
+        assert!(body["error"].is_null());
+        assert_eq!(body["result"]["isError"], false);
+    }
+
+    #[tokio::test]
     async fn tool_success_is_wrapped_in_calltoolresult() {
         let s = state().await;
         let r = call(
