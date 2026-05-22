@@ -10,6 +10,15 @@ pub struct SearchQuery<'a> {
     pub limit: i64,
 }
 
+/// FTS5 MATCH 式に literal string を渡すための quoting。
+/// SQLite FTS5 のクエリ言語では `-`, `*`, `OR`, `"` などが演算子になるため、
+/// double-quote で囲んだ phrase に変換する。内部 `"` は `""` で escape する。
+/// 結果は単純な phrase query (フレーズ一致) になる。
+fn fts5_escape(s: &str) -> String {
+    let escaped = s.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
 pub async fn raws(pool: &SqlitePool, q: SearchQuery<'_>) -> Result<Vec<Raw>, StorageError> {
     // 1..=100 にクランプ。負値や巨大値による DoS/誤動作を防ぐ。
     let limit = q.limit.clamp(1, 100);
@@ -18,7 +27,7 @@ pub async fn raws(pool: &SqlitePool, q: SearchQuery<'_>) -> Result<Vec<Raw>, Sto
          FROM raws_fts JOIN raws r ON r.rowid = raws_fts.rowid
          WHERE raws_fts MATCH ?",
     );
-    let mut binds: Vec<String> = vec![q.query.into()];
+    let mut binds: Vec<String> = vec![fts5_escape(q.query)];
     if let Some(s) = q.scope {
         sql.push_str(" AND r.scope = ?");
         binds.push(s.as_str().into());
@@ -136,6 +145,100 @@ mod tests {
         .await
         .unwrap();
         assert!(res.len() <= 100, "huge limit must clamp to 100");
+    }
+
+    #[tokio::test]
+    async fn query_with_hyphen_does_not_blow_up_or_match_unrelated() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "team frontend retro",
+                content: "react",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        // hyphen を含む query。escape 無しだと FTS5 が "team NOT frontend" として解釈し
+        // SQL error または unrelated hit になる。escape 後は phrase として無 hit で
+        // 返るのが正しい (title/content に "team-frontend" という連結文字列は無いため)。
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "team-frontend",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await;
+        assert!(res.is_ok(), "FTS5 must accept hyphenated query after escape");
+    }
+
+    #[tokio::test]
+    async fn query_with_double_quote_does_not_break_sql() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "alpha quote",
+                content: "x",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: r#"foo " bar"#,
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await;
+        assert!(res.is_ok(), "FTS5 must accept query with inner double-quote");
+    }
+
+    #[tokio::test]
+    async fn query_with_operator_keyword_is_literal() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "rules and exceptions",
+                content: "x",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        // 'AND' を演算子としてではなく literal phrase として扱う
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "rules AND exceptions",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await;
+        assert!(res.is_ok());
     }
 
     #[tokio::test]

@@ -131,6 +131,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_with_hyphenated_concept_succeeds() {
+        // FTS5 escape の回帰: concept = "team-frontend" でも SQL error が出ず空 hit で
+        // pass する (search.rs 側で fts5_escape を通すため)。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let out = build(&pool, Scope::Personal, "u1", "team-frontend", &[], &[]).await;
+        assert!(out.is_ok(), "hyphenated concept must not crash FTS5 search");
+    }
+
+    #[tokio::test]
     async fn dedupes_across_sources() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
         let r = insert(
