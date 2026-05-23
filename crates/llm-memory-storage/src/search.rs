@@ -160,7 +160,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_with_hyphen_does_not_error() {
+    async fn query_with_hyphen_matches_adjacent_tokens_only() {
+        // hyphen を含む query は escape 後 phrase になり、FTS5 tokenizer が
+        // `team-frontend` を [team, frontend] に分解 → adjacent な term ペアにだけ hit する。
+        // adjacent な doc は hit し、非 adjacent な doc は hit しないことを 1 テストで検証。
+        // escape 無しなら FTS5 が `-` を NOT 演算子と解釈し adjacent doc も hit しないため、
+        // この assert は pre-fix で破綻する (regression guard)。
         let pool = init_pool("sqlite::memory:").await.unwrap();
         insert(
             &pool,
@@ -176,9 +181,20 @@ mod tests {
         )
         .await
         .unwrap();
-        // hyphen を含む query。escape 無しだと FTS5 が "team NOT frontend" として解釈し
-        // SQL error または unrelated hit になる。escape 後は phrase として無 hit で
-        // 返るのが正しい (title/content に "team-frontend" という連結文字列は無いため)。
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "team alpha",
+                content: "frontend beta gamma",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
         let res = raws(
             &pool,
             SearchQuery {
@@ -188,15 +204,21 @@ mod tests {
                 limit: 10,
             },
         )
-        .await;
-        assert!(
-            res.is_ok(),
-            "FTS5 must accept hyphenated query after escape"
+        .await
+        .unwrap();
+        assert_eq!(
+            res.len(),
+            1,
+            "phrase must hit only the doc with adjacent team+frontend tokens"
         );
+        assert_eq!(res[0].title, "team frontend retro");
     }
 
     #[tokio::test]
-    async fn query_with_double_quote_does_not_error() {
+    async fn query_with_double_quote_returns_no_rows_for_unrelated_doc() {
+        // 内部 `"` を含む query は escape で `""` に展開され、phrase は壊れず literal 扱い。
+        // 投入 doc は query と無関係なので、SQL error にもならず 0 行で返る。
+        // 「escape の副作用で全件マッチに化けていないこと」も同時に検証する。
         let pool = init_pool("sqlite::memory:").await.unwrap();
         insert(
             &pool,
@@ -221,10 +243,12 @@ mod tests {
                 limit: 10,
             },
         )
-        .await;
-        assert!(
-            res.is_ok(),
-            "FTS5 must accept query with inner double-quote"
+        .await
+        .unwrap();
+        assert_eq!(
+            res.len(),
+            0,
+            "double-quote escape must not turn into a wildcard match"
         );
     }
 
@@ -301,13 +325,18 @@ mod tests {
 
     #[tokio::test]
     async fn query_with_operator_keyword_is_literal() {
+        // FTS5 の `AND` は演算子だが、escape 後は literal phrase ["AND"] (大文字小文字
+        // 無視で "and" token と一致) として扱われる。doc に `and` token が含まれない
+        // fixture を使うことで、operator 解釈 (rules AND exceptions = 両方含む doc に hit) と
+        // literal 解釈 (rules + AND + exceptions の 3 token 全てが必要 → "and" が無い doc は miss)
+        // を distinguish する。pre-fix なら 1 行 hit、post-fix なら 0 行になる。
         let pool = init_pool("sqlite::memory:").await.unwrap();
         insert(
             &pool,
             NewRaw {
                 scope: Scope::Personal,
                 owner_id: "u1",
-                title: "rules and exceptions",
+                title: "rules exceptions",
                 content: "x",
                 source: "m",
                 tags_json: None,
@@ -316,7 +345,6 @@ mod tests {
         )
         .await
         .unwrap();
-        // 'AND' を演算子としてではなく literal phrase として扱う
         let res = raws(
             &pool,
             SearchQuery {
@@ -326,8 +354,13 @@ mod tests {
                 limit: 10,
             },
         )
-        .await;
-        assert!(res.is_ok());
+        .await
+        .unwrap();
+        assert_eq!(
+            res.len(),
+            0,
+            "AND must be a literal term; doc lacking it must not match"
+        );
     }
 
     #[tokio::test]
