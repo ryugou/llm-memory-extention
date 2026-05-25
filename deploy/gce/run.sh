@@ -43,6 +43,33 @@
 
 set -euo pipefail
 
+# tmpfs (/dev/shm) 上の secret env ファイル。パスは固定: docker-compose.yml が
+# `env_file:` で同じパスを参照しているため。subcommand に関係なく毎回 cleanup を
+# 仕掛けて、過去の crash 残骸 / SM fetch を skip する subcommand のときも
+# tmp ファイルが取り残されないようにする (= subcommand 横断で secret が
+# tmpfs に残留しないことを保証)。
+TMPENV="/dev/shm/llm-memory-secrets.env"
+trap 'rm -f "${TMPENV}"' EXIT
+# 起動時にも残骸を消す (前回 trap 漏れ / 異常終了対策)。`-L` で symlink 化を検出し
+# 自分が辿らされるのを拒否する (`/dev/shm` は 1777 のため別ユーザが symlink を
+# 差し込めば本来の TMPENV の代わりに別ファイルを上書きさせられる TOCTOU)。
+# Phase 1 の VM は実質単独利用なので残留 risk は小さいが、defense in depth として。
+if [[ -L "${TMPENV}" ]]; then
+  echo "ERROR: ${TMPENV} は symlink。誰かが TOCTOU を仕込んだ可能性。手動確認して削除してください。" >&2
+  exit 1
+fi
+rm -f "${TMPENV}"
+
+# compose subcommand 抽出。`docker compose` の global option (例: `--ansi`,
+# `--project-directory`) を先に渡されるとここで subcommand を取りこぼし、
+# `NEED_SECRETS` 判定が壊れて secret 無しで container が起動する事故になる。
+# wrapper 経由では subcommand を先頭に置く制約を強制し、`-` で始まる引数は reject。
+if [[ "${1:-}" == -* ]]; then
+  echo "ERROR: subcommand を最初に置いてください (例: ./run.sh up --build -d)。" >&2
+  echo "  受け取った: '$1' は option 形式。global option (--ansi 等) はこの wrapper では非対応。" >&2
+  exit 1
+fi
+
 # secret 取得が必要な compose subcommand を判定する。`down` / `logs` / `ps` 等の
 # 既存 container を触るだけの操作で gcloud / Secret Manager に依存させると、
 # SM が一時的に不可達のときに container を止められない等の運用事故になる。
@@ -73,14 +100,8 @@ if [[ "${NEED_SECRETS}" == "true" ]]; then
     "jwt-signing-key-v1:JWT_SIGNING_KEY_v1"
   )
 
-  # tmpfs (/dev/shm) 上に env ファイルを作る。リブートで自動消滅。
-  # パスは固定: docker-compose.yml が `env_file:` で同じパスを参照しているため。
-  TMPENV="/dev/shm/llm-memory-secrets.env"
-  # 旧 run があれば消す (前回 trap 漏れ等)
-  rm -f "${TMPENV}"
   # 作成 + 自分のみ読み書き
   install -m 600 /dev/null "${TMPENV}"
-  trap 'rm -f "${TMPENV}"' EXIT
 
   echo "Fetching secrets from Secret Manager (project=${PROJECT}) → ${TMPENV} ..."
   for entry in "${SECRETS[@]}"; do
