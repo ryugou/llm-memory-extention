@@ -371,7 +371,11 @@ cd ~/llm-memory-extention
 ### サーバー起動時に「`no JWT_SIGNING_KEY_<kid> environment variable configured`」エラー
 - Secret Manager に `jwt-signing-key-v1` が存在するか: `gcloud secrets list --filter='name~jwt-signing-key'`
 - 値が空 / 改行入りでないか: `gcloud secrets versions access latest --secret=jwt-signing-key-v1 | wc -c` (base64 32 バイトなら 44 文字程度)
-- `cd ~/llm-memory-extention && ./deploy/gce/run.sh config | grep JWT` で container への env 注入を確認 (`config` は container を起動せず compose の最終解決後 yml を出力)
+- container への env 注入を redact 付きで確認 (`config` は compose の最終解決後 yml を出力するため、値をそのまま grep すると端末に表示されてしまう):
+  ```bash
+  cd ~/llm-memory-extention
+  ./deploy/gce/run.sh config | grep -E '^[[:space:]]+JWT_SIGNING_KEY' | sed -E 's/(=.{4}).+/\1<redacted>/'
+  ```
 - VM の SA に `roles/secretmanager.secretAccessor` が付いているか: `gcloud secrets get-iam-policy jwt-signing-key-v1`
 
 ### OAuth callback で `invalid_grant` / `redirect_uri mismatch`

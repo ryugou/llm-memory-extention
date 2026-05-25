@@ -29,42 +29,63 @@
 
 set -euo pipefail
 
-# GCP project ID。環境変数で上書き可能、無ければ gcloud config から取得。
-PROJECT="${GCP_PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
-if [[ -z "${PROJECT}" || "${PROJECT}" == "(unset)" ]]; then
-  echo "ERROR: GCP project が決まらない。GCP_PROJECT_ID を export するか" \
-       "gcloud config set project <id> を実行してください。" >&2
-  exit 1
+# secret 取得が必要な compose subcommand を判定する。`down` / `logs` / `ps` 等の
+# 既存 container を触るだけの操作で gcloud / Secret Manager に依存させると、
+# SM が一時的に不可達のときに container を止められない等の運用事故になる。
+# 新規 container を作る系 (`up`, `run`, `create`) のときだけ secret を fetch する。
+NEED_SECRETS=false
+case "${1:-}" in
+  up|run|create)
+    NEED_SECRETS=true
+    ;;
+esac
+
+if [[ "${NEED_SECRETS}" == "true" ]]; then
+  # GCP project ID。環境変数で上書き可能、無ければ gcloud config から取得。
+  PROJECT="${GCP_PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
+  if [[ -z "${PROJECT}" || "${PROJECT}" == "(unset)" ]]; then
+    echo "ERROR: GCP project が決まらない。GCP_PROJECT_ID を export するか" \
+         "gcloud config set project <id> を実行してください。" >&2
+    exit 1
+  fi
+
+  # secret-name : env-var-name のマッピング。
+  # JWT 鍵を rotation するときは `jwt-signing-key-v2:JWT_SIGNING_KEY_v2` を追加する。
+  SECRETS=(
+    "google-oauth-client-id:GOOGLE_OAUTH_CLIENT_ID"
+    "google-oauth-client-secret:GOOGLE_OAUTH_CLIENT_SECRET"
+    "jwt-signing-key-v1:JWT_SIGNING_KEY_v1"
+  )
+
+  # tmpfs (/dev/shm) 上に env ファイルを作る。リブートで自動消滅。
+  # パスは固定: docker-compose.yml が `env_file:` で同じパスを参照しているため。
+  TMPENV="/dev/shm/llm-memory-secrets.env"
+  # 旧 run があれば消す (前回 trap 漏れ等)
+  rm -f "${TMPENV}"
+  # 作成 + 自分のみ読み書き
+  install -m 600 /dev/null "${TMPENV}"
+  trap 'rm -f "${TMPENV}"' EXIT
+
+  echo "Fetching secrets from Secret Manager (project=${PROJECT}) → ${TMPENV} ..."
+  for entry in "${SECRETS[@]}"; do
+    name="${entry%%:*}"
+    envvar="${entry##*:}"
+    val=$(gcloud secrets versions access latest --secret="${name}" --project="${PROJECT}")
+    # secret 値に改行 / CR が含まれていると tmp env ファイルが複数行に化けて
+    # compose の env パースが壊れる (意図せず別 var を注入できる shape にもなる)。
+    # fail-fast し、Secret 側を 1 行に直すよう促す。
+    if [[ "${val}" == *$'\n'* || "${val}" == *$'\r'* ]]; then
+      echo "ERROR: secret '${name}' contains a newline/CR. Rewrite it as a single line, e.g.:" >&2
+      echo "  printf '%s' '<value-without-newline>' | gcloud secrets versions add ${name} --data-file=-" >&2
+      exit 1
+    fi
+    # `=` を含む値も正しく扱うため printf '%s=%s' を使う。
+    # 末尾改行 1 個だけ付ける (gcloud secrets versions access は値の末尾改行を
+    # 削除して返すので 1 行)。
+    printf '%s=%s\n' "${envvar}" "${val}" >>"${TMPENV}"
+    echo "  ${envvar} (from ${name})"
+  done
 fi
-
-# secret-name : env-var-name のマッピング。
-# JWT 鍵を rotation するときは `jwt-signing-key-v2:JWT_SIGNING_KEY_v2` を追加する。
-SECRETS=(
-  "google-oauth-client-id:GOOGLE_OAUTH_CLIENT_ID"
-  "google-oauth-client-secret:GOOGLE_OAUTH_CLIENT_SECRET"
-  "jwt-signing-key-v1:JWT_SIGNING_KEY_v1"
-)
-
-# tmpfs (/dev/shm) 上に env ファイルを作る。リブートで自動消滅。
-# パスは固定: docker-compose.yml が `env_file:` で同じパスを参照しているため。
-TMPENV="/dev/shm/llm-memory-secrets.env"
-# 旧 run があれば消す (前回 trap 漏れ等)
-rm -f "${TMPENV}"
-# 作成 + 自分のみ読み書き
-install -m 600 /dev/null "${TMPENV}"
-trap 'rm -f "${TMPENV}"' EXIT
-
-echo "Fetching secrets from Secret Manager (project=${PROJECT}) → ${TMPENV} ..."
-for entry in "${SECRETS[@]}"; do
-  name="${entry%%:*}"
-  envvar="${entry##*:}"
-  val=$(gcloud secrets versions access latest --secret="${name}" --project="${PROJECT}")
-  # `=` を含む値も正しく扱うため printf '%s=%s' を使う。
-  # 末尾改行 1 個だけ付ける (gcloud secrets versions access は値の末尾改行を
-  # 削除して返すので 1 行)。
-  printf '%s=%s\n' "${envvar}" "${val}" >>"${TMPENV}"
-  echo "  ${envvar} (from ${name})"
-done
 
 # compose 起動。
 # - container への env 注入はこの script ではなく docker-compose.yml の
