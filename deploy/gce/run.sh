@@ -15,19 +15,21 @@
 #
 # **secret の到達範囲 (Accepted Risk)**:
 # `env_file:` で注入された値は Docker の container config として
-# `/var/lib/docker/containers/<id>/config.v2.json` 等に永続化され、root 権限で
-# `docker inspect` すれば参照できる。本 script は `.env` / repo / 通常ユーザの
-# ホームに secret を書かないことを保証するだけで、root を持つ攻撃者 / SSH 越しに
-# `sudo` を踏める運用者からは依然見える。完全 secret 化が必要なら別途 secret を
-# ファイル mount + entrypoint/app 側で読み込む方式に切り替えること。Phase 1
-# (個人 / 自社運用、`sudo docker compose` を踏める人 = 実質 root) ではこのリスクを
-# 受容している (deploy/gce/README.md 「Accepted Risk」参照)。
+# `/var/lib/docker/containers/<id>/config.v2.json` 等に永続化される。これは
+# Docker daemon に到達できる主体 (root、`docker` グループメンバ、`/var/run/docker.sock`
+# にアクセス可能なユーザ) なら `docker inspect` 等で参照できる。本 script は
+# `.env` / repo / 通常ユーザのホームに secret を書かないことを保証するだけで、
+# Docker daemon にアクセスできる主体 (= 実質 root 相当) からは依然見える。
+# 完全 secret 化が必要なら別途 secret をファイル mount + entrypoint/app 側で
+# 読み込む方式に切り替えること。Phase 1 (個人 / 自社運用、`sudo docker compose`
+# を踏める = Docker daemon に到達できる人 = 実質 root) ではこのリスクを受容している
+# (deploy/gce/README.md 「Accepted Risk」参照)。
 #
-# Usage:
-#   ./run.sh up --build -d
-#   ./run.sh logs -f --tail=200 server caddy
-#   ./run.sh down
-#   ./run.sh ps
+# Usage (repo root `~/llm-memory-extention` から実行する想定):
+#   ./deploy/gce/run.sh up --build -d
+#   ./deploy/gce/run.sh logs -f --tail=200 server caddy
+#   ./deploy/gce/run.sh down
+#   ./deploy/gce/run.sh ps
 #
 # 引数はそのまま `docker compose` に転送する。compose project 名と base env_file
 # はこのスクリプト内で固定する。
@@ -44,10 +46,12 @@ set -euo pipefail
 # secret 取得が必要な compose subcommand を判定する。`down` / `logs` / `ps` 等の
 # 既存 container を触るだけの操作で gcloud / Secret Manager に依存させると、
 # SM が一時的に不可達のときに container を止められない等の運用事故になる。
-# 新規 container を作る系 (`up`, `run`, `create`) のときだけ secret を fetch する。
+# 新規 container を作る系 (`up`, `run`, `create`) と、env の最終解決後 yml を
+# 出力する系 (`config`, `convert`) は secret が無いと結果が壊れる / 不完全になるので
+# fetch 対象に含める。それ以外 (`down`, `logs`, `ps`, `top`, `kill`, `restart` 等) は skip。
 NEED_SECRETS=false
 case "${1:-}" in
-  up|run|create)
+  up|run|create|config|convert)
     NEED_SECRETS=true
     ;;
 esac
