@@ -14,7 +14,8 @@ export GCP_PROJECT_ID=<your-gcp-project>
 
 - **Firewall `0.0.0.0/0` で 80/443 を公開**: OAuth/MCP endpoint は public な前提。OAuth/DCR 側に in-memory session/code map の cap + expiry pruning (`crates/llm-memory-auth/src/authorization_server.rs`) は入っているが、token 発行や DCR 自体に per-IP rate-limit は無いため、悪意ある相手が DCR スパム / authorize spam を投げると CPU/log の負荷は受ける。MCP tool 呼び出しは認証後 per-user の rate-limit が効く。本格運用に出すなら Cloud Armor 等で前段制限を入れる。
 - **nip.io + Let's Encrypt CT log**: 取得した cert が `crt.sh` 等で永続記録されるため VM の external IP が公開ログに残る。GCE IP は scan で見つかるので追加リスクは軽微。
-- **`.env` 平文で secret 保持**: Secret Manager 連携は overkill。手順では `.env` 作成後に `chmod 600 .env` でファイル所有者以外を読めない状態にする。`sudo docker compose` を踏める権限 (= 実質 root) を持つユーザだけ secret に到達できる。
+- **secret は Secret Manager で集中管理 + container env 化**: OAuth client / JWT 鍵は `.env` には書かず、Secret Manager に保管 (§1-5)。VM 起動時に `deploy/gce/run.sh` が fetch して tmpfs (`/dev/shm/llm-memory-secrets.env`) 経由で compose に渡す。これにより `.env` / git repo / 通常ファイルシステムには secret 文字列を残さない。**ただし** compose の `env_file:` で注入した値は Docker container config として `/var/lib/docker/containers/<id>/config.v2.json` 等に書かれる。これは Docker daemon に到達できる主体 (root、`docker` group メンバ、`/var/run/docker.sock` にアクセス可能なユーザ) なら `docker inspect` で閲覧可能。本構成は `sudo docker compose` を踏める運用者 (= Docker daemon に到達できる = 実質 root 相当) に対しては protection しない (Phase 1 個人 / 自社運用の前提)。完全な secret 化が必要なら secret を env でなくファイル mount + entrypoint/app 側で読み込む方式に変更する必要がある (別 PR の値打ち)。
+  同 secret 名 (例: `jwt-signing-key-v1`) の値だけを差し替える rotation は Console で新バージョン作成 → 再起動で完結。新しい secret 名を追加する rotation (例: `jwt-signing-key-v2`) は §1-5 / §2 に従い IAM accessor 付与 + `run.sh` の `SECRETS` 配列に 1 行追加が必要。
 - **VM の Instance SA に `--scopes=cloud-platform`**: scope はあくまでメタデータ token 経由で叩ける API の上限を定めるだけ。実際の権限は SA に付与した IAM role (本ガイドでは `roles/storage.objectAdmin` (GCS バックアップ書込み) と `roles/aiplatform.user` (Vertex AI 呼び出し) の 2 つのみ) で制御。
 
 ## アーキテクチャ
@@ -46,10 +47,12 @@ gcloud services enable \
   compute.googleapis.com \
   storage.googleapis.com \
   iam.googleapis.com \
-  aiplatform.googleapis.com
+  aiplatform.googleapis.com \
+  secretmanager.googleapis.com
 ```
 
 `aiplatform.googleapis.com` は Vertex AI (Gemini Flash / Pro 経由の概念抽出と wiki 合成) 用。
+`secretmanager.googleapis.com` は OAuth client / JWT 鍵などの secret 保管用 (§1-5 で詳述)。
 
 ### 1-3. GCS バックアップバケット作成
 
@@ -57,22 +60,57 @@ gcloud services enable \
 gsutil mb -l asia-northeast1 -c standard "gs://${GCP_PROJECT_ID}-memory-backup"
 ```
 
-### 1-4. JWT 鍵生成 (ローカルで)
+### 1-4. Google OAuth クライアント作成 (Web 用)
+
+Google Cloud Console の **API とサービス** → **認証情報** (UI 刷新後は **Google Auth Platform**) で:
+
+1. **対象** (旧 OAuth consent screen / ユーザー設定):
+   - **ユーザータイプ** が「外部」、**公開ステータス** が「テスト中」になっていること
+   - **テストユーザー** に Claude Desktop で sign-in するアカウント (`<user>@example.com` 等) を追加
+     — 外部 + テスト中アプリはテストユーザーに登録された address しか sign-in を許可しない
+2. **クライアント** (旧 Credentials → OAuth 2.0 Client IDs):
+   - 「**+ クライアントを作成**」 → アプリケーションの種類: **ウェブ アプリケーション**
+   - 任意の名前 (例: `llm-memory`)
+   - **承認済みのリダイレクト URI** に `https://<IP-with-hyphens>.nip.io/oauth/callback/google` を後で追加
+     (VM 作成後に IP が確定するため、§7 で改めて登録する)
+   - **クライアント ID** と **クライアント シークレット** をメモ (§1-5 で Secret Manager に登録する)
+
+### 1-5. Secret Manager に secret を登録
+
+OAuth client / JWT 鍵などの secret は Secret Manager で管理する。`.env` に直書きしない方針 (詳細は `.env.example` の `--- Secrets ---` セクション参照)。
+
+3 つの secret を作成 (`secret-name` は run.sh の `SECRETS` 配列と一致させること):
 
 ```bash
-openssl rand -base64 32
-# 出力をメモ → .env の JWT_SIGNING_KEY_v1 に
+# OAuth client_id (§1-4 でメモした値)
+printf '%s' '<クライアント ID>' | \
+  gcloud secrets create google-oauth-client-id \
+    --project="${GCP_PROJECT_ID}" --data-file=- --replication-policy=automatic
+
+# OAuth client_secret (§1-4 でメモした値)
+printf '%s' '<クライアント シークレット>' | \
+  gcloud secrets create google-oauth-client-secret \
+    --project="${GCP_PROJECT_ID}" --data-file=- --replication-policy=automatic
+
+# JWT 署名鍵 v1 (新規生成、base64 32 バイト)
+openssl rand -base64 32 | tr -d '\n' | \
+  gcloud secrets create jwt-signing-key-v1 \
+    --project="${GCP_PROJECT_ID}" --data-file=- --replication-policy=automatic
 ```
 
-### 1-5. Google OAuth クライアント作成 (Web 用)
+`--project` 明示は active project 違いで別 project に secret を作ってしまう事故を防ぐため。
 
-`https://console.cloud.google.com/apis/credentials` で:
+`printf '%s'` で末尾改行を抑制 (改行込みで保存すると compose env が壊れる)。
 
-1. OAuth consent screen 設定 (User Type: External, Publishing status: Testing)
-2. **Test users に自分の Google アカウント (Claude Desktop から sign-in する予定のアドレス) を追加** — External + Testing アプリは Test users に登録されたアドレスしか sign-in を許可しない。漏らすと callback まで届かない
-3. Credentials → Create credentials → OAuth client ID → Web application
-4. Authorized redirect URIs に **後で** `https://<IP>.nip.io/oauth/callback/google` を追加 (VM 作成後に IP が確定するため)
-5. client_id と client_secret をメモ
+新しい JWT 鍵に rotation するときは:
+
+```bash
+openssl rand -base64 32 | tr -d '\n' | \
+  gcloud secrets create jwt-signing-key-v2 \
+    --project="${GCP_PROJECT_ID}" --data-file=- --replication-policy=automatic
+```
+
+その後 `deploy/gce/run.sh` の `SECRETS` 配列に `"jwt-signing-key-v2:JWT_SIGNING_KEY_v2"` を追加して再起動。
 
 ## 2. インスタンス用 Service Account 作成
 
@@ -91,7 +129,17 @@ gsutil iam ch \
 gcloud projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
   --member="serviceAccount:${SA_NAME}@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
   --role="roles/aiplatform.user"
+
+# Secret Manager から secret を読む権限 (§1-5 で作成した 3 つの secret 個別に付与)
+for sec in google-oauth-client-id google-oauth-client-secret jwt-signing-key-v1; do
+  gcloud secrets add-iam-policy-binding "${sec}" \
+    --project="${GCP_PROJECT_ID}" \
+    --member="serviceAccount:${SA_NAME}@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/secretmanager.secretAccessor"
+done
 ```
+
+JWT 鍵を rotation して `jwt-signing-key-v2` を追加した場合は、同じ for-loop で v2 にも accessor を付与する。
 
 ## 3. 静的 IP 予約
 
@@ -186,13 +234,10 @@ cd llm-memory-extention
 nano .env
 ```
 
-`.env` の内容 (compose の env-file はシェル展開しないので、`${...}` は **使わず** すべて直書き):
+`.env` の内容 (非 secret のみ。secret は §1-5 で Secret Manager に登録済みで、起動時に `run.sh` が fetch して container に注入する):
 
 ```
 DATABASE_URL=sqlite:///data/db.sqlite
-GOOGLE_OAUTH_CLIENT_ID=...
-GOOGLE_OAUTH_CLIENT_SECRET=...
-JWT_SIGNING_KEY_v1=<openssl rand -base64 32 の出力>
 TRUSTED_PROXY_COUNT=1
 VERTEX_PROJECT=<your-gcp-project>
 VERTEX_LOCATION=us-central1
@@ -206,7 +251,7 @@ LITESTREAM_BUCKET=<your-gcp-project>-memory-backup
 
 `34-146-12-34` は §3 で予約した IP の `.` を `-` に置換した値。`<your-gcp-project>` はローカルで設定した `${GCP_PROJECT_ID}` の値で置換する。
 
-書き込み後、secret 漏洩防止のためファイル権限を絞る:
+書き込み後、念のためファイル権限を絞る (`.env` に secret はもう無いが、設定値の改竄防止):
 
 ```bash
 chmod 600 ~/llm-memory-extention/.env
@@ -222,24 +267,28 @@ sudo docker compose -p llm-memory-extention --env-file ../.env config \
 # 失敗: PUBLIC_URL: https://${PUBLIC_DOMAIN} などのリテラルが残る → .env が誤り
 ```
 
-以降、すべての `docker compose ...` コマンドに `-p llm-memory-extention --env-file ../.env` を付ける。`COMPOSE_PROJECT_NAME` は compose CLI の挙動を変える環境変数で、`--env-file` 経由では読まれないため、フラグで明示する必要がある。
+以降、compose を直接叩く代わりに `deploy/gce/run.sh` 経由で起動する (§8)。`run.sh` が Secret Manager fetch + tmpfs (`/dev/shm/llm-memory-secrets.env`) への書き出し + compose に必要な `-p llm-memory-extention --env-file ../.env` の付与をまとめて行う。
 
 ## 7. Google OAuth Console に redirect URI 追加
 
-VM の IP が決まったので、§1-5 で作った OAuth クライアントに以下を追加:
+VM の IP が決まったので、§1-4 で作った OAuth クライアントに以下を追加:
 
-- Authorized redirect URIs: `https://<IP-with-hyphens>.nip.io/oauth/callback/google`
+- **承認済みのリダイレクト URI** (Authorized redirect URIs): `https://<IP-with-hyphens>.nip.io/oauth/callback/google`
+
+Google Cloud Console の **Google Auth Platform** → **クライアント** からエントリを開いて編集 → **保存**。
 
 ## 8. 起動
 
-VM 内で:
+VM 内で `deploy/gce/run.sh` を使う。これが §1-5 で登録した Secret Manager の値を fetch して `/dev/shm/llm-memory-secrets.env` (tmpfs) に書き、compose に渡す:
 
 ```bash
-cd ~/llm-memory-extention/docker
-sudo docker compose -p llm-memory-extention --env-file ../.env up --build -d
+cd ~/llm-memory-extention
+./deploy/gce/run.sh up --build -d
 ```
 
-初回ビルドは e2-medium で 5〜10 分かかる (Rust 全クレートを release プロファイルで compile)。`sudo` を毎回付けるのは Accepted Risk セクションの方針通り。
+引数は `docker compose` にそのまま転送される (`up --build -d`、`logs -f --tail=200 server`、`down`、`ps` 等)。
+
+初回ビルドは e2-medium で 5〜10 分かかる (Rust 全クレートを release プロファイルで compile)。`sudo` を毎回付けるのは Accepted Risk セクションの方針通り (`run.sh` 内部で `sudo docker compose ...` を呼ぶ)。
 
 ## 9. 動作確認
 
@@ -255,8 +304,8 @@ curl https://${DOMAIN}/metrics | head
 VM 内のサーバーログ:
 
 ```bash
-cd ~/llm-memory-extention/docker
-sudo docker compose -p llm-memory-extention --env-file ../.env logs -f --tail=200 server caddy
+cd ~/llm-memory-extention
+./deploy/gce/run.sh logs -f --tail=200 server caddy
 ```
 
 ## 10. Claude Desktop 連携
@@ -309,11 +358,13 @@ SQLite + シングルプロセスのため:
 
 ## 14. トラブルシューティング
 
-以下のコマンドはすべて **VM 上の `~/llm-memory-extention/docker` ディレクトリで実行** することを前提とする (compose file がそこに存在するため):
+以下のコマンドはすべて **VM 上で `~/llm-memory-extention` (repo root) で実行** することを前提とする (`deploy/gce/run.sh` を `./deploy/gce/run.sh ...` の形で叩くため):
 
 ```bash
-cd ~/llm-memory-extention/docker
+cd ~/llm-memory-extention
 ```
+
+直接 `docker compose` を叩く例 (`docker volume ls` 等) はそのまま VM のどこでも実行できる。
 
 ### `docker compose up --build` が OOM で落ちる
 - `dmesg | grep -i kill` で OOM Kill を確認
@@ -322,12 +373,19 @@ cd ~/llm-memory-extention/docker
 ### `curl https://${DOMAIN}/healthz` が応答しない
 - DNS 解決確認: `nslookup ${DOMAIN}` → VM の static IP が返るか
 - ファイアウォール: `gcloud compute firewall-rules list --filter='name=allow-https-llm-memory'`
-- Caddy ログ: `sudo docker compose -p llm-memory-extention --env-file ../.env logs caddy | tail -50`
+- Caddy ログ: `cd ~/llm-memory-extention && ./deploy/gce/run.sh logs caddy | tail -50`
 - Let's Encrypt rate limit (週 50 cert/domain) に当たっていれば 5 日待つか staging endpoint を試す
 
 ### サーバー起動時に「`no JWT_SIGNING_KEY_<kid> environment variable configured`」エラー
-- `.env` に `JWT_SIGNING_KEY_v1=...` (base64, decode 後 >= 32 bytes) があるか確認
-- `sudo docker compose -p llm-memory-extention --env-file ../.env config | grep JWT` で env 注入を確認
+- Secret Manager に `jwt-signing-key-v1` が存在するか: `gcloud secrets list --filter='name~jwt-signing-key'`
+- 値が空 / 改行入りでないか: `gcloud secrets versions access latest --secret=jwt-signing-key-v1 | wc -c` (base64 32 バイトなら 44 文字程度)
+- container への env 注入を redact 付きで確認 (`config` は compose の最終解決後 yml を出力するため、値をそのまま grep すると端末に表示されてしまう):
+  ```bash
+  cd ~/llm-memory-extention
+  ./deploy/gce/run.sh config | grep -E '^[[:space:]]+JWT_SIGNING_KEY' | sed -E 's/(:[[:space:]]*.{4}).+$/\1<redacted>/'
+  ```
+  (compose v2 の `config` 出力は yaml の `KEY: VALUE` 形式なので `:` 区切りで redact する。`=` 区切りで書くと secret が全表示されるので注意。)
+- VM の SA に `roles/secretmanager.secretAccessor` が付いているか: `gcloud secrets get-iam-policy jwt-signing-key-v1`
 
 ### OAuth callback で `invalid_grant` / `redirect_uri mismatch`
 - Google OAuth Console の Authorized redirect URIs と `${PUBLIC_URL}/oauth/callback/google` が一致するか確認
@@ -335,12 +393,12 @@ cd ~/llm-memory-extention/docker
 
 ### litestream が GCS に書き込めない
 - VM の Instance SA が GCS bucket に `roles/storage.objectAdmin` を持つか: `gsutil iam get gs://${GCP_PROJECT_ID}-memory-backup`
-- litestream ログ: `sudo docker compose -p llm-memory-extention --env-file ../.env logs litestream`
+- litestream ログ: `cd ~/llm-memory-extention && ./deploy/gce/run.sh logs litestream`
 
 ### Caddy が証明書を取得できない (`tls: no certificate found`)
 - `tcp/80` が開放されているか (HTTP-01 challenge 用)
 - DNS 確認 (nip.io が解決するか): `nslookup ${PUBLIC_DOMAIN}`
-- caddy ログを確認: `sudo docker compose -p llm-memory-extention --env-file ../.env logs caddy | grep -E 'acme|tls'`
+- caddy ログを確認: `cd ~/llm-memory-extention && ./deploy/gce/run.sh logs caddy | grep -E 'acme|tls'`
 
 **最終手段** として caddy_data volume を削除すると ACME account + cert cache が消えて再発行が走る。ただし:
 
@@ -348,8 +406,9 @@ cd ~/llm-memory-extention/docker
 - volume 名は compose project 名依存。本ガイドは `-p llm-memory-extention` で固定しているので `llm-memory-extention_caddy_data` のはずだが、念のため `sudo docker volume ls | grep caddy` で実名確認してから削除
 
 ```bash
-sudo docker compose -p llm-memory-extention --env-file ../.env down
+cd ~/llm-memory-extention
+./deploy/gce/run.sh down
 sudo docker volume ls | grep caddy   # 実名確認 (`-p llm-memory-extention` 経由なら llm-memory-extention_caddy_data)
 sudo docker volume rm <実名>          # 例: llm-memory-extention_caddy_data
-sudo docker compose -p llm-memory-extention --env-file ../.env up -d
+./deploy/gce/run.sh up -d
 ```
