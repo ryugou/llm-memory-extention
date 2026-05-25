@@ -10,6 +10,27 @@ pub struct SearchQuery<'a> {
     pub limit: i64,
 }
 
+/// FTS5 MATCH 式に literal string を渡すための quoting。
+/// 空白区切りの各 token を `"..."` (FTS5 phrase) で個別に wrap し、空白 join する。
+/// FTS5 は空白区切りの phrase 列を implicit AND として扱うため、
+/// `foo bar` は `foo` と `bar` 両方を含む doc に hit する (term-AND 意味を維持)。
+/// token 内部の `-`, `*`, `OR`, `AND`, `NEAR` などは phrase の中で literal 扱いになる。
+/// 内部 `"` は `""` で escape する。
+/// 空 / whitespace-only 入力は空 phrase (`""`) を返し、no rows で安全に終わる。
+fn fts5_escape(s: &str) -> String {
+    let tokens: Vec<String> = s
+        .split_whitespace()
+        .map(|tok| {
+            let escaped = tok.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        })
+        .collect();
+    if tokens.is_empty() {
+        return "\"\"".into();
+    }
+    tokens.join(" ")
+}
+
 pub async fn raws(pool: &SqlitePool, q: SearchQuery<'_>) -> Result<Vec<Raw>, StorageError> {
     // 1..=100 にクランプ。負値や巨大値による DoS/誤動作を防ぐ。
     let limit = q.limit.clamp(1, 100);
@@ -18,7 +39,7 @@ pub async fn raws(pool: &SqlitePool, q: SearchQuery<'_>) -> Result<Vec<Raw>, Sto
          FROM raws_fts JOIN raws r ON r.rowid = raws_fts.rowid
          WHERE raws_fts MATCH ?",
     );
-    let mut binds: Vec<String> = vec![q.query.into()];
+    let mut binds: Vec<String> = vec![fts5_escape(q.query)];
     if let Some(s) = q.scope {
         sql.push_str(" AND r.scope = ?");
         binds.push(s.as_str().into());
@@ -136,6 +157,210 @@ mod tests {
         .await
         .unwrap();
         assert!(res.len() <= 100, "huge limit must clamp to 100");
+    }
+
+    #[tokio::test]
+    async fn query_with_hyphen_matches_adjacent_tokens_only() {
+        // hyphen を含む query は escape 後 phrase になり、FTS5 tokenizer が
+        // `team-frontend` を [team, frontend] に分解 → adjacent な term ペアにだけ hit する。
+        // adjacent な doc は hit し、非 adjacent な doc は hit しないことを 1 テストで検証。
+        // escape 無しなら FTS5 が `-` を NOT 演算子と解釈し adjacent doc も hit しないため、
+        // この assert は pre-fix で破綻する (regression guard)。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "team frontend retro",
+                content: "react",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "team alpha",
+                content: "frontend beta gamma",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "team-frontend",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            res.len(),
+            1,
+            "phrase must hit only the doc with adjacent team+frontend tokens"
+        );
+        assert_eq!(res[0].title, "team frontend retro");
+    }
+
+    #[tokio::test]
+    async fn query_with_double_quote_returns_no_rows_for_unrelated_doc() {
+        // 内部 `"` を含む query は escape で `""` に展開され、phrase は壊れず literal 扱い。
+        // 投入 doc は query と無関係なので、SQL error にもならず 0 行で返る。
+        // 「escape の副作用で全件マッチに化けていないこと」も同時に検証する。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "alpha quote",
+                content: "x",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: r#"foo " bar"#,
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            res.len(),
+            0,
+            "double-quote escape must not turn into a wildcard match"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_query_returns_no_rows_without_error() {
+        // 空文字 query は escape 後 `""` (empty phrase) になる。
+        // SQLite FTS5 では empty phrase は no match を返すだけで SQL error にならない。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "x",
+                content: "y",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.len(), 0, "empty query must produce no rows, not error");
+    }
+
+    #[tokio::test]
+    async fn multi_word_query_uses_and_of_terms_semantics() {
+        // raw_search の term-AND 意味を維持する回帰: `foo bar` で `foo baz bar` を
+        // 含む doc が hit する (token ごとに phrase 化 + 空白 join で FTS5 implicit AND)。
+        // 1 つの phrase で wrap すると adjacency 必須になり hit しなくなる。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "doc with foo baz bar",
+                content: "x",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "foo bar",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            res.len(),
+            1,
+            "multi-word query must AND terms, not require adjacency"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_with_operator_keyword_is_literal() {
+        // FTS5 の `AND` は演算子だが、escape 後は literal phrase ["AND"] (大文字小文字
+        // 無視で "and" token と一致) として扱われる。doc に `and` token が含まれない
+        // fixture を使うことで、operator 解釈 (rules AND exceptions = 両方含む doc に hit) と
+        // literal 解釈 (rules + AND + exceptions の 3 token 全てが必要 → "and" が無い doc は miss)
+        // を distinguish する。pre-fix なら 1 行 hit、post-fix なら 0 行になる。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "rules exceptions",
+                content: "x",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let res = raws(
+            &pool,
+            SearchQuery {
+                query: "rules AND exceptions",
+                scope: Some(Scope::Personal),
+                owner_id: Some("u1"),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            res.len(),
+            0,
+            "AND must be a literal term; doc lacking it must not match"
+        );
     }
 
     #[tokio::test]

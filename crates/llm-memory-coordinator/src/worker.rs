@@ -254,18 +254,40 @@ pub(crate) async fn run_session(
                 // 安全対策: Haiku が `affected_existing` に existing でない concept を入れて
                 // 返してきても、それは無視する (そうしないと set 経由で Sonnet に投げられ
                 // CONCEPT_LIMIT_PER_OWNER を bypass して wiki が新規作成されてしまう)。
+                // 加えて LLM 出力は trust boundary 外なので、2-64 chars / lowercase+hyphen の
+                // concept 名規約を満たさないものは upsert 前に drop し warn で観測する。
                 let existing_set: std::collections::HashSet<&String> =
                     existing_concepts.iter().collect();
                 let mut set: std::collections::BTreeSet<String> = extracted
                     .affected_existing
                     .into_iter()
+                    .filter(|c| {
+                        if !llm_memory_core::concept::is_valid(c) {
+                            warn!(owner = ?key, concept = %c, "drop invalid affected_existing");
+                            return false;
+                        }
+                        true
+                    })
                     .filter(|c| existing_set.contains(c))
                     .collect();
                 let current_count =
                     wikis::count_concepts(&deps.pool, key.scope, &key.owner_id).await?;
                 // 残り枠だけ追加。current_count=199, new=100 でも 200 までで止める。
                 let remaining = (CONCEPT_LIMIT_PER_OWNER - current_count).max(0) as usize;
-                let new_total = extracted.new_concepts.len();
+                // budget の判定は validation 後の件数で行う。raw 件数で warn すると
+                // Haiku が invalid 大量返答した時に「truncated」と誤って警告してしまう。
+                let valid_new: Vec<String> = extracted
+                    .new_concepts
+                    .into_iter()
+                    .filter(|c| {
+                        if !llm_memory_core::concept::is_valid(c) {
+                            warn!(owner = ?key, concept = %c, "drop invalid new_concept");
+                            return false;
+                        }
+                        true
+                    })
+                    .collect();
+                let new_total = valid_new.len();
                 if remaining == 0 && new_total > 0 {
                     warn!(owner = ?key, current_count, "concept limit reached, ignoring new_concepts");
                 } else if new_total > remaining {
@@ -277,8 +299,8 @@ pub(crate) async fn run_session(
                         "concept limit approached, truncated new_concepts"
                     );
                 }
-                for c in extracted.new_concepts.into_iter().take(remaining) {
-                    // 既存 concept と衝突する場合は set に入れるだけで新規 count を消費しない。
+                // 既存 concept と衝突する場合は set に入れるだけで新規 count を消費しない。
+                for c in valid_new.into_iter().take(remaining) {
                     set.insert(c);
                 }
                 set.into_iter().collect()
@@ -452,6 +474,96 @@ mod tests {
             model_synth: "sonnet".into(),
             metrics: Arc::new(NoopMetricsSink) as Arc<dyn MetricsSink>,
         })
+    }
+
+    #[tokio::test]
+    async fn append_drops_haiku_invalid_concept_names() {
+        // Haiku が "INVALID" (大文字) や "x" (1 char) を new_concepts に返してきても、
+        // wikis に upsert される前に core::concept::is_valid で reject される。
+        // 正常 concept ("valid-concept") のみ通る。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let mock = Arc::new(MockClient::new());
+        mock.push_text(
+            r#"{"affected_existing":[],"new_concepts":["valid-concept","INVALID","x"]}"#,
+        )
+        .await;
+        // synth は valid-concept 1 件分のみ要求される
+        mock.push_text(r#"{"content":"wiki","source_refs":[]}"#)
+            .await;
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "t",
+                content: "c",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let deps = deps(pool.clone(), mock).await;
+        run_session(&deps, &OwnerKey::personal("u1"), RebuildMode::Append)
+            .await
+            .unwrap();
+
+        let concepts = wikis::list_concepts(&pool, Scope::Personal, "u1")
+            .await
+            .unwrap();
+        assert!(concepts.contains(&"valid-concept".to_string()));
+        assert!(
+            !concepts.iter().any(|c| c == "INVALID"),
+            "uppercase concept must be dropped"
+        );
+        assert!(
+            !concepts.iter().any(|c| c == "x"),
+            "1-char concept must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_drops_haiku_invalid_affected_existing_names() {
+        // Haiku が affected_existing に "INVALID" のような形式違反を返してきても drop。
+        // 既存 set に存在しない (existing_set filter で先に落ちる) 場合と独立に
+        // is_valid filter が効くことを確認。
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        // 既存 concept として大文字を持つ wiki は本来 upsert されないが、
+        // 過去の bug で残った wiki が affected_existing に乗っても upsert は走らない
+        // (is_valid で drop) ことを直接は検証できないので、ここでは
+        // 「invalid 形式の affected_existing は無視され、Sonnet 呼び出しが発生しない」
+        // ことを mock の captured() で検証する。
+        let mock = Arc::new(MockClient::new());
+        mock.push_text(r#"{"affected_existing":["BadName"],"new_concepts":[]}"#)
+            .await;
+        // Sonnet 呼び出しを期待しない (= push_text しない)。
+        insert(
+            &pool,
+            NewRaw {
+                scope: Scope::Personal,
+                owner_id: "u1",
+                title: "t",
+                content: "c",
+                source: "m",
+                tags_json: None,
+                created_by: Some("u1"),
+            },
+        )
+        .await
+        .unwrap();
+        let deps = deps(pool.clone(), mock.clone()).await;
+        run_session(&deps, &OwnerKey::personal("u1"), RebuildMode::Append)
+            .await
+            .unwrap();
+        // mock の captured 数は 1 (Haiku のみ; Sonnet は呼ばれていない)
+        let captured = mock.captured().await;
+        assert_eq!(
+            captured.len(),
+            1,
+            "Sonnet must NOT be called when no valid concept survives validation"
+        );
     }
 
     #[tokio::test]

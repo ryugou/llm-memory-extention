@@ -1,10 +1,24 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::Json;
+use llm_memory_core::scope::Scope;
 use serde_json::{Value, json};
 
 use crate::app::AppState;
 use crate::mcp::transport::JsonRpcResponse;
 use llm_memory_auth::middleware::AuthenticatedUser;
+
+/// MCP ツール引数 `scope` を `Option<Scope>` に正規化する。
+/// `None` または `"all"` → `Ok(None)` (= 全 scope)、`"personal"` / `"shared"` →
+/// `Ok(Some(...))`、それ以外は typo の早期検知のため `invalid scope` で reject。
+/// raw_search / wiki_read / wiki_list が共有する。
+pub(crate) fn parse_scope_arg(s: Option<&str>) -> Result<Option<Scope>> {
+    match s {
+        None | Some("all") => Ok(None),
+        Some("personal") => Ok(Some(Scope::Personal)),
+        Some("shared") => Ok(Some(Scope::Shared)),
+        Some(other) => Err(anyhow!("invalid scope: {other}")),
+    }
+}
 
 pub mod export;
 pub mod raw_append;
@@ -269,6 +283,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_scope_arg_normalizes_known_values() {
+        assert!(matches!(parse_scope_arg(None), Ok(None)));
+        assert!(matches!(parse_scope_arg(Some("all")), Ok(None)));
+        assert!(matches!(
+            parse_scope_arg(Some("personal")),
+            Ok(Some(Scope::Personal))
+        ));
+        assert!(matches!(
+            parse_scope_arg(Some("shared")),
+            Ok(Some(Scope::Shared))
+        ));
+    }
+
+    #[test]
+    fn parse_scope_arg_rejects_unknown_with_invalid_scope_error() {
+        let err = parse_scope_arg(Some("bogus")).unwrap_err();
+        assert!(err.to_string().contains("invalid scope"));
+        assert!(err.to_string().contains("bogus"));
+    }
+
     #[tokio::test]
     async fn list_emits_input_schema_per_tool() {
         let r = list(Some(Value::from(1))).await;
@@ -327,6 +362,68 @@ mod tests {
             .as_str()
             .expect("text content");
         assert!(text.contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn wiki_read_invalid_scope_is_tool_error() {
+        // 未知 scope (e.g., "unknown_scope") は silent empty ではなく isError=true で返す。
+        let s = state().await;
+        let r = call(
+            s,
+            user(),
+            None,
+            json!({"name": "wiki_read", "arguments": {"concept": "foo", "scope": "unknown_scope"}}),
+        )
+        .await;
+        let body = serde_json::to_value(&r.0).unwrap();
+        assert!(body["error"].is_null());
+        assert_eq!(body["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn wiki_list_invalid_scope_is_tool_error() {
+        let s = state().await;
+        let r = call(
+            s,
+            user(),
+            None,
+            json!({"name": "wiki_list", "arguments": {"scope": "unknown_scope"}}),
+        )
+        .await;
+        let body = serde_json::to_value(&r.0).unwrap();
+        assert!(body["error"].is_null());
+        assert_eq!(body["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn wiki_rebuild_invalid_concept_is_tool_error() {
+        let s = state().await;
+        let r = call(
+            s,
+            user(),
+            None,
+            json!({"name": "wiki_rebuild", "arguments": {"concept": "INVALID UPPER"}}),
+        )
+        .await;
+        let body = serde_json::to_value(&r.0).unwrap();
+        assert!(body["error"].is_null());
+        assert_eq!(body["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn wiki_rebuild_omitted_concept_is_accepted() {
+        // concept 省略 (= 全 concept 再合成) は引き続き有効
+        let s = state().await;
+        let r = call(
+            s,
+            user(),
+            None,
+            json!({"name": "wiki_rebuild", "arguments": {}}),
+        )
+        .await;
+        let body = serde_json::to_value(&r.0).unwrap();
+        assert!(body["error"].is_null());
+        assert_eq!(body["result"]["isError"], false);
     }
 
     #[tokio::test]
