@@ -11,17 +11,20 @@ services:
     image: llm-memory-server:local
     # env_file は 2 つ列挙:
     # 1. `../.env`: 非 secret の app/deploy config (Vertex / PUBLIC_URL 等)
-    # 2. `/dev/shm/llm-memory-secrets.env`: Secret Manager から fetch した
-    #    OAuth client / JWT 鍵などの secret。`deploy/gce/run.sh` が起動時に
-    #    tmpfs (/dev/shm) 上に書き、終了時に削除する (= `.env` / git repo /
-    #    通常ファイルシステムには secret 文字列が残らない)。
+    # 2. `${SECRETS_ENV_FILE:-/dev/null}`: Secret Manager から fetch した
+    #    OAuth client / JWT 鍵などの secret。`deploy/gce/run.sh` が `mktemp` で
+    #    `/dev/shm` 上にユニーク path を作って secrets を書き、その path を
+    #    環境変数 `SECRETS_ENV_FILE` 経由で渡す (compose の interpolation で展開)。
+    #    終了時に削除される。固定 path を使わないことで `/dev/shm` の TOCTOU
+    #    symlink 攻撃を回避し、tmpfs (永続層には書かれない) を維持する。
+    #    SECRETS_ENV_FILE 未設定時 (= run.sh 経由でない local dev) は `/dev/null`
+    #    が読まれて 0 行 → secret 注入無し。その場合は `.env` に直書きする。
     #    ただし env_file 経由で注入した値は Docker container config として
     #    `/var/lib/docker` 配下に書かれ、Docker daemon に到達できる主体
     #    (root / `docker` group メンバ / `/var/run/docker.sock` 経由のユーザ) は
     #    `docker inspect` 等で閲覧可能。Phase 1 では受容済み
     #    (deploy/gce/README.md 「Accepted Risk」参照)。
-    #    ローカル開発で SM を使わない場合は `.env` に直書きすれば良いので
-    #    `required: false` で optional 扱い (compose v2.24+ の機能)。
+    #    `required: false` は compose v2.24+ の機能。
     # JWT key rotation (JWT_SIGNING_KEY_v1, v2, ...) は個別列挙不要。
     # container は std::env::vars() で `JWT_SIGNING_KEY_<kid>` を全列挙して読むので
     # env_file 経由でいくつ追加しても動作する。run.sh の SECRETS 配列に
@@ -30,7 +33,7 @@ services:
     env_file:
       - path: ../.env
         required: true
-      - path: /dev/shm/llm-memory-secrets.env
+      - path: ${SECRETS_ENV_FILE:-/dev/null}
         required: false
     # Docker 内固定値の上書き (env_file より優先される)。
     environment:

@@ -43,22 +43,13 @@
 
 set -euo pipefail
 
-# tmpfs (/dev/shm) 上の secret env ファイル。パスは固定: docker-compose.yml が
-# `env_file:` で同じパスを参照しているため。subcommand に関係なく毎回 cleanup を
-# 仕掛けて、過去の crash 残骸 / SM fetch を skip する subcommand のときも
-# tmp ファイルが取り残されないようにする (= subcommand 横断で secret が
-# tmpfs に残留しないことを保証)。
-TMPENV="/dev/shm/llm-memory-secrets.env"
+# tmpfs (/dev/shm) 上の secret env ファイル。`mktemp` で unique path を生成して
+# 固定 path を避け、`/dev/shm` (mode 1777) での TOCTOU symlink 攻撃を回避する。
+# subcommand に関係なく cleanup trap を仕掛けて、過去の crash 残骸 / SM fetch を
+# skip する subcommand のときも tmp ファイルが取り残されないようにする。
+TMPENV="$(mktemp /dev/shm/llm-memory-secrets.XXXXXX)"
+chmod 600 "${TMPENV}"
 trap 'rm -f "${TMPENV}"' EXIT
-# 起動時にも残骸を消す (前回 trap 漏れ / 異常終了対策)。`-L` で symlink 化を検出し
-# 自分が辿らされるのを拒否する (`/dev/shm` は 1777 のため別ユーザが symlink を
-# 差し込めば本来の TMPENV の代わりに別ファイルを上書きさせられる TOCTOU)。
-# Phase 1 の VM は実質単独利用なので残留 risk は小さいが、defense in depth として。
-if [[ -L "${TMPENV}" ]]; then
-  echo "ERROR: ${TMPENV} は symlink。誰かが TOCTOU を仕込んだ可能性。手動確認して削除してください。" >&2
-  exit 1
-fi
-rm -f "${TMPENV}"
 
 # compose subcommand 抽出。`docker compose` の global option (例: `--ansi`,
 # `--project-directory`) を先に渡されるとここで subcommand を取りこぼし、
@@ -99,9 +90,6 @@ if [[ "${NEED_SECRETS}" == "true" ]]; then
     "google-oauth-client-secret:GOOGLE_OAUTH_CLIENT_SECRET"
     "jwt-signing-key-v1:JWT_SIGNING_KEY_v1"
   )
-
-  # 作成 + 自分のみ読み書き
-  install -m 600 /dev/null "${TMPENV}"
 
   echo "Fetching secrets from Secret Manager (project=${PROJECT}) → ${TMPENV} ..."
   for entry in "${SECRETS[@]}"; do
@@ -149,7 +137,11 @@ esac
 #   その後の削除は安全。`up` (foreground) や `logs -f` でも Ctrl-C で
 #   compose 終了 → script 終了 → trap → 削除の順で確実に消える。
 cd "$(dirname "$0")/../../docker"
-sudo docker compose \
+# sudo は env を strip するので、`VAR=val sudo ...` 形でなく `sudo VAR=val cmd`
+# 形で渡す (sudo がそのまま子プロセスに継承させる)。
+# SECRETS_ENV_FILE を読んだ compose は env_file: の path interpolation で展開して
+# その tmp file を container env に注入する。
+sudo SECRETS_ENV_FILE="${TMPENV}" docker compose \
   -p llm-memory-extention \
   --env-file ../.env \
   "$@"

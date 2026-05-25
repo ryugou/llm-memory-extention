@@ -382,8 +382,9 @@ cd ~/llm-memory-extention
 - container への env 注入を redact 付きで確認 (`config` は compose の最終解決後 yml を出力するため、値をそのまま grep すると端末に表示されてしまう):
   ```bash
   cd ~/llm-memory-extention
-  ./deploy/gce/run.sh config | grep -E '^[[:space:]]+JWT_SIGNING_KEY' | sed -E 's/(=.{4}).+/\1<redacted>/'
+  ./deploy/gce/run.sh config | grep -E '^[[:space:]]+JWT_SIGNING_KEY' | sed -E 's/(:[[:space:]]*.{4}).+$/\1<redacted>/'
   ```
+  (compose v2 の `config` 出力は yaml の `KEY: VALUE` 形式なので `:` 区切りで redact する。`=` 区切りで書くと secret が全表示されるので注意。)
 - VM の SA に `roles/secretmanager.secretAccessor` が付いているか: `gcloud secrets get-iam-policy jwt-signing-key-v1`
 
 ### OAuth callback で `invalid_grant` / `redirect_uri mismatch`
