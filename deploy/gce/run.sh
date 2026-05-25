@@ -2,10 +2,14 @@
 # GCE 上で docker compose を起動するラッパー。
 #
 # 役割:
-# 1. Secret Manager から secret を fetch して /dev/shm 上の一時 env ファイルに書く
-#    (tmpfs なので永続層 = ディスクに残らない)。
-# 2. その env ファイルを compose に `--env-file` で追加渡しして起動。
-# 3. 終了時 (シェル exit 時) に一時ファイルを削除。
+# 1. Secret Manager から secret を fetch して、固定パス
+#    `/dev/shm/llm-memory-secrets.env` (tmpfs、永続層には残らない) に書き出す。
+# 2. `docker compose` を起動する。secret を container に渡す経路はこの script
+#    ではなく `docker/docker-compose.yml` 側の `env_file:` ディレクティブ
+#    (`/dev/shm/llm-memory-secrets.env` を 2 つめの env_file として参照) で完結する。
+#    この script が compose に渡す `--env-file ../.env` は compose ファイル内の
+#    `${LITESTREAM_BUCKET}` 等の variable interpolation 用で、container には渡らない。
+# 3. 終了時 (シェル exit 時) に tmp ファイルを削除する (EXIT trap)。
 #
 # Usage:
 #   ./run.sh up --build -d
@@ -50,7 +54,7 @@ rm -f "${TMPENV}"
 install -m 600 /dev/null "${TMPENV}"
 trap 'rm -f "${TMPENV}"' EXIT
 
-echo "Fetching secrets from Secret Manager (project=${PROJECT})..."
+echo "Fetching secrets from Secret Manager (project=${PROJECT}) → ${TMPENV} ..."
 for entry in "${SECRETS[@]}"; do
   name="${entry%%:*}"
   envvar="${entry##*:}"
@@ -63,10 +67,12 @@ for entry in "${SECRETS[@]}"; do
 done
 
 # compose 起動。
-# - `--env-file ../.env` は compose ファイル内の `${LITESTREAM_BUCKET}` 等の
-#   変数 interpolation 用 (container には渡らない)。
-# - container への env 注入は docker-compose.yml の `env_file:` セクションで
-#   `../.env` と `/dev/shm/llm-memory-secrets.env` の 2 つを読む。
+# - container への env 注入はこの script ではなく docker-compose.yml の
+#   `env_file:` セクションで完結する (`../.env` + `/dev/shm/llm-memory-secrets.env`
+#   の 2 つを参照)。後者はこの script が直前に書いた tmp ファイル。
+# - 下記 `--env-file ../.env` は compose ファイル内の `${LITESTREAM_BUCKET}` 等の
+#   variable interpolation 用で、container には渡らない。tmp env file はここでは
+#   渡さない (interpolation で参照されるのは非 secret の値だけのため不要)。
 # - `exec` を使うと bash プロセスが置き換わって EXIT trap が発火しなくなるため、
 #   fork して exit を待つ。`up -d` の場合は container 起動後すぐ戻ってきて
 #   trap で tmp ファイルを削除。container は起動時に env を読み込み済みなので、

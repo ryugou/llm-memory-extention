@@ -14,7 +14,7 @@ export GCP_PROJECT_ID=<your-gcp-project>
 
 - **Firewall `0.0.0.0/0` で 80/443 を公開**: OAuth/MCP endpoint は public な前提。OAuth/DCR 側に in-memory session/code map の cap + expiry pruning (`crates/llm-memory-auth/src/authorization_server.rs`) は入っているが、token 発行や DCR 自体に per-IP rate-limit は無いため、悪意ある相手が DCR スパム / authorize spam を投げると CPU/log の負荷は受ける。MCP tool 呼び出しは認証後 per-user の rate-limit が効く。本格運用に出すなら Cloud Armor 等で前段制限を入れる。
 - **nip.io + Let's Encrypt CT log**: 取得した cert が `crt.sh` 等で永続記録されるため VM の external IP が公開ログに残る。GCE IP は scan で見つかるので追加リスクは軽微。
-- **secret は Secret Manager で集中管理**: OAuth client / JWT 鍵は `.env` には書かず、Secret Manager に保管 (§1-5)。VM 起動時に `deploy/gce/run.sh` が fetch して tmpfs (`/dev/shm/llm-memory-secrets.env`) 経由で compose に渡す。永続層 (`.env` を含む) に secret は残らない。rotation は Console で新バージョン作成のみで完結。
+- **secret は Secret Manager で集中管理**: OAuth client / JWT 鍵は `.env` には書かず、Secret Manager に保管 (§1-5)。VM 起動時に `deploy/gce/run.sh` が fetch して tmpfs (`/dev/shm/llm-memory-secrets.env`) 経由で compose に渡す。永続層 (`.env` を含む) に secret は残らない。同 secret 名 (例: `jwt-signing-key-v1`) の値だけを差し替える rotation は Console で新バージョン作成 → 再起動で完結。新しい secret 名を追加する rotation (例: `jwt-signing-key-v2`) は §1-5 / §2 に従い IAM accessor 付与 + `run.sh` の `SECRETS` 配列に 1 行追加が必要。
 - **VM の Instance SA に `--scopes=cloud-platform`**: scope はあくまでメタデータ token 経由で叩ける API の上限を定めるだけ。実際の権限は SA に付与した IAM role (本ガイドでは `roles/storage.objectAdmin` (GCS バックアップ書込み) と `roles/aiplatform.user` (Vertex AI 呼び出し) の 2 つのみ) で制御。
 
 ## アーキテクチャ
@@ -350,11 +350,13 @@ SQLite + シングルプロセスのため:
 
 ## 14. トラブルシューティング
 
-以下のコマンドはすべて **VM 上の `~/llm-memory-extention/docker` ディレクトリで実行** することを前提とする (compose file がそこに存在するため):
+以下のコマンドはすべて **VM 上で `~/llm-memory-extention` (repo root) で実行** することを前提とする (`deploy/gce/run.sh` を `./deploy/gce/run.sh ...` の形で叩くため):
 
 ```bash
-cd ~/llm-memory-extention/docker
+cd ~/llm-memory-extention
 ```
+
+直接 `docker compose` を叩く例 (`docker volume ls` 等) はそのまま VM のどこでも実行できる。
 
 ### `docker compose up --build` が OOM で落ちる
 - `dmesg | grep -i kill` で OOM Kill を確認
