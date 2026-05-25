@@ -9,11 +9,23 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     image: llm-memory-server:local
-    # JWT key rotation (JWT_SIGNING_KEY_v1, v2, ...) を後から追加できるよう、
-    # 個別列挙ではなく `.env` 全体を環境変数として流し込む。container は app
-    # 起動時に `JWT_SIGNING_KEY_<kid>` を std::env::vars() で全列挙して読む。
+    # env_file は 2 つ列挙:
+    # 1. `../.env`: 非 secret の app/deploy config (Vertex / PUBLIC_URL 等)
+    # 2. `/dev/shm/llm-memory-secrets.env`: Secret Manager から fetch した
+    #    OAuth client / JWT 鍵などの secret。`deploy/gce/run.sh` が起動時に
+    #    tmpfs (/dev/shm) 上に書き、終了時に削除する。永続層に secret は残らない。
+    #    ローカル開発で SM を使わない場合は `.env` に直書きすれば良いので
+    #    `required: false` で optional 扱い (compose v2.24+ の機能)。
+    # JWT key rotation (JWT_SIGNING_KEY_v1, v2, ...) は個別列挙不要。
+    # container は std::env::vars() で `JWT_SIGNING_KEY_<kid>` を全列挙して読むので
+    # env_file 経由でいくつ追加しても動作する。run.sh の SECRETS 配列に
+    # `jwt-signing-key-vN:JWT_SIGNING_KEY_vN` を追加するだけ。
     # `.env` 例 / 必須 key の説明はリポジトリ root の `.env.example` 参照。
-    env_file: ../.env
+    env_file:
+      - path: ../.env
+        required: true
+      - path: /dev/shm/llm-memory-secrets.env
+        required: false
     # Docker 内固定値の上書き (env_file より優先される)。
     environment:
       - DATABASE_URL=sqlite:///data/db.sqlite
