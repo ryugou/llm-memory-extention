@@ -13,7 +13,11 @@ services:
     # 1. `../.env`: 非 secret の app/deploy config (Vertex / PUBLIC_URL 等)
     # 2. `/dev/shm/llm-memory-secrets.env`: Secret Manager から fetch した
     #    OAuth client / JWT 鍵などの secret。`deploy/gce/run.sh` が起動時に
-    #    tmpfs (/dev/shm) 上に書き、終了時に削除する。永続層に secret は残らない。
+    #    tmpfs (/dev/shm) 上に書き、終了時に削除する (= `.env` / git repo /
+    #    通常ファイルシステムには secret 文字列が残らない)。
+    #    ただし env_file 経由で注入した値は Docker container config として
+    #    `/var/lib/docker` 配下に書かれ、root + `docker inspect` から閲覧可能。
+    #    Phase 1 では受容済み (deploy/gce/README.md 「Accepted Risk」参照)。
     #    ローカル開発で SM を使わない場合は `.env` に直書きすれば良いので
     #    `required: false` で optional 扱い (compose v2.24+ の機能)。
     # JWT key rotation (JWT_SIGNING_KEY_v1, v2, ...) は個別列挙不要。

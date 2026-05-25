@@ -3,13 +3,25 @@
 #
 # 役割:
 # 1. Secret Manager から secret を fetch して、固定パス
-#    `/dev/shm/llm-memory-secrets.env` (tmpfs、永続層には残らない) に書き出す。
+#    `/dev/shm/llm-memory-secrets.env` (tmpfs、ホストの永続ディスクには書かれない)
+#    に書き出す。これにより `.env` / git repo / VM の通常ファイルシステムに
+#    secret 文字列を残さない。
 # 2. `docker compose` を起動する。secret を container に渡す経路はこの script
 #    ではなく `docker/docker-compose.yml` 側の `env_file:` ディレクティブ
 #    (`/dev/shm/llm-memory-secrets.env` を 2 つめの env_file として参照) で完結する。
 #    この script が compose に渡す `--env-file ../.env` は compose ファイル内の
 #    `${LITESTREAM_BUCKET}` 等の variable interpolation 用で、container には渡らない。
 # 3. 終了時 (シェル exit 時) に tmp ファイルを削除する (EXIT trap)。
+#
+# **secret の到達範囲 (Accepted Risk)**:
+# `env_file:` で注入された値は Docker の container config として
+# `/var/lib/docker/containers/<id>/config.v2.json` 等に永続化され、root 権限で
+# `docker inspect` すれば参照できる。本 script は `.env` / repo / 通常ユーザの
+# ホームに secret を書かないことを保証するだけで、root を持つ攻撃者 / SSH 越しに
+# `sudo` を踏める運用者からは依然見える。完全 secret 化が必要なら別途 secret を
+# ファイル mount + entrypoint/app 側で読み込む方式に切り替えること。Phase 1
+# (個人 / 自社運用、`sudo docker compose` を踏める人 = 実質 root) ではこのリスクを
+# 受容している (deploy/gce/README.md 「Accepted Risk」参照)。
 #
 # Usage:
 #   ./run.sh up --build -d
