@@ -92,7 +92,7 @@ if [[ "${NEED_SECRETS}" == "true" ]]; then
     # fail-fast し、Secret 側を 1 行に直すよう促す。
     if [[ "${val}" == *$'\n'* || "${val}" == *$'\r'* ]]; then
       echo "ERROR: secret '${name}' contains a newline/CR. Rewrite it as a single line, e.g.:" >&2
-      echo "  printf '%s' '<value-without-newline>' | gcloud secrets versions add ${name} --data-file=-" >&2
+      echo "  printf '%s' '<value-without-newline>' | gcloud secrets versions add ${name} --project=${PROJECT} --data-file=-" >&2
       exit 1
     fi
     # `=` を含む値も正しく扱うため printf '%s=%s' を使う。
@@ -102,6 +102,18 @@ if [[ "${NEED_SECRETS}" == "true" ]]; then
     echo "  ${envvar} (from ${name})"
   done
 fi
+
+# `config` / `convert` は解決後の compose 設定を stdout に出力するため、
+# Secret Manager 由来の値もそのまま端末 / リダイレクト先 / CI ログ等に出る。
+# うっかり叩いて漏らさないよう、subcommand を見て STDERR に警告を出す。
+# (READ FILTER で値を redact しても良いが、grep/sed の組み合わせ次第になるので
+# まずは「叩いた人に意識させる」運用ガードを入れる。README は redact 付きの
+# grep を案内している。)
+case "${1:-}" in
+  config|convert)
+    echo "WARNING: '$1' は env を解決した結果を stdout に出力します。Secret Manager 由来の値もそのまま表示されるため、redirect / CI ログ等に流さないよう注意してください。" >&2
+    ;;
+esac
 
 # compose 起動。
 # - container への env 注入はこの script ではなく docker-compose.yml の

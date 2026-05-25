@@ -84,16 +84,21 @@ OAuth client / JWT 鍵などの secret は Secret Manager で管理する。`.en
 ```bash
 # OAuth client_id (§1-4 でメモした値)
 printf '%s' '<クライアント ID>' | \
-  gcloud secrets create google-oauth-client-id --data-file=- --replication-policy=automatic
+  gcloud secrets create google-oauth-client-id \
+    --project="${GCP_PROJECT_ID}" --data-file=- --replication-policy=automatic
 
 # OAuth client_secret (§1-4 でメモした値)
 printf '%s' '<クライアント シークレット>' | \
-  gcloud secrets create google-oauth-client-secret --data-file=- --replication-policy=automatic
+  gcloud secrets create google-oauth-client-secret \
+    --project="${GCP_PROJECT_ID}" --data-file=- --replication-policy=automatic
 
 # JWT 署名鍵 v1 (新規生成、base64 32 バイト)
 openssl rand -base64 32 | tr -d '\n' | \
-  gcloud secrets create jwt-signing-key-v1 --data-file=- --replication-policy=automatic
+  gcloud secrets create jwt-signing-key-v1 \
+    --project="${GCP_PROJECT_ID}" --data-file=- --replication-policy=automatic
 ```
+
+`--project` 明示は active project 違いで別 project に secret を作ってしまう事故を防ぐため。
 
 `printf '%s'` で末尾改行を抑制 (改行込みで保存すると compose env が壊れる)。
 
@@ -101,7 +106,8 @@ openssl rand -base64 32 | tr -d '\n' | \
 
 ```bash
 openssl rand -base64 32 | tr -d '\n' | \
-  gcloud secrets create jwt-signing-key-v2 --data-file=- --replication-policy=automatic
+  gcloud secrets create jwt-signing-key-v2 \
+    --project="${GCP_PROJECT_ID}" --data-file=- --replication-policy=automatic
 ```
 
 その後 `deploy/gce/run.sh` の `SECRETS` 配列に `"jwt-signing-key-v2:JWT_SIGNING_KEY_v2"` を追加して再起動。
@@ -127,6 +133,7 @@ gcloud projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
 # Secret Manager から secret を読む権限 (§1-5 で作成した 3 つの secret 個別に付与)
 for sec in google-oauth-client-id google-oauth-client-secret jwt-signing-key-v1; do
   gcloud secrets add-iam-policy-binding "${sec}" \
+    --project="${GCP_PROJECT_ID}" \
     --member="serviceAccount:${SA_NAME}@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/secretmanager.secretAccessor"
 done
