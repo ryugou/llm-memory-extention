@@ -54,6 +54,16 @@ gcloud services enable \
 `aiplatform.googleapis.com` は Vertex AI (Gemini Flash / Pro 経由の概念抽出と wiki 合成) 用。
 `secretmanager.googleapis.com` は OAuth client / JWT 鍵などの secret 保管用 (§1-5 で詳述)。
 
+**確認** (5 つすべて enabled で返ること):
+
+```bash
+gcloud services list --enabled --project="${GCP_PROJECT_ID}" \
+  --filter='config.name:(compute.googleapis.com OR storage.googleapis.com OR iam.googleapis.com OR aiplatform.googleapis.com OR secretmanager.googleapis.com)' \
+  --format='value(config.name)'
+```
+
+`aiplatform.googleapis.com` だけが未 enable のまま気付かず起動すると server 自体は立ち上がるが、Gemini 呼び出し時に permission denied で raw 投入後の wiki 合成が静かに失敗する。
+
 ### 1-3. GCS バックアップバケット作成
 
 ```bash
@@ -140,6 +150,39 @@ done
 ```
 
 JWT 鍵を rotation して `jwt-signing-key-v2` を追加した場合は、同じ for-loop で v2 にも accessor を付与する。
+
+**確認** (各コマンドが対象 SA まで検証するように `--filter` に SA member を含めている。別 SA / user に role が付いているだけでは通らない):
+
+```bash
+SA="llm-memory-sa@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+
+# project レベル: roles/aiplatform.user が対象 SA に付与されているか
+gcloud projects get-iam-policy "${GCP_PROJECT_ID}" \
+  --flatten='bindings[].members' \
+  --filter="bindings.role=roles/aiplatform.user AND bindings.members:serviceAccount:${SA}" \
+  --format='value(bindings.members)'
+# 期待値: serviceAccount:llm-memory-sa@<project-id>.iam.gserviceaccount.com (空なら未付与)
+
+# bucket レベル: roles/storage.objectAdmin が対象 SA に付与されているか (jq で role+member を同時 match)
+gsutil iam get "gs://${GCP_PROJECT_ID}-memory-backup" \
+  | jq -er --arg sa "serviceAccount:${SA}" \
+      '.bindings[] | select(.role=="roles/storage.objectAdmin") | .members[] | select(. == $sa)'
+# 期待値: 上記 SA の文字列が 1 行返る (空 / exit code 非 0 なら未付与)
+
+# secret レベル: 3 secret それぞれ roles/secretmanager.secretAccessor が対象 SA に付与されているか
+# (filter の `=` と grep の `-x` で完全一致にして、似た prefix の別 SA を取り違えない)
+for sec in google-oauth-client-id google-oauth-client-secret jwt-signing-key-v1; do
+  echo -n "${sec}: "
+  gcloud secrets get-iam-policy "${sec}" --project="${GCP_PROJECT_ID}" \
+    --flatten='bindings[].members' \
+    --filter="bindings.role=roles/secretmanager.secretAccessor AND bindings.members=serviceAccount:${SA}" \
+    --format='value(bindings.members)' \
+    | grep -qx "serviceAccount:${SA}" && echo OK || echo MISSING
+done
+# 期待値: 3 行すべて OK (MISSING があれば §2 の add-iam-policy-binding を再実行)
+```
+
+どれか欠けていると container 起動後に `secret access denied` / `Gemini permission denied` で raw 投入時の wiki 合成が静かに失敗する。`jq` は GCE Debian 12 default image に同梱されている。
 
 ## 3. 静的 IP 予約
 
@@ -267,7 +310,54 @@ sudo docker compose -p llm-memory-extention --env-file ../.env config \
 # 失敗: PUBLIC_URL: https://${PUBLIC_DOMAIN} などのリテラルが残る → .env が誤り
 ```
 
+**旧フォーマットが残っていないかの確認** (Secret Manager 設計に切り替わる前の構成で立てた VM を引き継ぐ場合、`.env` に下記の残骸が混入しているとそれらが container に注入されてしまい、Secret Manager 由来の値を上書きしないものの noise として残る):
+
+```bash
+grep -E '^(GOOGLE_OAUTH_CLIENT_ID|GOOGLE_OAUTH_CLIENT_SECRET|JWT_SIGNING_KEY_|ANTHROPIC_API_KEY|MODEL_HAIKU|MODEL_SONNET|__FILL_ME__)' ~/llm-memory-extention/.env
+# 期待値: 何も出力されない
+# 出てきたら .env から該当行を削除する (これらは Secret Manager 由来 or 廃止済み env)
+```
+
 以降、compose を直接叩く代わりに `deploy/gce/run.sh` 経由で起動する (§8)。`run.sh` が Secret Manager fetch + tmpfs (`/dev/shm/llm-memory-secrets.env`) への書き出し + compose に必要な `-p llm-memory-extention --env-file ../.env` の付与をまとめて行う。
+
+### 6-1. 既存 VM での再デプロイ手順 (2 回目以降)
+
+新 commit を取り込んで再起動する場合:
+
+```bash
+cd ~/llm-memory-extention
+git pull --ff-only                           # run.sh / docker-compose.yml の更新を取り込む
+./deploy/gce/run.sh down                     # 旧 container を停止 (data volume は保持)
+./deploy/gce/run.sh up --build -d            # 再ビルド + 起動
+```
+
+`git pull` をせずに `run.sh` 経由で起動すると、古い `docker-compose.yml` で立ち上がって Secret Manager 由来の env が container に届かないことがあるので必ず pull する。
+
+container env に Secret Manager の値が実際に届いているかは、起動後に下記 2 段で確認する:
+
+**(a) キーが全て揃っているか (値は完全 redact)**
+
+```bash
+sudo docker inspect llm-memory-extention-server-1 \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep -E '^(GOOGLE_OAUTH_CLIENT_ID|GOOGLE_OAUTH_CLIENT_SECRET|JWT_SIGNING_KEY_[^=]+|VERTEX_PROJECT|PUBLIC_URL)=' \
+  | sed -E 's/^([^=]+)=.*/\1=<redacted>/'
+# 期待値: 5 行 (GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / JWT_SIGNING_KEY_v1 / VERTEX_PROJECT / PUBLIC_URL) が表示される
+# JWT_SIGNING_KEY_<kid> の <kid> 部分は v1 / v2 ... と rotation で増える可能性があるため `[^=]+` で吸収する
+```
+
+**(b) `__FILL_ME__` や旧 secret の混入が無いか (= 古い `.env` が container に届いていないか)**
+
+```bash
+sudo docker inspect llm-memory-extention-server-1 \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep -E '__FILL_ME__|MODEL_HAIKU|MODEL_SONNET|ANTHROPIC_API_KEY' \
+  | sed -E 's/^([^=]+)=.*/\1=<旧値検出>/'
+# 期待値: 何も出力されない
+# 出力があった場合: `run.sh` 経由でなく直接 `docker compose up` した可能性 → §8 の手順で起動し直す
+```
+
+GOOGLE_OAUTH_CLIENT_ID の値そのもの (= Secret Manager 由来か `.env` 由来か) を確認したい場合は、Cloud Console の OAuth クライアント一覧と Secret Manager の値が一致していることを別途確認する。Console / Secret Manager 以外には secret を平文表示しない方針。
 
 ## 7. Google OAuth Console に redirect URI 追加
 
@@ -292,6 +382,8 @@ cd ~/llm-memory-extention
 
 ## 9. 動作確認
 
+### 9-1. エンドポイントスモークテスト
+
 ローカルマシンから (素の `curl` のみ。整形して読みたければ `| jq` を付けて OK):
 
 ```bash
@@ -299,14 +391,52 @@ DOMAIN=34-146-12-34.nip.io   # ← 実際の値に置換
 curl https://${DOMAIN}/healthz                              # → ok
 curl https://${DOMAIN}/.well-known/oauth-authorization-server
 curl https://${DOMAIN}/metrics | head
+curl -X POST https://${DOMAIN}/mcp -o /dev/null -w '%{http_code}\n'   # → 401 (認証ガードが効いている)
+# 401 以外 (404 / 5xx / 3xx) が返る場合は Caddy / server / OAuth 設定のどこかに問題あり → §14 で切り分け
 ```
 
-VM 内のサーバーログ:
+`/metrics` の `concept_rebuild_failed_total` / `rebuild_failed_total` は counter (累積値) のため、絶対値 0 だけで「成功」と判断してはいけない (raw が 1 件も投入されていない初期状態でも 0)。実際の抽出系の動作確認は §9-3 (raws / wikis 行の存在) と併用すること。
+
+### 9-2. サーバーログ
+
+VM 内で:
 
 ```bash
 cd ~/llm-memory-extention
 ./deploy/gce/run.sh logs -f --tail=200 server caddy
 ```
+
+### 9-3. データの実在確認 (raw 投入後)
+
+Claude Desktop から `raw_append` を 1 件投げた直後、SQLite の中を見て raws / wikis に行が入っているかを確認する。
+
+**初回のみ: VM ホストに sqlite3 を install** (Debian 12 default image には未同梱):
+
+```bash
+sudo apt-get install -y sqlite3
+```
+
+VM ホスト側で named volume の mountpoint を取って読む (read-only で安全):
+
+```bash
+DB_PATH=$(sudo docker volume inspect llm-memory-extention_data --format '{{.Mountpoint}}')/db.sqlite
+
+sudo sqlite3 -header -column "${DB_PATH}" \
+  "SELECT id, owner_id, substr(title,1,20) AS title, created_at FROM raws ORDER BY created_at DESC LIMIT 3;"
+
+sudo sqlite3 -header -column "${DB_PATH}" \
+  "SELECT scope, concept, substr(content,1,40) AS content, last_rebuilt_at FROM wikis ORDER BY last_rebuilt_at DESC LIMIT 3;"
+```
+
+ホストに sqlite3 を入れたくない場合の fallback として alpine の sqlite で attach する手もある (third-party image 依存を増やす点に注意):
+
+```bash
+sudo docker run --rm -v llm-memory-extention_data:/data:ro alpine:3 \
+  sh -c 'apk add --no-cache sqlite >/dev/null && sqlite3 -header -column /data/db.sqlite \
+    "SELECT id, owner_id, substr(title,1,20) AS title, created_at FROM raws ORDER BY created_at DESC LIMIT 3;"'
+```
+
+raws に行があるのに wikis が空のままで 30 秒以上経つ場合、Vertex AI 呼び出し失敗 (IAM 未付与 / API 未 enable / quota) を疑い、`./deploy/gce/run.sh logs server` で ERROR 行を探す。
 
 ## 10. Claude Desktop 連携
 
@@ -375,6 +505,44 @@ cd ~/llm-memory-extention
 - ファイアウォール: `gcloud compute firewall-rules list --filter='name=allow-https-llm-memory'`
 - Caddy ログ: `cd ~/llm-memory-extention && ./deploy/gce/run.sh logs caddy | tail -50`
 - Let's Encrypt rate limit (週 50 cert/domain) に当たっていれば 5 日待つか staging endpoint を試す
+
+### raw 投入はできるのに wiki が一向に生成されない (Gemini 抽出が静かに失敗)
+
+raw_append 直前に `/metrics` で `concept_rebuild_failed_total` の値を控えておき、raw_append 後に再度 scrape したとき値が増えている場合 (counter は累積値なので絶対値でなく **差分** で判定する)、または server ログに `aiplatform` の permission denied / `INVALID_ARGUMENT` が出る場合、もしくは raws に行があるのに 30 秒以上経っても §9-3 の wikis に行が増えない場合:
+
+- API が enabled か: `gcloud services list --enabled --project="${GCP_PROJECT_ID}" --filter='config.name:aiplatform.googleapis.com' --format='value(config.name)'` → 空なら `gcloud services enable aiplatform.googleapis.com` で有効化
+- SA に role が付いているか: `gcloud projects get-iam-policy "${GCP_PROJECT_ID}" --flatten='bindings[].members' --filter="bindings.members:serviceAccount:llm-memory-sa@${GCP_PROJECT_ID}.iam.gserviceaccount.com" --format='value(bindings.role)' | grep aiplatform.user` → 空なら §2 の `add-iam-policy-binding` を実行
+- VM 上で metadata server から SA email が取れるか: `curl -fsS -H "Metadata-Flavor: Google" 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email'` → `llm-memory-sa@<project-id>.iam.gserviceaccount.com` が返ること (server container は scratch ベースで `curl` / `wget` が入っていないので VM ホスト側で叩く)
+- 修正後は `./deploy/gce/run.sh down && ./deploy/gce/run.sh up -d` で再起動 (IAM 変更は token cache の関係で即時反映されないことがある)
+
+### container の env に Secret Manager の値ではなく `__FILL_ME__` / `.env` 直書き値が入っている
+
+旧構成 (Secret Manager 設計に切り替わる前) の VM を引き継いだ場合、`.env` に旧 secret が直書きされたまま放置されていることがある。`run.sh` 経由でなく直接 `docker compose up` で起動するとそれらが container に注入されてしまう (Secret Manager fetch が走らない)。
+
+```bash
+# 1. .env から旧 secret を排除 (§6 の grep で検出される行を全部削除)
+nano ~/llm-memory-extention/.env
+
+# 2. .env.bak / .env.old などのバックアップが残っていないか確認
+ls -la ~/llm-memory-extention/.env*
+
+# 3. run.sh 経由で再起動 (Secret Manager から fetch される)
+cd ~/llm-memory-extention
+./deploy/gce/run.sh down
+./deploy/gce/run.sh up --build -d
+
+# 4. 注入結果を確認 (§6-1 と同じ 2 段チェック)
+#    キー揃いを確認 (値は完全 redact)
+sudo docker inspect llm-memory-extention-server-1 \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep -E '^(GOOGLE_OAUTH_CLIENT_ID|GOOGLE_OAUTH_CLIENT_SECRET|JWT_SIGNING_KEY_[^=]+)=' \
+  | sed -E 's/^([^=]+)=.*/\1=<redacted>/'
+#    旧値混入が無いか
+sudo docker inspect llm-memory-extention-server-1 \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep -E '__FILL_ME__|MODEL_HAIKU|MODEL_SONNET|ANTHROPIC_API_KEY' \
+  | sed -E 's/^([^=]+)=.*/\1=<旧値検出>/'
+```
 
 ### サーバー起動時に「`no JWT_SIGNING_KEY_<kid> environment variable configured`」エラー
 - Secret Manager に `jwt-signing-key-v1` が存在するか: `gcloud secrets list --filter='name~jwt-signing-key'`
