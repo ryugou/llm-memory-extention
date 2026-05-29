@@ -87,12 +87,24 @@ struct GeminiSystemInstruction<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct GeminiThinkingConfig {
+    /// Vertex AI Gemini 2.5 `thinkingConfig.thinkingBudget`.
+    /// `0` で thinking 無効化 (Flash 2.5)。
+    thinking_budget: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiGenerationConfig<'a> {
     max_output_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_mime_type: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_schema: Option<&'a serde_json::Value>,
+    /// `None` の場合はリクエストから omit する (Gemini default の thinking 動作)。
+    /// `Some({thinking_budget: 0})` で thinking を明示的に無効化する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinkingConfig>,
 }
 
 #[derive(Serialize)]
@@ -135,41 +147,53 @@ struct PromptFeedback {
     block_reason: Option<String>,
 }
 
+/// Build the Gemini request payload from a `CompleteRequest`.
+///
+/// 切り出した理由: production の `VertexAi::complete` と tests が同じ payload
+/// 構築経路を共有することで、新フィールド (例: `thinkingConfig`) を追加した
+/// ときに test が production と乖離するリスクを排除する。
+fn build_gemini_payload(req: &CompleteRequest) -> GeminiRequest<'_> {
+    // Gemini が許容するのは "user" / "model" の 2 role のみ。
+    // Anthropic 由来の "assistant" は "model" にマップ、その他はすべて "user"
+    // として扱う (今回の用途では multi-turn を組まないので user 中心)。
+    let contents: Vec<GeminiContent> = req
+        .messages
+        .iter()
+        .map(|m| GeminiContent {
+            role: if m.role == "assistant" || m.role == "model" {
+                "model"
+            } else {
+                "user"
+            },
+            parts: vec![GeminiPart { text: &m.content }],
+        })
+        .collect();
+
+    let (mime, schema) = match &req.response_schema {
+        Some(s) => (Some("application/json"), Some(s)),
+        None => (None, None),
+    };
+
+    GeminiRequest {
+        contents,
+        system_instruction: GeminiSystemInstruction {
+            parts: vec![GeminiPart { text: &req.system }],
+        },
+        generation_config: GeminiGenerationConfig {
+            max_output_tokens: req.max_tokens,
+            response_mime_type: mime,
+            response_schema: schema,
+            thinking_config: req
+                .thinking_budget
+                .map(|b| GeminiThinkingConfig { thinking_budget: b }),
+        },
+    }
+}
+
 #[async_trait]
 impl LlmClient for VertexAi {
     async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse, LlmError> {
-        // Gemini が許容するのは "user" / "model" の 2 role のみ。
-        // Anthropic 由来の "assistant" は "model" にマップ、その他はすべて "user"
-        // として扱う (今回の用途では multi-turn を組まないので user 中心)。
-        let contents: Vec<GeminiContent> = req
-            .messages
-            .iter()
-            .map(|m| GeminiContent {
-                role: if m.role == "assistant" || m.role == "model" {
-                    "model"
-                } else {
-                    "user"
-                },
-                parts: vec![GeminiPart { text: &m.content }],
-            })
-            .collect();
-
-        let (mime, schema) = match &req.response_schema {
-            Some(s) => (Some("application/json"), Some(s)),
-            None => (None, None),
-        };
-
-        let payload = GeminiRequest {
-            contents,
-            system_instruction: GeminiSystemInstruction {
-                parts: vec![GeminiPart { text: &req.system }],
-            },
-            generation_config: GeminiGenerationConfig {
-                max_output_tokens: req.max_tokens,
-                response_mime_type: mime,
-                response_schema: schema,
-            },
-        };
+        let payload = build_gemini_payload(&req);
 
         let token = self.access_token().await?;
         let url = format!(
@@ -255,9 +279,16 @@ mod tests {
     use crate::client::Message;
     use serde_json::json;
 
-    #[test]
-    fn gemini_request_payload_is_serializable() {
-        let req = CompleteRequest {
+    /// Helper used by all tests below — calls the same `build_gemini_payload`
+    /// that production `VertexAi::complete` uses, so payload-shape assertions
+    /// stay in sync with the actual wire format.
+    fn serialize_payload(req: &CompleteRequest) -> String {
+        let payload = build_gemini_payload(req);
+        serde_json::to_string(&payload).unwrap()
+    }
+
+    fn base_req() -> CompleteRequest {
+        CompleteRequest {
             model: "gemini-2.5-flash".into(),
             system: "sys".into(),
             messages: vec![Message {
@@ -265,28 +296,62 @@ mod tests {
                 content: "hi".into(),
             }],
             max_tokens: 100,
+            response_schema: None,
+            thinking_budget: None,
+        }
+    }
+
+    #[test]
+    fn gemini_request_includes_thinking_budget_zero_for_flash() {
+        // Gemini 2.5 Flash は thinking_budget=0 で thinking 完全無効化を許容する。
+        // extract phase の structured JSON 出力では thinking 不要なため 0 を渡す。
+        let req = CompleteRequest {
+            thinking_budget: Some(0),
+            ..base_req()
+        };
+        let s = serialize_payload(&req);
+        assert!(
+            s.contains("\"thinkingConfig\":{\"thinkingBudget\":0}"),
+            "expected thinkingConfig.thinkingBudget=0 in payload: {s}"
+        );
+    }
+
+    #[test]
+    fn gemini_request_includes_thinking_budget_128_for_pro() {
+        // Vertex AI 上の Gemini 2.5 Pro は thinking off (= budget=0) 不可。
+        // 手動指定する場合の範囲は 128-32768、未指定 (None) は auto budget。
+        // synth phase は仕様内の最小値 128 を明示して thinking を最小化する。
+        let req = CompleteRequest {
+            model: "gemini-2.5-pro".into(),
+            thinking_budget: Some(128),
+            ..base_req()
+        };
+        let s = serialize_payload(&req);
+        assert!(
+            s.contains("\"thinkingConfig\":{\"thinkingBudget\":128}"),
+            "expected thinkingConfig.thinkingBudget=128 in payload: {s}"
+        );
+    }
+
+    #[test]
+    fn gemini_request_omits_thinking_config_when_none() {
+        // thinking_budget=None なら payload に thinkingConfig 行が出ないこと
+        // (= 既存呼び出しと backward compatible、Vertex AI default 動作に委ねる)
+        let req = base_req();
+        let s = serialize_payload(&req);
+        assert!(
+            !s.contains("thinkingConfig"),
+            "thinkingConfig must be omitted when budget=None: {s}"
+        );
+    }
+
+    #[test]
+    fn gemini_request_payload_is_serializable() {
+        let req = CompleteRequest {
             response_schema: Some(json!({"type": "object"})),
+            ..base_req()
         };
-        let contents: Vec<GeminiContent> = req
-            .messages
-            .iter()
-            .map(|m| GeminiContent {
-                role: "user",
-                parts: vec![GeminiPart { text: &m.content }],
-            })
-            .collect();
-        let payload = GeminiRequest {
-            contents,
-            system_instruction: GeminiSystemInstruction {
-                parts: vec![GeminiPart { text: &req.system }],
-            },
-            generation_config: GeminiGenerationConfig {
-                max_output_tokens: req.max_tokens,
-                response_mime_type: Some("application/json"),
-                response_schema: req.response_schema.as_ref(),
-            },
-        };
-        let s = serde_json::to_string(&payload).unwrap();
+        let s = serialize_payload(&req);
         assert!(s.contains("\"role\":\"user\""));
         assert!(s.contains("\"text\":\"hi\""));
         assert!(s.contains("\"systemInstruction\""));

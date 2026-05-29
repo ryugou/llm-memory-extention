@@ -65,6 +65,7 @@ mod tests {
                 messages: vec![],
                 max_tokens: 10,
                 response_schema: None,
+                thinking_budget: None,
             })
             .await
             .unwrap();
@@ -82,6 +83,7 @@ mod tests {
                 messages: vec![],
                 max_tokens: 10,
                 response_schema: None,
+                thinking_budget: None,
             })
             .await;
         assert!(r.is_err());
