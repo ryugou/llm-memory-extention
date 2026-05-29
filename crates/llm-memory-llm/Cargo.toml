@@ -2,6 +2,7 @@
 name = "llm-memory-llm"
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 llm-memory-core = { path = "../llm-memory-core" }

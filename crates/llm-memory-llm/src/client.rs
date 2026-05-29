@@ -19,6 +19,14 @@ pub struct CompleteRequest {
     /// Optional JSON Schema (Gemini `responseSchema`) for structured output.
     /// 指定すると、モデルは厳密にこの schema に従う JSON のみを返す。
     pub response_schema: Option<serde_json::Value>,
+    /// Optional Gemini 2.5 thinking budget (`thinkingConfig.thinkingBudget`).
+    /// `Some(0)` で thinking 完全無効化 (Flash 2.5)。
+    /// `Some(N)` で N tokens の thinking budget。
+    /// `None` でリクエストに thinkingConfig を含めない (provider default 動作)。
+    /// Vertex AI Gemini 2.5 系はデフォルトで thinking が有効になっており、
+    /// thinking tokens が max_output_tokens を圧迫して finishReason=MAX_TOKENS で
+    /// truncate される事故を防ぐため、batch 抽出系では明示的に 0 を渡す。
+    pub thinking_budget: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
