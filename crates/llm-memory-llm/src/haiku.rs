@@ -169,10 +169,7 @@ mod tests {
     #[test]
     fn thinking_budget_for_model_returns_zero_for_flash_25() {
         assert_eq!(thinking_budget_for_model("gemini-2.5-flash"), Some(0));
-        assert_eq!(
-            thinking_budget_for_model("gemini-2.5-flash-lite"),
-            Some(0)
-        );
+        assert_eq!(thinking_budget_for_model("gemini-2.5-flash-lite"), Some(0));
     }
 
     #[test]

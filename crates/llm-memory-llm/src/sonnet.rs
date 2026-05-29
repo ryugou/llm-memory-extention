@@ -120,7 +120,8 @@ mod tests {
         // 再発防止) を SonnetSynthesizer の production code 経路で固定する。
         // max_tokens=32768, thinking_budget=Some(128) が必ず client に届くこと。
         let mock = MockClient::new();
-        mock.push_text(r##"{"content":"x","source_refs":[]}"##).await;
+        mock.push_text(r##"{"content":"x","source_refs":[]}"##)
+            .await;
         let s = SonnetSynthesizer {
             client: &mock,
             model: "gemini-2.5-pro".into(),
@@ -145,7 +146,8 @@ mod tests {
         // Pro 用 Some(128) を hard-code せず、Flash で thinking 完全無効化
         // (Some(0)) にフォールバックすること。コスト最小化と API 互換の両立。
         let mock = MockClient::new();
-        mock.push_text(r##"{"content":"x","source_refs":[]}"##).await;
+        mock.push_text(r##"{"content":"x","source_refs":[]}"##)
+            .await;
         let s = SonnetSynthesizer {
             client: &mock,
             model: "gemini-2.5-flash".into(),
