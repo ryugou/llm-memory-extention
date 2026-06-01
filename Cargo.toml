@@ -7,6 +7,9 @@ members = [
     "crates/llm-memory-coordinator",
     "crates/llm-memory-auth",
     "crates/llm-memory-server",
+    "crates/vegapunk-client",
+    "crates/vegapunk-memory-storage",
+    "crates/vegapunk-memory-server",
 ]
 
 [workspace.package]
