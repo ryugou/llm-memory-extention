@@ -1,21 +1,27 @@
 //! 起動時設定。env var から読み込む。
 //!
-//! 必須:
-//! - `DATABASE_URL`            (例: sqlite:///data/vegapunk-memory.sqlite)
-//! - `BIND_ADDR`               (例: 0.0.0.0:8081)
-//! - `PUBLIC_URL`              (例: https://vegapunk-136-110-78-245.nip.io)
-//! - `GOOGLE_OAUTH_CLIENT_ID`  (Secret Manager 経由で注入)
+//! 必須 (`from_env` が unwrap する):
+//! - `DATABASE_URL`              (例: sqlite:///data/vegapunk-memory.sqlite)
+//! - `PUBLIC_URL`                (例: https://vegapunk-136-110-78-245.nip.io)
+//! - `GOOGLE_OAUTH_CLIENT_ID`    (Secret Manager 経由で注入)
 //! - `GOOGLE_OAUTH_CLIENT_SECRET`
-//! - `VEGAPUNK_GRPC_ENDPOINT`  (例: http://vegapunk.local:6840)
-//! - `VEGAPUNK_BEARER_TOKEN`   (vegapunk server.auth.token と一致)
-//! - `JWT_SIGNING_KEY_<kid>`   (少なくとも 1 つ、HS256 base64 32+ bytes)
+//! - `VEGAPUNK_GRPC_ENDPOINT`    (例: http://vegapunk.local:6840)
+//! - `VEGAPUNK_BEARER_TOKEN`     (vegapunk server.auth.token と一致)
 //!
-//! オプション:
-//! - `TRUSTED_PROXY_COUNT`     (default 1)
+//! オプション (default あり):
+//! - `BIND_ADDR`                 (default `0.0.0.0:8081`)
+//! - `TRUSTED_PROXY_COUNT`       (default 1)
+//!
+//! 後続 PR で追加予定 (本 skeleton では未読込):
+//! - `JWT_SIGNING_KEY_<kid>`     (HS256 base64 32+ bytes、HTTP transport 実装と
+//!   合わせて `llm_memory_auth::jwt::JwtKeys::from_env()` 経由で読み込む)
 
 use anyhow::{Context, Result};
 
-#[derive(Debug, Clone)]
+/// 秘匿値 (OAuth client secret / vegapunk bearer / JWT 鍵 など) を含むため
+/// `Debug` を derive しない。意図せず `{:?}` でログに流出するのを防ぐ。
+/// 必要なら redaction 付きの手書き `Debug` 実装を追加する。
+#[derive(Clone)]
 pub struct ServerConfig {
     pub database_url: String,
     pub bind_addr: String,

@@ -39,11 +39,15 @@ pub async fn find_by_id(pool: &SqlitePool, id: &str) -> Result<Option<User>, Sto
     .await?)
 }
 
-/// 新規 user を作成 (= OAuth 初回認証時)。
-/// vegapunk_schema は OAuth 段階では確定しないので、暫定値 ("__unset__" 等) を
-/// 入れる運用も考えられるが、本実装では admin による事前設定を強制し、
-/// 該当 schema 未割当の subject は認証失敗扱いとする (= insert しない)。
-/// = insert は admin の SQL 直設定でのみ行う。
+/// 新規 user 行を作成する admin provisioning ヘルパ。
+///
+/// vegapunk_schema は OAuth 段階では確定しない (= ユーザ自身は自分の schema を
+/// 知らない) ため、本サーバの認証経路では自動 INSERT しない。admin が
+/// 事前に vegapunk Console / CLI で schema を作成 → ここで対応 user 行を
+/// 投入 → 以降 OAuth 経路は既存行を SELECT して使う、という運用。
+///
+/// テストフィクスチャ用途と admin スクリプト用途を兼ねるため `pub` のまま
+/// 残しているが、サーバ実装内の OAuth flow からは呼ばないこと。
 pub async fn insert(
     pool: &SqlitePool,
     id: &str,

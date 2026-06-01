@@ -2,7 +2,10 @@
 //!
 //! tonic で proto から生成した client を、固定 Bearer + base URL の
 //! 接続設定込みで使いやすくする層。MCP server (vegapunk-memory-server)
-//! からは `VegapunkClient::connect(...)` 経由でアクセスする。
+//! からは `vegapunk_client::connect(endpoint, bearer_token)` 経由で
+//! `GraphRagClient` を得る。`GraphRagClient` は内部で
+//! `BearerAuthInterceptor` を持ち、全リクエストに
+//! `authorization: Bearer <token>` を自動付与する。
 
 // tonic_build で生成された code は proto のコメントから doc 化される。proto 側で
 // 整形しきれないため clippy::doc_overindented_list_items などが発火するが、
