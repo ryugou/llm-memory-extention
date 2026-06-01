@@ -53,3 +53,41 @@ pub async fn find_by_id(pool: &SqlitePool, id: &str) -> Result<Option<SharedMemo
     .fetch_optional(pool)
     .await?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::init_pool;
+
+    #[tokio::test]
+    async fn create_and_list_all() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let id = SharedMemoryId::parse("team-x").unwrap();
+        create(&pool, &id, "Team X", "shared-schema-team-x")
+            .await
+            .unwrap();
+        let list = list_all(&pool).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "team-x");
+        assert_eq!(list[0].name, "Team X");
+        assert_eq!(list[0].vegapunk_schema, "shared-schema-team-x");
+    }
+
+    #[tokio::test]
+    async fn find_by_id_returns_created_shared_memory() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        let id = SharedMemoryId::parse("team-y").unwrap();
+        create(&pool, &id, "Team Y", "shared-schema-y")
+            .await
+            .unwrap();
+        let found = find_by_id(&pool, "team-y").await.unwrap().expect("exists");
+        assert_eq!(found.id, "team-y");
+        assert_eq!(found.vegapunk_schema, "shared-schema-y");
+    }
+
+    #[tokio::test]
+    async fn find_by_id_returns_none_for_missing_id() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        assert!(find_by_id(&pool, "nonexistent").await.unwrap().is_none());
+    }
+}

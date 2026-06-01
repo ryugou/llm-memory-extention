@@ -40,3 +40,9 @@ CREATE TABLE tokens (
   expires_at INTEGER NOT NULL,
   revoked_at INTEGER
 );
+
+-- token revocation 系クエリ (= 「ある user / client の全 token を revoke」)
+-- は user_id / client_id でフィルタするため、両方に index を張って
+-- 行数増加時の full-scan を防ぐ。
+CREATE INDEX idx_tokens_user_id ON tokens(user_id);
+CREATE INDEX idx_tokens_client_id ON tokens(client_id);

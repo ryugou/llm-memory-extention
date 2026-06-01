@@ -78,3 +78,48 @@ pub async fn insert(
         created_at: now,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::init_pool;
+
+    #[tokio::test]
+    async fn insert_then_lookup_by_provider_subject() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(
+            &pool,
+            "u1",
+            "google",
+            "sub1",
+            Some("x@example.com"),
+            "schema-1",
+        )
+        .await
+        .unwrap();
+        let found = find_by_provider_subject(&pool, "google", "sub1")
+            .await
+            .unwrap()
+            .expect("user should exist");
+        assert_eq!(found.id, "u1");
+        assert_eq!(found.email.as_deref(), Some("x@example.com"));
+        assert_eq!(found.vegapunk_schema, "schema-1");
+    }
+
+    #[tokio::test]
+    async fn find_by_id_returns_inserted_user_with_null_email() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        insert(&pool, "u2", "google", "sub2", None, "schema-2")
+            .await
+            .unwrap();
+        let found = find_by_id(&pool, "u2").await.unwrap().expect("exists");
+        assert_eq!(found.id, "u2");
+        assert!(found.email.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_by_id_returns_none_for_missing_user() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        assert!(find_by_id(&pool, "nonexistent").await.unwrap().is_none());
+    }
+}

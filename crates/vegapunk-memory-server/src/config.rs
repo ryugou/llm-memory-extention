@@ -56,5 +56,12 @@ impl ServerConfig {
 }
 
 fn env_required(key: &str) -> Result<String> {
-    std::env::var(key).with_context(|| format!("missing required env var: {key}"))
+    let value = std::env::var(key).with_context(|| format!("missing required env var: {key}"))?;
+    // 空文字 / whitespace-only な値は実用的には未設定と等価で、後段の API 呼び出しで
+    // 紛らわしい失敗を生む。env_required の時点で fail-fast してエラーメッセージで
+    // 原因を明示する。
+    if value.trim().is_empty() {
+        anyhow::bail!("required env var {key} is empty or whitespace-only");
+    }
+    Ok(value)
 }
