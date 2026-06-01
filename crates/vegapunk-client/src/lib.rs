@@ -123,8 +123,20 @@ impl tonic::service::Interceptor for BearerAuthInterceptor {
 /// - `endpoint`: 例 `http://vegapunk.local:6840` (dev) / `https://<cloud>` (prod)
 /// - `bearer_token`: vegapunk config (`server.auth.token`) と一致する token
 ///
-/// `connect_timeout` / `tcp_keepalive` で接続安定性の最低限を確保する。
+/// 順序:
+/// 1. Bearer token を fail-fast validate
+/// 2. endpoint を parse して channel を connect
+///    (`connect_timeout` / `tcp_keepalive` で接続安定性を確保)
+///
+/// token / endpoint の同期的 validation を先に済ませることで、設定エラー時に
+/// ネットワーク接続を試みる前に分かりやすい error を返す (= startup の高速化 +
+/// connect error で真因がマスクされるのを防ぐ)。
 pub async fn connect(endpoint: &str, bearer_token: &str) -> Result<GraphRagClient, ConnectError> {
+    // 1. token validation (同期、即時 fail-fast)
+    let interceptor = BearerAuthInterceptor::new(bearer_token)
+        .map_err(|e| ConnectError::InvalidToken(e.to_string()))?;
+
+    // 2. endpoint parse + channel connect (network I/O はここで初めて発生)
     let channel = Endpoint::from_shared(endpoint.to_string())
         .map_err(|e| ConnectError::InvalidEndpoint(e.to_string()))?
         .connect_timeout(Duration::from_secs(5))
@@ -132,9 +144,6 @@ pub async fn connect(endpoint: &str, bearer_token: &str) -> Result<GraphRagClien
         .connect()
         .await
         .map_err(|e| ConnectError::Connect(e.to_string()))?;
-
-    let interceptor = BearerAuthInterceptor::new(bearer_token)
-        .map_err(|e| ConnectError::InvalidToken(e.to_string()))?;
 
     Ok(GraphRagEngineClient::with_interceptor(channel, interceptor))
 }
