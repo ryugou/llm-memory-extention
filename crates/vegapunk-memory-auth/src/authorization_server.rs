@@ -275,13 +275,30 @@ async fn authorize(State(state): State<AsState>, Query(p): Query<AuthorizeParams
             return server_error("storage error");
         }
     };
-    let allowed: Vec<String> = serde_json::from_str(&client.redirect_uris).unwrap_or_default();
+    // DB 上の redirect_uris は DCR (`oauth_clients::register`) で JSON serialize
+    // 済の値が入る前提。parse fail はストレージ破損 (= 運用事故) なので、
+    // 空配列にフォールバックして "redirect_uri not registered" に化けさせず、
+    // operator が原因を追えるよう server_error (500) + log で fail-fast する。
+    let allowed: Vec<String> = match serde_json::from_str(&client.redirect_uris) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(client_id = %p.client_id, error = ?e, "malformed redirect_uris JSON in oauth_clients row");
+            return server_error("storage error");
+        }
+    };
     if !allowed.contains(&p.redirect_uri) {
         return bad_request("invalid_request", "redirect_uri not registered");
     }
     // DCR 時に登録された grant_types を enforce する。authorization_code を
     // 持たないクライアントは /authorize を踏ませない (OAuth 2.0 §3.1, §3.2.2)。
-    let grants: Vec<String> = serde_json::from_str(&client.grant_types).unwrap_or_default();
+    // ストレージ破損で grant_types が壊れた場合も同上で server_error 化する。
+    let grants: Vec<String> = match serde_json::from_str(&client.grant_types) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(client_id = %p.client_id, error = ?e, "malformed grant_types JSON in oauth_clients row");
+            return server_error("storage error");
+        }
+    };
     if !grants.iter().any(|g| g == "authorization_code") {
         return bad_request(
             "unauthorized_client",
@@ -450,21 +467,41 @@ async fn token(State(state): State<AsState>, Form(body): Form<TokenForm>) -> Res
     }
 }
 
+/// `client_grant_types` の失敗種別。
+/// `Storage`: DB エラー / `MalformedJson`: 行内 JSON が壊れている。
+/// どちらも caller は `server_error` (500) を返す扱いで、operator が原因
+/// 追跡できるよう tracing で log する想定。
+#[derive(Debug, thiserror::Error)]
+enum ClientLookupError {
+    #[error(transparent)]
+    Storage(#[from] vegapunk_memory_storage::StorageError),
+    #[error("malformed grant_types JSON in oauth_clients row: {0}")]
+    MalformedJson(serde_json::Error),
+}
+
 /// Look up a registered client and return its `grant_types` array.
 /// 戻り値:
 /// - `Ok(Some(grants))`: client が存在し grant_types が読めた
 /// - `Ok(None)`: client が DB に存在しない (= invalid_client)
-/// - `Err(_)`: DB 障害 (= caller は server_error/500 を返すべき)
+/// - `Err(Storage|MalformedJson)`: DB 障害 / 行内 JSON 破損
+///   (= caller は server_error/500 を返すべき)
 ///
-/// 旧実装は Err を `.ok()` で None に丸めていたため、DB 障害がすべて
-/// `invalid_client` (= 認証エラー) に変換されて operator が原因追跡できない
-/// 問題があった。Result で明示返却して呼び出し元で区別する。
+/// 旧実装は parse 失敗を `unwrap_or_default()` で空配列に化けさせていたため、
+/// データ破損が「該当 grant 未登録」(= unauthorized_client) として誤判定
+/// される事故があった。Err を明示的に伝播して operator に通知する。
 async fn client_grant_types(
     pool: &SqlitePool,
     client_id: &str,
-) -> Result<Option<Vec<String>>, vegapunk_memory_storage::StorageError> {
+) -> Result<Option<Vec<String>>, ClientLookupError> {
     let client = vegapunk_memory_storage::oauth_clients::get(pool, client_id).await?;
-    Ok(client.map(|c| serde_json::from_str(&c.grant_types).unwrap_or_default()))
+    match client {
+        Some(c) => {
+            let grants: Vec<String> = serde_json::from_str(&c.grant_types)
+                .map_err(ClientLookupError::MalformedJson)?;
+            Ok(Some(grants))
+        }
+        None => Ok(None),
+    }
 }
 
 async fn grant_auth_code(state: AsState, body: TokenForm) -> Response {

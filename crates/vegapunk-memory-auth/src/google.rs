@@ -34,10 +34,15 @@ impl GoogleClient {
             Some(TokenUrl::new("https://oauth2.googleapis.com/token".into()).expect("TokenUrl")),
         )
         .set_redirect_uri(RedirectUrl::new(cfg.redirect_uri).expect("RedirectUrl"));
-        Self {
-            inner,
-            http: Client::new(),
-        }
+        // Google userinfo / token endpoint への TCP hang から保護する total timeout。
+        // timeout 無しの `Client::new()` だと down host への TLS handshake で
+        // 数十秒 await し続けることがあり、OAuth callback 経路で UX を悪化させる。
+        // 10s は Google の SLO に対して十分余裕がある現実的な上限。
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest client build with timeout");
+        Self { inner, http }
     }
 
     /// Returns (authorize_url, csrf_token, pkce_verifier).
