@@ -5,10 +5,17 @@
 //! 2. Client redirects user to /oauth/authorize with their PKCE challenge.
 //! 3. We redirect to Google. User authenticates.
 //! 4. Google returns to /oauth/callback/google with code+state.
-//! 5. We exchange Google code → userinfo → upsert user → issue an auth code.
+//! 5. We exchange Google code → userinfo → **find_by_provider_subject**
+//!    (= admin が事前 provision した users 行を引く、無ければ拒否) → issue
+//!    an auth code.
 //! 6. We redirect back to the client's redirect_uri with our auth code.
 //! 7. Client calls /oauth/token with the auth code + PKCE verifier.
 //! 8. We verify PKCE and issue (access_token, refresh_token).
+//!
+//! 注: llm-memory-auth 版は (5) で `users::upsert` を使い未登録 user を auto
+//! insert していたが、vegapunk-memory-server は admin による事前
+//! provisioning 方針 (`users.vegapunk_schema` 必須) のため、未登録 user は
+//! `user_not_provisioned` で拒否する。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -238,9 +245,16 @@ async fn authorize(State(state): State<AsState>, Query(p): Query<AuthorizeParams
         return bad_request("invalid_request", "code_challenge_method must be S256");
     }
     // Verify client exists + redirect_uri is registered + grant_types includes authorization_code.
-    let client = match vegapunk_memory_storage::oauth_clients::get(&state.pool, &p.client_id).await {
+    // DB 障害は invalid_client に丸めず、operator が原因を追えるよう server_error
+    // で 500 を返す (= log にも記録)。
+    let client = match vegapunk_memory_storage::oauth_clients::get(&state.pool, &p.client_id).await
+    {
         Ok(Some(c)) => c,
-        _ => return bad_request("invalid_client", "unknown client_id"),
+        Ok(None) => return bad_request("invalid_client", "unknown client_id"),
+        Err(e) => {
+            tracing::error!(client_id = %p.client_id, error = ?e, "oauth_clients::get failed in /authorize");
+            return server_error("storage error");
+        }
     };
     let allowed: Vec<String> = serde_json::from_str(&client.redirect_uris).unwrap_or_default();
     if !allowed.contains(&p.redirect_uri) {
@@ -257,7 +271,8 @@ async fn authorize(State(state): State<AsState>, Query(p): Query<AuthorizeParams
     }
 
     // Touch the client's last-seen timestamp.
-    let _ = vegapunk_memory_storage::oauth_clients::touch_last_seen(&state.pool, &p.client_id).await;
+    let _ =
+        vegapunk_memory_storage::oauth_clients::touch_last_seen(&state.pool, &p.client_id).await;
 
     // Build the Google authorize URL.
     let (g_url, csrf, verifier) = state.google.authorize_url();
@@ -291,16 +306,26 @@ async fn callback_google(
         None => return bad_request("invalid_state", "no matching session"),
     };
     let verifier = PkceCodeVerifier::new(pending.google_verifier_secret.clone());
+    // Google OAuth / userinfo 失敗時のレスポンスは内部 detail (HTTP body や
+    // network エラー) を client に echo しない。詳細は server log にだけ残し、
+    // 公開メッセージは stable な文字列にする (= 個人情報・provider 内部の
+    // エラー文言が外部に漏れる経路を断つ)。
     let access_token = match state.google.exchange_code(p.code, verifier).await {
         Ok(t) => t,
         Err(e) => {
-            warn!(?e, "google code exchange failed");
-            return bad_request("google_exchange_failed", &e.to_string());
+            warn!(error = ?e, "google code exchange failed");
+            return bad_request(
+                "google_exchange_failed",
+                "google authorization code exchange failed",
+            );
         }
     };
     let info = match state.google.userinfo(&access_token).await {
         Ok(i) => i,
-        Err(e) => return bad_request("google_userinfo_failed", &e.to_string()),
+        Err(e) => {
+            warn!(error = ?e, "google userinfo fetch failed");
+            return bad_request("google_userinfo_failed", "google userinfo fetch failed");
+        }
     };
     // vegapunk-memory-server は admin による事前 provisioning 方針:
     // 各 user の vegapunk_schema は admin が手動で割り当てた後にしか users 行が
@@ -353,16 +378,20 @@ async fn callback_google(
 }
 
 fn urlencoding(s: &str) -> String {
-    // tiny utility — only need to encode states which are typically alphanumeric
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u32)
-            }
-        })
-        .collect()
+    // RFC 3986 unreserved characters はそのまま、それ以外は **UTF-8 bytes 単位**
+    // で percent encoding する。char (Unicode scalar) 単位で % エンコードすると
+    // 非 ASCII 文字 ('あ' → "%3042" 等) で壊れた URL を生成してしまうため、
+    // bytes 単位で encode する。
+    let mut out = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        let b = *byte;
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]

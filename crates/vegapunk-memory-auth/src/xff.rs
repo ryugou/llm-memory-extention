@@ -12,6 +12,12 @@ pub fn parse_client_ip(
     peer_ip: IpAddr,
     trusted_proxy_count: usize,
 ) -> IpAddr {
+    // trusted_proxy_count == 0 は「proxy を信用しない (= 非 proxy 経路の直
+    // 接続を想定)」を意味するので、XFF を完全に無視して peer_ip を返す。
+    // これを忘れると非 proxy 経路でも攻撃者が偽装した XFF を信じてしまう。
+    if trusted_proxy_count == 0 {
+        return peer_ip;
+    }
     if let Some(xff) = xff_header {
         let ips: Vec<&str> = xff
             .split(',')
@@ -71,6 +77,20 @@ mod tests {
     #[test]
     fn empty_xff_uses_peer() {
         let ip = parse_client_ip(Some(""), peer(), 1);
+        assert_eq!(ip.to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn trusted_proxy_count_zero_ignores_xff() {
+        // 0 = proxy を信用しない。XFF を完全に無視して peer_ip を返す。
+        let ip = parse_client_ip(Some("203.0.113.10"), peer(), 0);
+        assert_eq!(ip.to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn trusted_proxy_count_zero_ignores_long_xff() {
+        // 偽装された複数 hop の XFF でも 0 なら全無視する。
+        let ip = parse_client_ip(Some("203.0.113.10, 198.51.100.1"), peer(), 0);
         assert_eq!(ip.to_string(), "10.0.0.1");
     }
 }
