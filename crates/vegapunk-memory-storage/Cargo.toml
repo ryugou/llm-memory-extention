@@ -13,6 +13,7 @@ tracing.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 ulid.workspace = true
+sha2.workspace = true
 
 llm-memory-core = { path = "../llm-memory-core" }
 

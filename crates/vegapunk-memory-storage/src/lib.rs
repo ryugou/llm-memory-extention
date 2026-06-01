@@ -7,8 +7,10 @@
 //! migration: `migrations/0001_initial.sql`
 
 pub mod error;
+pub mod oauth_clients;
 pub mod pool;
 pub mod shared_memories;
+pub mod tokens;
 pub mod users;
 
 pub use error::StorageError;
