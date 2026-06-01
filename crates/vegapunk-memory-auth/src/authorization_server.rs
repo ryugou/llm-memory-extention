@@ -87,8 +87,21 @@ struct InMemorySessions {
 }
 
 impl InMemorySessions {
+    /// `Mutex::lock` の poison から recover してロックを取り直すヘルパ。
+    /// セッション map のロック保持中に panic が起きると Mutex が poisoned 状態
+    /// になり、以降 `unwrap()` するとサーバ全体が panic で落ちる (= 単発の
+    /// request panic が persistent DoS に化ける)。本サーバの session map は
+    /// 不変条件 (= HashMap が破損したらまずい) を持たず、最悪 1 件 dirty
+    /// entry が残るだけなので、poisoned guard を内側ごと取り出して継続する。
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingAuth>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn lock_codes(&self) -> std::sync::MutexGuard<'_, HashMap<String, AuthCode>> {
+        self.codes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn put_pending(&self, key: String, p: PendingAuth) {
-        let mut m = self.pending.lock().unwrap();
+        let mut m = self.lock_pending();
         let now = now_ms();
         m.retain(|_, p| p.expires_at_ms > now);
         // hard cap: 期限切れ pruning 後でも上限超なら最古を 1 件落として枠を作る。
@@ -104,13 +117,13 @@ impl InMemorySessions {
         m.insert(key, p);
     }
     fn take_pending(&self, key: &str) -> Option<PendingAuth> {
-        let mut m = self.pending.lock().unwrap();
+        let mut m = self.lock_pending();
         let now = now_ms();
         m.retain(|_, p| p.expires_at_ms > now);
         m.remove(key)
     }
     fn put_code(&self, key: String, c: AuthCode) {
-        let mut m = self.codes.lock().unwrap();
+        let mut m = self.lock_codes();
         let now = now_ms();
         m.retain(|_, c| c.expires_at_ms > now);
         if m.len() >= MAX_AUTH_CODES {
@@ -125,7 +138,7 @@ impl InMemorySessions {
         m.insert(key, c);
     }
     fn take_code(&self, key: &str) -> Option<AuthCode> {
-        let mut m = self.codes.lock().unwrap();
+        let mut m = self.lock_codes();
         let now = now_ms();
         m.retain(|_, c| c.expires_at_ms > now);
         m.remove(key)
@@ -150,6 +163,11 @@ impl AsState {
         public_url: String,
         trusted_proxy_count: usize,
     ) -> Self {
+        // env 由来の trailing slash を取り除く: そのまま放置すると
+        // `${public_url}/oauth/authorize` が `https://host//oauth/authorize` の
+        // 形になり、OAuth client 側の厳密一致 redirect_uri 検証 (RFC 6749
+        // §3.1.2.3) で fail する事故になる。
+        let public_url = public_url.trim_end_matches('/').to_string();
         Self {
             pool,
             jwt_keys,
