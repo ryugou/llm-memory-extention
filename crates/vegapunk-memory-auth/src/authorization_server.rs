@@ -747,4 +747,124 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
+
+    // --- authorization_code grant: client_id / redirect_uri binding tests ---
+    //
+    // `/oauth/token` (grant_type=authorization_code) では、code 発行時に bind した
+    // client_id と redirect_uri を request 側でも明示してもらい、一致するか
+    // 検証している (RFC 6749 §4.1.3 / RFC 8252、code mix-up 攻撃の防御)。
+    //
+    // ここでは session map に AuthCode を直接注入し、token endpoint を叩いて
+    // 4 つの失敗パスを固定する:
+    //   - client_id 省略
+    //   - redirect_uri 省略
+    //   - client_id mismatch
+    //   - redirect_uri mismatch
+
+    /// PKCE: verifier から S256 challenge を導出するテストヘルパ。
+    fn pkce_challenge(verifier: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(verifier.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+    }
+
+    /// 共通の test 用 AuthCode と client 登録を済ませた state を返す。
+    /// verifier="v", code="test-code" で PKCE が通る code を 1 件注入する。
+    async fn state_with_test_code(redirect_uri: &str) -> (AsState, String) {
+        let s = test_state().await;
+        let client = vegapunk_memory_storage::oauth_clients::register(
+            &s.pool,
+            &serde_json::to_string(&[redirect_uri]).unwrap(),
+            r#"["authorization_code","refresh_token"]"#,
+            "none",
+            None,
+        )
+        .await
+        .unwrap();
+        // admin provisioning: token 発行に進む経路では users 行があってもなくても
+        // 影響しないが、auth-code redeem path は user 行不要 (sessions に code が
+        // あるかだけ見るため) なので user 行は作らない。
+        let entry = AuthCode {
+            user_id: "01HJTESTUSER0000000000000A".into(),
+            client_id: client.id.clone(),
+            redirect_uri: redirect_uri.into(),
+            code_challenge: pkce_challenge("v"),
+            code_challenge_method: "S256".into(),
+            expires_at_ms: now_ms() + 60_000,
+        };
+        s.sessions.put_code("test-code".into(), entry);
+        (s, client.id)
+    }
+
+    fn token_form_with(grant_fields: &str) -> Body {
+        let base =
+            "grant_type=authorization_code&code=test-code&code_verifier=v";
+        Body::from(format!("{base}&{grant_fields}"))
+    }
+
+    #[tokio::test]
+    async fn token_auth_code_rejects_missing_client_id() {
+        let (s, _client_id) = state_with_test_code("https://app.example.com/cb").await;
+        let app = router().with_state(s);
+        let req = Request::post("/oauth/token")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(token_form_with(
+                "redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb",
+            ))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("client_id"),
+            "expected client_id error: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[tokio::test]
+    async fn token_auth_code_rejects_missing_redirect_uri() {
+        let (s, client_id) = state_with_test_code("https://app.example.com/cb").await;
+        let app = router().with_state(s);
+        let req = Request::post("/oauth/token")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(token_form_with(&format!("client_id={client_id}")))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("redirect_uri"),
+            "expected redirect_uri error: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[tokio::test]
+    async fn token_auth_code_rejects_client_id_mismatch() {
+        let (s, _client_id) = state_with_test_code("https://app.example.com/cb").await;
+        let app = router().with_state(s);
+        let req = Request::post("/oauth/token")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(token_form_with(
+                "client_id=other-client&redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb",
+            ))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn token_auth_code_rejects_redirect_uri_mismatch() {
+        let (s, client_id) = state_with_test_code("https://app.example.com/cb").await;
+        let app = router().with_state(s);
+        let req = Request::post("/oauth/token")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(token_form_with(&format!(
+                "client_id={client_id}&redirect_uri=https%3A%2F%2Fevil.example.com%2Fcb"
+            )))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
 }

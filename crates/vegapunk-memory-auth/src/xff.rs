@@ -12,8 +12,8 @@ pub fn parse_client_ip(
     peer_ip: IpAddr,
     trusted_proxy_count: usize,
 ) -> IpAddr {
-    // trusted_proxy_count == 0 は「proxy を信用しない (= 非 proxy 経路の直
-    // 接続を想定)」を意味するので、XFF を完全に無視して peer_ip を返す。
+    // trusted_proxy_count == 0 は「proxy を信用しない」(= 非 proxy 経路の
+    // 直接接続を想定) を意味するので、XFF を完全に無視して peer_ip を返す。
     // これを忘れると非 proxy 経路でも攻撃者が偽装した XFF を信じてしまう。
     if trusted_proxy_count == 0 {
         return peer_ip;

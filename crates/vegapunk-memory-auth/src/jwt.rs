@@ -36,6 +36,16 @@ impl JwtKeys {
         let mut current = String::new();
         for (k, v) in std::env::vars() {
             if let Some(kid) = k.strip_prefix("JWT_SIGNING_KEY_") {
+                // 末尾 `_` だけの env var (= 空 kid) は誤設定の典型で、
+                // current_kid が "" になり JWT header.kid も空になって
+                // 後段の verify で UnknownKid に化ける。startup で弾く。
+                if kid.is_empty() {
+                    return Err(AuthError::OAuth(
+                        "JWT_SIGNING_KEY_ requires a non-empty kid suffix \
+                         (e.g. JWT_SIGNING_KEY_v1=...)"
+                            .into(),
+                    ));
+                }
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(&v)
                     .map_err(|e| {
