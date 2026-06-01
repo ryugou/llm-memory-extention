@@ -1,6 +1,10 @@
 //! 起動時設定。env var から読み込む。
 //!
-//! 必須 (`from_env` が unwrap する):
+//! `from_env` は値が無いとき `anyhow::Error` を返す (= unwrap せず Result で
+//! エラー化)。起動 binary で `?` で受けて、欠けている env var 名を tracing で
+//! 報告した上で exit する想定。
+//!
+//! 必須 (未設定だと `from_env` が Err を返す):
 //! - `DATABASE_URL`              (例: sqlite:///data/vegapunk-memory.sqlite)
 //! - `PUBLIC_URL`                (例: https://vegapunk-136-110-78-245.nip.io)
 //! - `GOOGLE_OAUTH_CLIENT_ID`    (Secret Manager 経由で注入)
