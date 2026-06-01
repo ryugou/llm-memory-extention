@@ -6,7 +6,8 @@
 //! - MCP tool call を vegapunk gRPC に forward
 //! - request の `schema` 引数は wrapper が user の schema に強制注入 (cross-tenant 防止)
 //!
-//! 設計詳細は repo 内 `docs/superpowers/specs/vegapunk-memory-server.md` 参照。
+//! 詳細仕様 doc は別 PR で `docs/superpowers/specs/` 配下に起こす予定。
+//! 本 PR は skeleton のみで、tool handler / HTTP transport は後続 PR で追加する。
 
 pub mod config;
 pub mod state;
