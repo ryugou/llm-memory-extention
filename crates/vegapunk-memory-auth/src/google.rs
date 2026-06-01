@@ -38,8 +38,12 @@ impl GoogleClient {
         // timeout 無しの `Client::new()` だと down host への TLS handshake で
         // 数十秒 await し続けることがあり、OAuth callback 経路で UX を悪化させる。
         // 10s は Google の SLO に対して十分余裕がある現実的な上限。
+        //
+        // `redirect(Policy::none())` は SSRF 防止のため。oauth2 crate の default
+        // `async_http_client` も同じ判断で no-redirect を強制している。
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client build with timeout");
         Self { inner, http }
@@ -65,11 +69,50 @@ impl GoogleClient {
         code: String,
         verifier: PkceCodeVerifier,
     ) -> Result<String, AuthError> {
+        // `oauth2::reqwest::async_http_client` を使うと library 内部で毎回
+        // reqwest::Client::new() (= timeout 無し) を構築するため、token endpoint
+        // への TCP hang から保護できない。自前 closure で `self.http`
+        // (timeout=10s, redirect=none) を経由させて userinfo と同じ制約を適用。
+        let http = self.http.clone();
         let token = self
             .inner
             .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(verifier)
-            .request_async(oauth2::reqwest::async_http_client)
+            .request_async(move |request| {
+                let http = http.clone();
+                async move {
+                    // oauth2 4.x は古い `http` crate (0.x) の Method/HeaderMap を
+                    // 使うのに対し reqwest 0.12 は `http` 1.x を使うため、bytes
+                    // を経由して型変換する。
+                    let method = reqwest::Method::from_bytes(request.method.as_str().as_bytes())
+                        .expect("oauth2 always passes valid HTTP method bytes");
+                    let mut builder =
+                        http.request(method, request.url.as_str()).body(request.body);
+                    for (name, value) in &request.headers {
+                        builder = builder.header(name.as_str(), value.as_bytes());
+                    }
+                    let req = builder.build()?;
+                    let resp = http.execute(req).await?;
+                    let status =
+                        oauth2::http::StatusCode::from_u16(resp.status().as_u16())
+                            .expect("reqwest StatusCode is always valid http 0.x StatusCode");
+                    let mut oauth_headers = oauth2::http::HeaderMap::new();
+                    for (name, value) in resp.headers() {
+                        if let (Ok(n), Ok(v)) = (
+                            oauth2::http::HeaderName::from_bytes(name.as_str().as_bytes()),
+                            oauth2::http::HeaderValue::from_bytes(value.as_bytes()),
+                        ) {
+                            oauth_headers.insert(n, v);
+                        }
+                    }
+                    let body = resp.bytes().await?.to_vec();
+                    Ok::<oauth2::HttpResponse, reqwest::Error>(oauth2::HttpResponse {
+                        status_code: status,
+                        headers: oauth_headers,
+                        body,
+                    })
+                }
+            })
             .await
             .map_err(|e| AuthError::OAuth(e.to_string()))?;
         Ok(token.access_token().secret().clone())
