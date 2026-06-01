@@ -26,4 +26,3 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
-futures = "0.3"

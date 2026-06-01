@@ -73,9 +73,10 @@ struct AuthCode {
     expires_at_ms: i64,
 }
 
-/// In-mem セッション 1 owner あたりの hard cap。abandoned `/authorize` で
-/// `put_pending` / `put_code` が無限に増える DoS を防ぐ。
-/// 通常運用ではユーザー × 同時 OAuth flow の積で数十〜数百を超えない。
+/// In-memory session map 全体に対する hard cap (= 1 プロセス・全 owner 合算)。
+/// abandoned `/authorize` で `put_pending` / `put_code` が無限に増える DoS を
+/// 防ぐための上限値。通常運用では全 owner × 同時 OAuth flow の積で
+/// 数十〜数百しか乗らない想定で、10_000 は十分な余裕を持った値。
 const MAX_PENDING_AUTHS: usize = 10_000;
 const MAX_AUTH_CODES: usize = 10_000;
 
