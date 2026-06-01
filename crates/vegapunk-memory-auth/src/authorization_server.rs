@@ -433,14 +433,20 @@ async fn token(State(state): State<AsState>, Form(body): Form<TokenForm>) -> Res
 }
 
 /// Look up a registered client and return its `grant_types` array.
-/// Returns `None` if the client is unknown — caller should respond with
-/// `invalid_client`.
-async fn client_grant_types(pool: &SqlitePool, client_id: &str) -> Option<Vec<String>> {
-    let client = vegapunk_memory_storage::oauth_clients::get(pool, client_id)
-        .await
-        .ok()
-        .flatten()?;
-    Some(serde_json::from_str(&client.grant_types).unwrap_or_default())
+/// 戻り値:
+/// - `Ok(Some(grants))`: client が存在し grant_types が読めた
+/// - `Ok(None)`: client が DB に存在しない (= invalid_client)
+/// - `Err(_)`: DB 障害 (= caller は server_error/500 を返すべき)
+///
+/// 旧実装は Err を `.ok()` で None に丸めていたため、DB 障害がすべて
+/// `invalid_client` (= 認証エラー) に変換されて operator が原因追跡できない
+/// 問題があった。Result で明示返却して呼び出し元で区別する。
+async fn client_grant_types(
+    pool: &SqlitePool,
+    client_id: &str,
+) -> Result<Option<Vec<String>>, vegapunk_memory_storage::StorageError> {
+    let client = vegapunk_memory_storage::oauth_clients::get(pool, client_id).await?;
+    Ok(client.map(|c| serde_json::from_str(&c.grant_types).unwrap_or_default()))
 }
 
 async fn grant_auth_code(state: AsState, body: TokenForm) -> Response {
@@ -486,8 +492,12 @@ async fn grant_auth_code(state: AsState, body: TokenForm) -> Response {
     }
     // refresh_token grant が登録されていれば一緒に発行、そうでなければ access のみ。
     let grants = match client_grant_types(&state.pool, &entry.client_id).await {
-        Some(g) => g,
-        None => return bad_request("invalid_client", "unknown client_id"),
+        Ok(Some(g)) => g,
+        Ok(None) => return bad_request("invalid_client", "unknown client_id"),
+        Err(e) => {
+            tracing::error!(client_id = %entry.client_id, error = ?e, "client_grant_types failed in grant_auth_code");
+            return server_error("storage error");
+        }
     };
     let include_refresh = grants.iter().any(|g| g == "refresh_token");
     issue_tokens(state, &entry.user_id, &entry.client_id, include_refresh).await
@@ -510,8 +520,12 @@ async fn grant_refresh(state: AsState, body: TokenForm) -> Response {
     // 登録された grant_types に refresh_token が含まれていなければ refuse。
     // (旧 token は既に revoke 済みなので、reject 時はクライアントは再認可が必要)
     let grants = match client_grant_types(&state.pool, &client_id).await {
-        Some(g) => g,
-        None => return bad_request("invalid_client", "unknown client_id"),
+        Ok(Some(g)) => g,
+        Ok(None) => return bad_request("invalid_client", "unknown client_id"),
+        Err(e) => {
+            tracing::error!(client_id = %client_id, error = ?e, "client_grant_types failed in grant_refresh");
+            return server_error("storage error");
+        }
     };
     if !grants.iter().any(|g| g == "refresh_token") {
         return bad_request(
