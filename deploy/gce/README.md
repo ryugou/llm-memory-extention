@@ -445,6 +445,77 @@ Claude Desktop の MCP 設定に追加 (詳細は `docs/superpowers/runbooks/e2e
 - URL: `https://${DOMAIN}/mcp`
 - 初回接続時にブラウザで Google OAuth 認可
 
+## 10-1. vegapunk-memory-server (vegapunk backend) 並行運用
+
+同 VM 上で `vegapunk-memory-server` を **別 subdomain** で動かし、wiki backend (llm-memory-server) と並行運用する。OAuth metadata は origin で分離されるので、MCP client (Claude.ai / ChatGPT 等) からは「もう 1 つの connector」として独立して接続できる。
+
+### 10-1-1. ネットワーク前提 (済)
+
+- `gen-lang-client-0184763777` (llm-memory VM) の `default` VPC と `punkrecord-egghead` の `punkrecord-egghead-vpc` で **VPC Peering 設定済み** (両側 ACTIVE)。`10.146.0.0/20` ⇄ `10.10.0.0/24` の route 自動生成済み。
+- `punkrecord-egghead` 側 firewall `punkrecord-egghead-allow-internal-grpc` の `sourceRanges` に **`10.146.0.0/24` 追加済み** (`tcp:6840,6841`、`targetTags=punkrecord-server`)。直叩きの drift は許容 (Terraform 管理ではなく gcloud で更新)。
+
+### 10-1-2. Secret Manager (consumer 側)
+
+`vegapunk-bearer-token` を `gen-lang-client-0184763777` project の Secret Manager に登録済 (cross-project IAM ではなく consumer 側で自前管理する設計)。`deploy/gce/run.sh` の `SECRETS` 配列に `vegapunk-bearer-token:VEGAPUNK_BEARER_TOKEN` を追加してあるので、起動時に `VEGAPUNK_BEARER_TOKEN` が container env に注入される。
+
+VM の SA (`llm-memory-sa@...`) には `roles/secretmanager.secretAccessor` を `vegapunk-bearer-token` 単位で付与済み。
+
+### 10-1-3. DNS / Caddy / Compose
+
+`.env` に追加:
+
+```
+VEGAPUNK_PUBLIC_DOMAIN=vegapunk-136-110-78-245.nip.io
+VEGAPUNK_PUBLIC_URL=https://vegapunk-136-110-78-245.nip.io
+VEGAPUNK_GRPC_ENDPOINT=http://10.10.0.2:6840
+```
+
+`docker/Caddyfile` には `{$VEGAPUNK_PUBLIC_DOMAIN}` block が、`docker/docker-compose.yml` には `vegapunk-server` service + `vegapunk_data` named volume が定義済。`docker/Dockerfile` は multi-target で同一 builder stage から両 binary を切り出すので、`docker compose build` で 1 回の cargo build から `server` / `vegapunk-server` 両方の image が生える。
+
+### 10-1-4. Google OAuth Console に vegapunk 用 redirect URI を追加
+
+§1-4 で作った OAuth client (wiki と共有) の **承認済みのリダイレクト URI** に以下を追加 (Web フォームで「URI を追加」):
+
+```
+https://vegapunk-136-110-78-245.nip.io/oauth/callback/google
+```
+
+両 server で `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` を共有しているので、新しい OAuth client を作る必要はない。
+
+### 10-1-5. 起動と動作確認
+
+```bash
+# VM 上、リポジトリ root から
+./deploy/gce/run.sh up --build -d
+sudo docker compose -p llm-memory-extention ps
+# 期待: server / vegapunk-server / litestream / caddy がすべて Up
+
+# vegapunk endpoint の healthz
+curl -fsS https://vegapunk-136-110-78-245.nip.io/healthz
+# 期待: ok
+# /healthz が ok を返す ⇒ vegapunk-server プロセスは生きている。
+# vegapunk gRPC backend (10.10.0.2:6840) への到達性は起動時に
+# `vegapunk-client::connect()` 内で `connect_lazy()` で channel を作るだけで
+# 失敗しない (lazy 接続) ため、確実な確認は MCP 経由で実 RPC を投げるか、
+# server ログに "vegapunk gRPC error: code=Unavailable" 系が継続して出ていない
+# ことを目視する。
+
+sudo docker compose -p llm-memory-extention logs --tail=200 vegapunk-server
+```
+
+### 10-1-6. Claude.ai 等の MCP client への登録
+
+wiki と完全に独立した connector として登録する:
+
+- URL: `https://vegapunk-136-110-78-245.nip.io/mcp`
+- 初回接続でブラウザに Google OAuth 認可画面 (vegapunk 側の `PUBLIC_URL` 経由)
+
+### 10-1-7. ユーザ provisioning (admin 作業)
+
+vegapunk-memory-server の `users` テーブルは wiki と独立 (`crates/vegapunk-memory-storage`)。初回 OAuth で行が自動作成される **わけではない**: middleware は users 行が無い時に 401 を返す設計 ([[project-vegapunk-connection]] memory 参照)。新 user を受け入れる場合は admin が `users::insert` を直接叩く必要がある。
+
+将来的に「初回 OAuth で provisioning」を入れるかは別 PR で判断。
+
 ## 11. バックアップからの復元
 
 **前提**: §8 の起動コマンドで `-p llm-memory-extention` を付けているため、compose project 名は `llm-memory-extention`、named volume は `llm-memory-extention_data` で作られている。下記 `docker run` はその volume 名にハードコードで attach する。`-p` を変えた場合は `sudo docker volume ls` で実名を確認して書き換えること。
