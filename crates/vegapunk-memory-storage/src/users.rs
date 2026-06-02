@@ -10,7 +10,10 @@ pub struct User {
     pub subject: String,
     pub email: Option<String>,
     /// 対応する vegapunk schema 名。初回 OAuth callback で
-    /// `user-{provider_subject}` 形式に自動生成される (`find_or_provision`)。
+    /// `user-{google_subject}` 形式 (現状 Google 以外の provider は無いので
+    /// provider prefix は付けない) に自動生成される (`find_or_provision`)。
+    /// 将来 Google 以外の provider を追加する場合は `user-{provider}-{subject}`
+    /// 形に拡張して衝突を防ぐこと。
     /// 一度作られたら user 自身が動かす API は無く、middleware が tool 呼び
     /// 出し時の cross-tenant guard としてこの値を強制注入する。
     pub vegapunk_schema: String,
