@@ -225,7 +225,21 @@ mod tests {
         // 同じ未登録 (provider, subject) を 2 つの task が同時に provision しに
         // 来ても、両方 Ok を返す。負け側は UNIQUE 違反で落ちず、勝ち側が入れた
         // 同じ行を観測する (cross-tenant guard と同じ「先勝ち」仕様)。
-        let pool = init_pool("sqlite::memory:").await.unwrap();
+        //
+        // 注: SQLite で `:memory:` を素で渡すと「connection 単位」の DB が
+        // できて、pool が複数 connection を開くと task 間で別 DB を見る形に
+        // なり race を再現できない。`file::memory:?cache=shared` で全
+        // connection が同じ in-memory DB を共有する。各テストで instance が
+        // 衝突しないよう unique な vfs name を付ける。
+        let vfs = format!(
+            "race-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let url = format!("sqlite:file:{vfs}?mode=memory&cache=shared");
+        let pool = init_pool(&url).await.unwrap();
         let pool_a = pool.clone();
         let pool_b = pool.clone();
         let (a, b) = tokio::join!(
