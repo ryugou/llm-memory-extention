@@ -190,7 +190,22 @@ async fn dispatch_one(state: AppState, user: AuthenticatedUser, req: JsonRpcRequ
     // MCP spec: log only, never produce a response. We don't currently act on
     // any of them (cancellation will land with the tool handlers in the next
     // PR), so this is intentionally an ack-only path.
+    //
+    // If a client mistakenly sends an `id` with a `notifications/*` method,
+    // it isn't a real notification: JSON-RPC says any request *with* an id
+    // MUST receive a response, and silently suppressing one would hang the
+    // client. Reject those as `-32600 Invalid Request`.
     if req.method.starts_with("notifications/") {
+        if !is_notification {
+            return Outcome::Response(JsonRpcResponse::error(
+                id,
+                -32600,
+                format!(
+                    "Invalid Request: '{}' must be sent as a Notification (no id)",
+                    req.method
+                ),
+            ));
+        }
         tracing::debug!(method = %req.method, "MCP notification received (ack only)");
         return Outcome::Notification;
     }
@@ -370,6 +385,19 @@ mod tests {
             );
             assert!(v.is_null());
         }
+    }
+
+    #[tokio::test]
+    async fn notifications_namespace_with_id_returns_invalid_request() {
+        // notifications/* に id が付いて来たら spec 違反 — JSON-RPC は
+        // id 付き request に必ず response を返す義務があるので、ack-only
+        // パスでなく `-32600 Invalid Request` を返してクライアントが
+        // hang しないようにする。
+        let body = json!({"jsonrpc":"2.0","id":42,"method":"notifications/initialized"});
+        let (status, v) = invoke(test_state().await, body).await;
+        assert_eq!(status, 200);
+        assert_eq!(v["error"]["code"], -32600);
+        assert_eq!(v["id"], 42);
     }
 
     #[tokio::test]
