@@ -87,7 +87,10 @@ services:
     environment:
       - DATABASE_URL=sqlite:///data/db.sqlite
       - BIND_ADDR=0.0.0.0:8081
-      - PUBLIC_URL=${VEGAPUNK_PUBLIC_URL}
+      # compose の `${VAR:?msg}` で fail-fast。未設定だと container が空 PUBLIC_URL
+      # で起動してから ServerConfig::from_env が reject する経路に乗らないよう、
+      # docker compose の段階で原因明示エラーにする。
+      - PUBLIC_URL=${VEGAPUNK_PUBLIC_URL:?VEGAPUNK_PUBLIC_URL must be set in .env (e.g. https://vegapunk-<ip>.nip.io)}
     volumes:
       - vegapunk_data:/data
     expose:
@@ -125,9 +128,13 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    # Caddyfile が `{$PUBLIC_DOMAIN}` / `{$VEGAPUNK_PUBLIC_DOMAIN}` を直接
+      # 受けるので、未設定だと Caddy 起動時に site block が空ホストで parse
+      # 失敗してわかりにくい挙動になる。compose の `${VAR:?msg}` で
+      # docker compose up の段階に fail-fast する。
     environment:
-      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN}
-      - VEGAPUNK_PUBLIC_DOMAIN=${VEGAPUNK_PUBLIC_DOMAIN}
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:?PUBLIC_DOMAIN must be set in .env (e.g. memory-<ip>.nip.io)}
+      - VEGAPUNK_PUBLIC_DOMAIN=${VEGAPUNK_PUBLIC_DOMAIN:?VEGAPUNK_PUBLIC_DOMAIN must be set in .env (e.g. vegapunk-<ip>.nip.io)}
     depends_on:
       - server
       - vegapunk-server

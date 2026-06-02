@@ -493,11 +493,14 @@ sudo docker compose -p llm-memory-extention ps
 # vegapunk endpoint の healthz
 curl -fsS https://vegapunk-136-110-78-245.nip.io/healthz
 # 期待: ok
+# /healthz が ok を返す ⇒ vegapunk-server プロセスは生きている。
+# vegapunk gRPC backend (10.10.0.2:6840) への到達性は起動時に
+# `vegapunk-client::connect()` 内で `connect_lazy()` で channel を作るだけで
+# 失敗しない (lazy 接続) ため、確実な確認は MCP 経由で実 RPC を投げるか、
+# server ログに "vegapunk gRPC error: code=Unavailable" 系が継続して出ていない
+# ことを目視する。
 
-# VPC Peering 経由で vegapunk gRPC に到達できることを確認 (VM 内、host から)
-sudo docker compose -p llm-memory-extention exec vegapunk-server \
-  /usr/local/bin/vegapunk-memory-server --help >/dev/null 2>&1 || true
-# tracing 出力に "vegapunk gRPC connect failed" が出ていなければ peering + firewall OK。
+sudo docker compose -p llm-memory-extention logs --tail=200 vegapunk-server
 ```
 
 ### 10-1-6. Claude.ai 等の MCP client への登録
