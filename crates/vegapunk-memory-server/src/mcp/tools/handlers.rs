@@ -12,9 +12,12 @@
 //! 「schema 注入」「引数マッピング」「missing required の検出」だけを保証する。
 //! 実際の gRPC 往復は handler 全体の integration test (= 別 PR で fake server を立てて) で見る。
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
-use vegapunk_client::graphrag::{GetSchemaRequest, SearchRequest, SearchResultItem};
+use vegapunk_client::graphrag::{
+    GetSchemaRequest, IngestMessage, IngestRawMetadata, IngestRawRequest, IngestRequest,
+    MessageMetadata, SearchRequest, SearchResultItem,
+};
 use vegapunk_memory_auth::middleware::AuthenticatedUser;
 
 use crate::state::AppState;
@@ -23,6 +26,47 @@ use super::{
     SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN, SEARCH_MODE_DEFAULT,
     SEARCH_VALID_MODES,
 };
+
+/// MCP `tools/call.arguments` を共通の作法で object に降ろす。
+/// `arguments` は spec 上 object のみ、string/array/null/number は早く弾く。
+fn require_object_args(args: &Value) -> Result<&Map<String, Value>, String> {
+    args.as_object()
+        .ok_or_else(|| "'arguments' must be a JSON object".to_string())
+}
+
+/// 必須の string field を取り出す: 存在しない / null / 非 string / 空白のみは
+/// すべて error にする。空白を許すと vegapunk の required string が "" で
+/// 通って何の意味も無い row が入る。
+fn require_str_field(obj: &Map<String, Value>, field: &str, owner: &str) -> Result<String, String> {
+    let raw = match obj.get(field) {
+        None | Some(Value::Null) => {
+            return Err(format!("missing required '{owner}.{field}'"));
+        }
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| format!("'{owner}.{field}' must be a string"))?,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("'{owner}.{field}' must not be empty"));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// 任意の string field: null / missing は None、非 string は error。
+fn optional_str_field(
+    obj: &Map<String, Value>,
+    field: &str,
+    owner: &str,
+) -> Result<Option<String>, String> {
+    match obj.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_str() {
+            Some(s) => Ok(Some(s.to_string())),
+            None => Err(format!("'{owner}.{field}' must be a string")),
+        },
+    }
+}
 
 /// `search` argument を `SearchRequest` に詰める。`schema` は `user_schema` で
 /// 強制上書きするので、`arguments` に schema 指定があっても無視する。
@@ -231,6 +275,127 @@ pub(super) async fn get_schema(state: &AppState, user: &AuthenticatedUser) -> Va
                 "schema_yaml": resp.schema_yaml,
                 "version": resp.version,
                 "description": resp.description,
+            }))
+        }
+    }
+}
+
+/// `ingest` argument を `IngestRequest` に詰める。`schema` は `user_schema` で
+/// 強制上書きする (cross-tenant guard)。messages.metadata の必須 field は
+/// `tools/list` の inputSchema と同じ集合 (source_type / author / channel /
+/// timestamp) を runtime でも guard する — client 側 JSON Schema 検証は無保証。
+pub(super) fn build_ingest_request(
+    user_schema: &str,
+    args: &Value,
+) -> Result<IngestRequest, String> {
+    let args = require_object_args(args)?;
+    let messages_value = args
+        .get("messages")
+        .ok_or_else(|| "missing required argument: 'messages'".to_string())?;
+    let messages_array = messages_value
+        .as_array()
+        .ok_or_else(|| "'messages' must be an array".to_string())?;
+    if messages_array.is_empty() {
+        return Err("'messages' must contain at least one item".to_string());
+    }
+    let messages = messages_array
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let owner = format!("messages[{i}]");
+            let m = item
+                .as_object()
+                .ok_or_else(|| format!("'{owner}' must be an object"))?;
+            let id = optional_str_field(m, "id", &owner)?;
+            let text = require_str_field(m, "text", &owner)?;
+            let meta_owner = format!("{owner}.metadata");
+            let metadata_value = m
+                .get("metadata")
+                .ok_or_else(|| format!("missing required '{meta_owner}'"))?;
+            let metadata_obj = metadata_value
+                .as_object()
+                .ok_or_else(|| format!("'{meta_owner}' must be an object"))?;
+            let metadata = MessageMetadata {
+                source_type: require_str_field(metadata_obj, "source_type", &meta_owner)?,
+                author: require_str_field(metadata_obj, "author", &meta_owner)?,
+                author_id: optional_str_field(metadata_obj, "author_id", &meta_owner)?,
+                channel: require_str_field(metadata_obj, "channel", &meta_owner)?,
+                channel_id: optional_str_field(metadata_obj, "channel_id", &meta_owner)?,
+                thread_id: optional_str_field(metadata_obj, "thread_id", &meta_owner)?,
+                timestamp: require_str_field(metadata_obj, "timestamp", &meta_owner)?,
+            };
+            Ok::<_, String>(IngestMessage {
+                id,
+                text,
+                metadata: Some(metadata),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(IngestRequest {
+        messages,
+        schema: user_schema.to_string(),
+    })
+}
+
+/// `ingest_raw` argument を `IngestRawRequest` に詰める。`schema` は
+/// `user_schema` で強制上書き。`metadata.source_type` だけ必須、author / channel /
+/// timestamp は optional。proto 側で timestamp 省略時は server time が使われる。
+pub(super) fn build_ingest_raw_request(
+    user_schema: &str,
+    args: &Value,
+) -> Result<IngestRawRequest, String> {
+    let args = require_object_args(args)?;
+    let text = require_str_field(args, "text", "arguments")?;
+    let metadata_value = args
+        .get("metadata")
+        .ok_or_else(|| "missing required argument: 'metadata'".to_string())?;
+    let metadata_obj = metadata_value
+        .as_object()
+        .ok_or_else(|| "'metadata' must be an object".to_string())?;
+    let metadata = IngestRawMetadata {
+        source_type: require_str_field(metadata_obj, "source_type", "metadata")?,
+        author: optional_str_field(metadata_obj, "author", "metadata")?,
+        channel: optional_str_field(metadata_obj, "channel", "metadata")?,
+        timestamp: optional_str_field(metadata_obj, "timestamp", "metadata")?,
+    };
+    Ok(IngestRawRequest {
+        text,
+        metadata: Some(metadata),
+        schema: user_schema.to_string(),
+    })
+}
+
+pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
+    let request = match build_ingest_request(&user.vegapunk_schema, &args) {
+        Ok(r) => r,
+        Err(e) => return invalid_args_content("ingest", &e),
+    };
+    let mut client = state.vegapunk.clone();
+    match client.ingest(request).await {
+        Err(status) => tonic_error_content("Ingest", status),
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            success_content(json!({
+                "ingested_count": resp.ingested_count,
+                "job_id": resp.job_id,
+            }))
+        }
+    }
+}
+
+pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
+    let request = match build_ingest_raw_request(&user.vegapunk_schema, &args) {
+        Ok(r) => r,
+        Err(e) => return invalid_args_content("ingest_raw", &e),
+    };
+    let mut client = state.vegapunk.clone();
+    match client.ingest_raw(request).await {
+        Err(status) => tonic_error_content("IngestRaw", status),
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            success_content(json!({
+                "chunk_count": resp.chunk_count,
+                "msg_ids": resp.msg_ids,
             }))
         }
     }
@@ -463,5 +628,189 @@ mod tests {
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("search"));
         assert!(text.contains("missing 'query'"));
+    }
+
+    // ── ingest ──────────────────────────────────────────────────────────
+
+    fn good_message() -> Value {
+        json!({
+            "text": "hello",
+            "metadata": {
+                "source_type": "slack",
+                "author": "ryugo",
+                "channel": "#general",
+                "timestamp": "2026-06-02T10:00:00+09:00",
+            }
+        })
+    }
+
+    #[test]
+    fn ingest_request_uses_user_schema_and_ignores_args_schema() {
+        let args = json!({ "messages": [good_message()], "schema": "evil" });
+        let req = build_ingest_request("alice-tenant", &args).unwrap();
+        assert_eq!(req.schema, "alice-tenant");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].text, "hello");
+        let md = req.messages[0].metadata.as_ref().unwrap();
+        assert_eq!(md.source_type, "slack");
+        assert_eq!(md.author, "ryugo");
+        assert_eq!(md.channel, "#general");
+        assert_eq!(md.timestamp, "2026-06-02T10:00:00+09:00");
+    }
+
+    #[test]
+    fn ingest_request_rejects_non_object_arguments() {
+        for bad in [json!("oops"), json!([1, 2]), json!(null), json!(42)] {
+            let err = build_ingest_request("t", &bad).unwrap_err();
+            assert!(err.contains("'arguments'"), "input {bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn ingest_request_rejects_missing_messages() {
+        let err = build_ingest_request("t", &json!({})).unwrap_err();
+        assert!(err.contains("'messages'"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_request_rejects_non_array_messages() {
+        let err = build_ingest_request("t", &json!({ "messages": "nope" })).unwrap_err();
+        assert!(err.contains("array"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_request_rejects_empty_messages() {
+        // 空配列で gRPC を叩いても無意味、early reject。
+        let err = build_ingest_request("t", &json!({ "messages": [] })).unwrap_err();
+        assert!(err.contains("at least one"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_request_rejects_non_object_message_item() {
+        let err = build_ingest_request("t", &json!({ "messages": ["nope"] })).unwrap_err();
+        assert!(err.contains("messages[0]"), "got: {err}");
+        assert!(err.contains("object"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_request_rejects_empty_text() {
+        let mut bad = good_message();
+        bad["text"] = json!("   ");
+        let err = build_ingest_request("t", &json!({ "messages": [bad] })).unwrap_err();
+        assert!(err.contains("messages[0].text"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_request_rejects_missing_metadata() {
+        let bad = json!({ "text": "hello" });
+        let err = build_ingest_request("t", &json!({ "messages": [bad] })).unwrap_err();
+        assert!(err.contains("metadata"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_request_requires_each_metadata_field() {
+        // source_type / author / channel / timestamp — proto では全て required。
+        for field in ["source_type", "author", "channel", "timestamp"] {
+            let mut msg = good_message();
+            msg["metadata"].as_object_mut().unwrap().remove(field);
+            let err = build_ingest_request("t", &json!({ "messages": [msg] })).unwrap_err();
+            assert!(
+                err.contains(field) && err.contains("metadata"),
+                "removing {field} should report it; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ingest_request_accepts_optional_id_and_metadata_fields() {
+        let mut msg = good_message();
+        msg["id"] = json!("client-supplied-id");
+        msg["metadata"]["author_id"] = json!("U123");
+        msg["metadata"]["channel_id"] = json!("C123");
+        msg["metadata"]["thread_id"] = json!("1.2");
+        let req = build_ingest_request("t", &json!({ "messages": [msg] })).unwrap();
+        let m = &req.messages[0];
+        assert_eq!(m.id.as_deref(), Some("client-supplied-id"));
+        let md = m.metadata.as_ref().unwrap();
+        assert_eq!(md.author_id.as_deref(), Some("U123"));
+        assert_eq!(md.channel_id.as_deref(), Some("C123"));
+        assert_eq!(md.thread_id.as_deref(), Some("1.2"));
+    }
+
+    #[test]
+    fn ingest_request_reports_index_for_bad_item_in_batch() {
+        // 1st item OK, 2nd item missing metadata → エラーは index 1 を示す。
+        let mut bad = good_message();
+        bad.as_object_mut().unwrap().remove("metadata");
+        let err =
+            build_ingest_request("t", &json!({ "messages": [good_message(), bad] })).unwrap_err();
+        assert!(err.contains("messages[1]"), "got: {err}");
+    }
+
+    // ── ingest_raw ──────────────────────────────────────────────────────
+
+    fn good_raw_args() -> Value {
+        json!({
+            "text": "hello world",
+            "metadata": {
+                "source_type": "wiki",
+            }
+        })
+    }
+
+    #[test]
+    fn ingest_raw_request_uses_user_schema_and_ignores_args_schema() {
+        let mut args = good_raw_args();
+        args["schema"] = json!("evil");
+        let req = build_ingest_raw_request("alice-tenant", &args).unwrap();
+        assert_eq!(req.schema, "alice-tenant");
+        assert_eq!(req.text, "hello world");
+        let md = req.metadata.as_ref().unwrap();
+        assert_eq!(md.source_type, "wiki");
+        assert!(md.author.is_none());
+        assert!(md.channel.is_none());
+        assert!(md.timestamp.is_none());
+    }
+
+    #[test]
+    fn ingest_raw_request_rejects_empty_text() {
+        let mut args = good_raw_args();
+        args["text"] = json!("   ");
+        let err = build_ingest_raw_request("t", &args).unwrap_err();
+        assert!(err.contains("'arguments.text'"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_raw_request_rejects_missing_metadata() {
+        let err = build_ingest_raw_request("t", &json!({ "text": "x" })).unwrap_err();
+        assert!(err.contains("'metadata'"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_raw_request_requires_source_type() {
+        let err =
+            build_ingest_raw_request("t", &json!({ "text": "x", "metadata": {} })).unwrap_err();
+        assert!(err.contains("metadata.source_type"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_raw_request_accepts_full_metadata() {
+        let req = build_ingest_raw_request(
+            "t",
+            &json!({
+                "text": "hello",
+                "metadata": {
+                    "source_type": "wiki",
+                    "author": "ryugo",
+                    "channel": "kb",
+                    "timestamp": "2026-06-02T10:00:00+09:00",
+                }
+            }),
+        )
+        .unwrap();
+        let md = req.metadata.unwrap();
+        assert_eq!(md.author.as_deref(), Some("ryugo"));
+        assert_eq!(md.channel.as_deref(), Some("kb"));
+        assert_eq!(md.timestamp.as_deref(), Some("2026-06-02T10:00:00+09:00"));
     }
 }

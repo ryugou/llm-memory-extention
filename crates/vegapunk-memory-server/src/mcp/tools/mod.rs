@@ -88,20 +88,45 @@ fn tool_descriptor(name: &str) -> Value {
         }),
         "ingest" => json!({
             "name": "ingest",
-            "description": "Ingest structured messages into the knowledge graph (vegapunk Ingest RPC).",
+            "description": "Ingest structured messages into the knowledge graph (vegapunk Ingest RPC). Each message is treated as one provenance unit (e.g. a Slack post or commit). For long-form text without per-utterance structure, prefer `ingest_raw`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "messages": {
                         "type": "array",
+                        "minItems": 1,
                         "items": {
                             "type": "object",
                             "properties": {
-                                "title": {"type": "string"},
-                                "body": {"type": "string"},
-                                "tags": {"type": "array", "items": {"type": "string"}}
+                                "id": {
+                                    "type": "string",
+                                    "description": "Optional client-supplied msg id. Server generates one if omitted."
+                                },
+                                "text": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "pattern": "\\S",
+                                    "description": "Message body. Must contain at least one non-whitespace character."
+                                },
+                                "metadata": {
+                                    "type": "object",
+                                    "properties": {
+                                        "source_type": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                                        "author": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                                        "author_id": {"type": "string"},
+                                        "channel": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                                        "channel_id": {"type": "string"},
+                                        "thread_id": {"type": "string"},
+                                        "timestamp": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "description": "RFC3339 timestamp, e.g. 2026-06-02T10:00:00+09:00."
+                                        }
+                                    },
+                                    "required": ["source_type", "author", "channel", "timestamp"]
+                                }
                             },
-                            "required": ["body"]
+                            "required": ["text", "metadata"]
                         }
                     }
                 },
@@ -110,15 +135,32 @@ fn tool_descriptor(name: &str) -> Value {
         }),
         "ingest_raw" => json!({
             "name": "ingest_raw",
-            "description": "Ingest raw text into the knowledge graph with automatic chunking (vegapunk IngestRaw RPC).",
+            "description": "Ingest a single block of raw text into the knowledge graph; vegapunk chunks it and returns one msg_id per chunk (vegapunk IngestRaw RPC).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string"},
-                    "title": {"type": "string"},
-                    "tags": {"type": "array", "items": {"type": "string"}}
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S",
+                        "description": "Raw text. Must contain at least one non-whitespace character."
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "properties": {
+                            "source_type": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                            "author": {"type": "string"},
+                            "channel": {"type": "string"},
+                            "timestamp": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "RFC3339 timestamp. Server uses current time if omitted."
+                            }
+                        },
+                        "required": ["source_type"]
+                    }
                 },
-                "required": ["text"]
+                "required": ["text", "metadata"]
             }
         }),
         "query_nodes" => json!({
@@ -262,6 +304,8 @@ pub async fn call(
     let content = match name.as_str() {
         "search" => handlers::search(&state, &user, args).await,
         "get_schema" => handlers::get_schema(&state, &user).await,
+        "ingest" => handlers::ingest(&state, &user, args).await,
+        "ingest_raw" => handlers::ingest_raw(&state, &user, args).await,
         other if TOOL_NAMES.contains(&other) => not_implemented_content(other),
         _ => {
             return JsonRpcResponse::error(
@@ -398,11 +442,11 @@ mod tests {
 
     #[tokio::test]
     async fn call_registered_but_unimplemented_tool_returns_iserror_content() {
-        // tools/list には載っているが本 PR ではまだ実装が無い tool は、
+        // tools/list には載っているが本 PR 時点で未実装の tool は、
         // JSON-RPC では success、tool 側で `isError: true` を返す。
-        // 「ingest」を例にとる (PR #16 で実装予定)。
+        // PR #17 で実装予定の `query_nodes` を例に取る。
         let state = test_state().await;
-        let params = json!({ "name": "ingest", "arguments": {} });
+        let params = json!({ "name": "query_nodes", "arguments": {} });
         let resp = call(state, test_user(), Some(json!(1)), params).await;
         let v = serde_json::to_value(resp).unwrap();
         assert!(
@@ -411,7 +455,35 @@ mod tests {
         );
         assert_eq!(v["result"]["isError"], true);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("ingest") && text.contains("not yet implemented"));
+        assert!(text.contains("query_nodes") && text.contains("not yet implemented"));
+    }
+
+    #[tokio::test]
+    async fn call_routes_ingest_into_handler_and_surfaces_validation_error() {
+        // gRPC は実呼び出ししないが、handler 経由で arguments 検証エラーが
+        // tool error として返ることを確認 (= dispatcher が ingest に届いた証拠)。
+        let state = test_state().await;
+        let params = json!({ "name": "ingest", "arguments": {} });
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert!(v["error"].is_null(), "expected tool error, got: {v}");
+        assert_eq!(v["result"]["isError"], true);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ingest"), "got: {text}");
+        assert!(text.contains("messages"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn call_routes_ingest_raw_into_handler_and_surfaces_validation_error() {
+        let state = test_state().await;
+        let params = json!({ "name": "ingest_raw", "arguments": {} });
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert!(v["error"].is_null(), "expected tool error, got: {v}");
+        assert_eq!(v["result"]["isError"], true);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ingest_raw"), "got: {text}");
+        assert!(text.contains("text"), "got: {text}");
     }
 
     #[test]
