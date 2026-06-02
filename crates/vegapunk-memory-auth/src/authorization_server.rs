@@ -5,17 +5,27 @@
 //! 2. Client redirects user to /oauth/authorize with their PKCE challenge.
 //! 3. We redirect to Google. User authenticates.
 //! 4. Google returns to /oauth/callback/google with code+state.
-//! 5. We exchange Google code → userinfo → **find_or_provision** the user row
-//!    (vegapunk_schema = `user-{google_sub}`) → idempotently ensure the user
-//!    schema and the shared schema exist on the vegapunk backend via the
-//!    injected `SchemaProvisioner` → issue an auth code.
+//! 5. We exchange Google code → userinfo → **find_or_provision** the user
+//!    row → idempotently `ensure_schema` for both schemas via the injected
+//!    `SchemaProvisioner` → issue an auth code.
 //! 6. We redirect back to the client's redirect_uri with our auth code.
 //! 7. Client calls /oauth/token with the auth code + PKCE verifier.
 //! 8. We verify PKCE and issue (access_token, refresh_token).
 //!
-//! Schema 命名規則と provisioning 詳細はトップレベル README §10-1 / memory
-//! `project-vegapunk-connection` を参照。新規ユーザは別管理 (admin の手動
-//! INSERT) を介さずに自分の Google アカウントで sign-in するだけで使える。
+//! Schema naming (step 5):
+//! - **Personal**: `user-{google_subject}` — derived right here in the
+//!   callback. Google sub is unique and immutable; we don't add a provider
+//!   prefix because Google is currently the only supported IdP (extend to
+//!   `user-{provider}-{subject}` if a second one is added).
+//! - **Shared**: `AsState.shared_schema` — operator-configured via
+//!   `ServerConfig.shared_schema_name` (env `VEGAPUNK_SHARED_SCHEMA_NAME`,
+//!   default `sivira-shared`).
+//!
+//! Both schemas are ensured on every callback; the provisioner folds
+//! `AlreadyExists` into success, so re-sign-ins are no-ops on the wrapper
+//! side. Failures of `ensure_schema` are warned and the OAuth flow proceeds
+//! — the user can still complete sign-in and the failure will resurface
+//! as a tonic error the moment they invoke a tool that needs the schema.
 
 use std::collections::HashMap;
 use std::sync::Arc;

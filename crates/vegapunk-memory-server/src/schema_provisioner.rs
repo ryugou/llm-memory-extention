@@ -2,15 +2,17 @@
 //!
 //! `authorization_server::callback_google` は **OAuth callback ごとに**
 //! (新規ユーザだけでなく既存ユーザの再 sign-in でも) 個人 schema
-//! (`user-{sub}`) と shared schema (`sivira-shared`) に対して
-//! `ensure_schema` を呼ぶ。gRPC リクエスト自体は毎回送るが、本 impl は
-//! `AlreadyExists` を `Ok(())` に丸めるので結果は idempotent ―
-//! 同じユーザの再 sign-in や複数ユーザによる shared schema 作成競合が
-//! あっても OAuth フローは止まらない。
+//! (`user-{sub}`) と shared schema に対して `ensure_schema` を呼ぶ。gRPC
+//! リクエスト自体は毎回送るが、本 impl は `AlreadyExists` を `Ok(())` に
+//! 丸めるので結果は idempotent ― 同じユーザの再 sign-in や複数ユーザによる
+//! shared schema 作成競合があっても OAuth フローは止まらない。
 //!
-//! template 名 (= 個人 schema を新規作成する際の vegapunk SchemaTemplate)
-//! は `ServerConfig.default_schema_template` で env から指定する
-//! (`VEGAPUNK_DEFAULT_SCHEMA_TEMPLATE`、default `discussion`)。
+//! 設定 (`ServerConfig` 経由で env から読む):
+//! - shared schema 名:    `VEGAPUNK_SHARED_SCHEMA_NAME` (default `sivira-shared`)
+//! - 新規 schema の template: `VEGAPUNK_DEFAULT_SCHEMA_TEMPLATE` (default `discussion`)
+//!
+//! template 名は vegapunk 側で既存の `SchemaTemplate` 一覧に存在する必要が
+//! ある (= `ListSchemaTemplates` で確認可能)。
 
 use async_trait::async_trait;
 use tonic::Code;

@@ -226,11 +226,15 @@ mod tests {
         // 来ても、両方 Ok を返す。負け側は UNIQUE 違反で落ちず、勝ち側が入れた
         // 同じ行を観測する (cross-tenant guard と同じ「先勝ち」仕様)。
         //
-        // 注: SQLite で `:memory:` を素で渡すと「connection 単位」の DB が
+        // 注 1: SQLite で `:memory:` を素で渡すと「connection 単位」の DB が
         // できて、pool が複数 connection を開くと task 間で別 DB を見る形に
         // なり race を再現できない。`file::memory:?cache=shared` で全
         // connection が同じ in-memory DB を共有する。各テストで instance が
         // 衝突しないよう unique な vfs name を付ける。
+        //
+        // 注 2: `tokio::spawn` を介すると scheduler が 2 task を逐次実行する
+        // 余地が残り race が観測できないことがある。`tokio::join!` で同一
+        // poll cycle に並べて両者が SELECT await を確実に同時に踏むようにする。
         let vfs = format!(
             "race-{}",
             std::time::SystemTime::now()
@@ -240,18 +244,12 @@ mod tests {
         );
         let url = format!("sqlite:file:{vfs}?mode=memory&cache=shared");
         let pool = init_pool(&url).await.unwrap();
-        let pool_a = pool.clone();
-        let pool_b = pool.clone();
         let (a, b) = tokio::join!(
-            tokio::spawn(async move {
-                find_or_provision(&pool_a, "id-a", "google", "race-sub", None, "user-race-a").await
-            }),
-            tokio::spawn(async move {
-                find_or_provision(&pool_b, "id-b", "google", "race-sub", None, "user-race-b").await
-            }),
+            find_or_provision(&pool, "id-a", "google", "race-sub", None, "user-race-a"),
+            find_or_provision(&pool, "id-b", "google", "race-sub", None, "user-race-b"),
         );
-        let a = a.unwrap().expect("task a ok");
-        let b = b.unwrap().expect("task b ok");
+        let a = a.expect("task a ok");
+        let b = b.expect("task b ok");
         assert_eq!(a.id, b.id, "both tasks must observe the same row id");
         assert_eq!(
             a.vegapunk_schema, b.vegapunk_schema,

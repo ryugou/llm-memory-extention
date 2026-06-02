@@ -510,11 +510,18 @@ wiki と完全に独立した connector として登録する:
 - URL: `https://vegapunk-136-110-78-245.nip.io/mcp`
 - 初回接続でブラウザに Google OAuth 認可画面 (vegapunk 側の `PUBLIC_URL` 経由)
 
-### 10-1-7. ユーザ provisioning (admin 作業)
+### 10-1-7. ユーザ provisioning (自動)
 
-vegapunk-memory-server の `users` テーブルは wiki と独立 (`crates/vegapunk-memory-storage`)。初回 OAuth で行が自動作成される **わけではない**: middleware は users 行が無い時に 401 を返す設計 ([[project-vegapunk-connection]] memory 参照)。新 user を受け入れる場合は admin が `users::insert` を直接叩く必要がある。
+vegapunk-memory-server の `users` テーブルは wiki と独立 (`crates/vegapunk-memory-storage`)。**初回 OAuth callback で auto-provision される** ので admin が `users::insert` を叩く必要は無い。
 
-将来的に「初回 OAuth で provisioning」を入れるかは別 PR で判断。
+命名規則:
+
+- 個人 schema: `user-{google_subject}` (Google sub は不変・一意なので衝突しない。Google 以外の provider を追加するときは `user-{provider}-{subject}` に拡張する)
+- 共有 schema: `${VEGAPUNK_SHARED_SCHEMA_NAME}` (default `sivira-shared`)
+
+OAuth callback は両 schema に対して `ensure_schema` (= vegapunk `CreateSchema`) を毎回 idempotent に呼ぶ (`AlreadyExists` は無視)。新規 schema の YAML source は `${VEGAPUNK_DEFAULT_SCHEMA_TEMPLATE}` で指定された vegapunk `SchemaTemplate` (default `discussion`) からコピーされる。template 名が vegapunk 側に存在しないと `CreateSchema` が失敗するので、`ListSchemaTemplates` で利用可能な template を確認しておく。
+
+`ensure_schema` が失敗しても OAuth フロー自体は通る (= log に warn が出る)。失敗の影響は最初に tool を呼んだ時の tonic error として client 側に surface する設計。
 
 ## 11. バックアップからの復元
 
