@@ -496,8 +496,8 @@ async fn client_grant_types(
     let client = vegapunk_memory_storage::oauth_clients::get(pool, client_id).await?;
     match client {
         Some(c) => {
-            let grants: Vec<String> = serde_json::from_str(&c.grant_types)
-                .map_err(ClientLookupError::MalformedJson)?;
+            let grants: Vec<String> =
+                serde_json::from_str(&c.grant_types).map_err(ClientLookupError::MalformedJson)?;
             Ok(Some(grants))
         }
         None => Ok(None),
@@ -852,8 +852,7 @@ mod tests {
     }
 
     fn token_form_with(grant_fields: &str) -> Body {
-        let base =
-            "grant_type=authorization_code&code=test-code&code_verifier=v";
+        let base = "grant_type=authorization_code&code=test-code&code_verifier=v";
         Body::from(format!("{base}&{grant_fields}"))
     }
 
