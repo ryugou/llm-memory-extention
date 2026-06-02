@@ -15,14 +15,17 @@
 use serde_json::{Map, Value, json};
 
 use vegapunk_client::graphrag::{
-    GetSchemaRequest, IngestMessage, IngestRawMetadata, IngestRawRequest, IngestRequest,
-    MessageMetadata, SearchRequest, SearchResultItem,
+    AttributeFilter, GetSchemaRequest, GetStatsRequest, IngestMessage, IngestRawMetadata,
+    IngestRawRequest, IngestRequest, ListSchemasRequest, MessageMetadata, QueryNodesRequest,
+    SchemaListItem, SearchRequest, SearchResultItem,
 };
 use vegapunk_memory_auth::middleware::AuthenticatedUser;
 
 use crate::state::AppState;
 
 use super::{
+    ATTRIBUTE_FILTER_VALID_OPS, QUERY_NODES_LIMIT_DEFAULT, QUERY_NODES_LIMIT_MAX,
+    QUERY_NODES_LIMIT_MIN, QUERY_NODES_SORT_ORDER_DEFAULT, QUERY_NODES_VALID_SORT_ORDERS,
     SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN, SEARCH_MODE_DEFAULT,
     SEARCH_VALID_MODES,
 };
@@ -407,6 +410,229 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
             success_content(json!({
                 "chunk_count": resp.chunk_count,
                 "msg_ids": resp.msg_ids,
+            }))
+        }
+    }
+}
+
+/// 単一の AttributeFilter (key / op / value) を build する。op は enum guard。
+fn build_attribute_filter(item: &Value, owner: &str) -> Result<AttributeFilter, String> {
+    let m = item
+        .as_object()
+        .ok_or_else(|| format!("'{owner}' must be an object"))?;
+    let key = require_str_field(m, "key", owner)?;
+    let op = require_str_field(m, "op", owner)?;
+    if !ATTRIBUTE_FILTER_VALID_OPS.contains(&op.as_str()) {
+        return Err(format!(
+            "'{owner}.op' must be one of {ATTRIBUTE_FILTER_VALID_OPS:?}, got {op:?}"
+        ));
+    }
+    // value は require_str_field を使わず、空文字も明示的に許容する
+    // (eq "" のような検索が想定される)。
+    let value = match m.get("value") {
+        None | Some(Value::Null) => {
+            return Err(format!("missing required '{owner}.value'"));
+        }
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| format!("'{owner}.value' must be a string"))?
+            .to_string(),
+    };
+    Ok(AttributeFilter { key, op, value })
+}
+
+/// `arguments.filters` (optional JSON array) を `Vec<AttributeFilter>` に変換。
+/// `filters` が無い / null なら空配列を返す。query_nodes / stats で共通。
+fn build_attribute_filters_from(
+    obj: &Map<String, Value>,
+    owner: &str,
+) -> Result<Vec<AttributeFilter>, String> {
+    let owner_field = format!("{owner}.filters");
+    match obj.get("filters") {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| format!("'{owner_field}' must be an array"))?;
+            arr.iter()
+                .enumerate()
+                .map(|(i, f)| build_attribute_filter(f, &format!("{owner_field}[{i}]")))
+                .collect()
+        }
+    }
+}
+
+/// optional integer field を i32 にまで降ろす。null/missing は default を返す
+/// (default が None ならそのまま None)。範囲外は err。
+fn optional_bounded_i32(
+    obj: &Map<String, Value>,
+    field: &str,
+    min: i64,
+    max: i64,
+    default: Option<i32>,
+    owner: &str,
+) -> Result<Option<i32>, String> {
+    match obj.get(field) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| format!("'{owner}.{field}' must be an integer"))?;
+            if !(min..=max).contains(&n) {
+                return Err(format!(
+                    "'{owner}.{field}' must be between {min} and {max}, got {n}"
+                ));
+            }
+            Ok(Some(n as i32))
+        }
+    }
+}
+
+/// `query_nodes` argument を `QueryNodesRequest` に詰める。`schema` は user の
+/// vegapunk_schema で強制注入する。
+pub(super) fn build_query_nodes_request(
+    user_schema: &str,
+    args: &Value,
+) -> Result<QueryNodesRequest, String> {
+    let args = require_object_args(args)?;
+    let node_type = require_str_field(args, "node_type", "arguments")?;
+    let filters = build_attribute_filters_from(args, "arguments")?;
+    let sort_by = optional_str_field(args, "sort_by", "arguments")?;
+    let sort_order = {
+        let raw = match args.get("sort_order") {
+            None | Some(Value::Null) => QUERY_NODES_SORT_ORDER_DEFAULT,
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| "'arguments.sort_order' must be a string".to_string())?,
+        };
+        if !QUERY_NODES_VALID_SORT_ORDERS.contains(&raw) {
+            return Err(format!(
+                "'arguments.sort_order' must be one of {QUERY_NODES_VALID_SORT_ORDERS:?}, got {raw:?}"
+            ));
+        }
+        Some(raw.to_string())
+    };
+    let limit = optional_bounded_i32(
+        args,
+        "limit",
+        QUERY_NODES_LIMIT_MIN,
+        QUERY_NODES_LIMIT_MAX,
+        Some(QUERY_NODES_LIMIT_DEFAULT),
+        "arguments",
+    )?;
+    // offset は 0..=i32::MAX で受ける。default 0。
+    let offset = optional_bounded_i32(args, "offset", 0, i32::MAX as i64, Some(0), "arguments")?;
+    Ok(QueryNodesRequest {
+        schema: user_schema.to_string(),
+        node_type,
+        filters,
+        sort_by,
+        sort_order,
+        limit,
+        offset,
+        traverse: None,
+    })
+}
+
+/// `stats` argument を `GetStatsRequest` に詰める。proto の `schema` は optional
+/// で「empty = cross-schema total (admin Dashboard default)」だが、wrapper では
+/// user.vegapunk_schema を必ずセットして tenant 越境を遮断する。
+pub(super) fn build_get_stats_request(
+    user_schema: &str,
+    args: &Value,
+) -> Result<GetStatsRequest, String> {
+    let args = require_object_args(args)?;
+    let node_type = optional_str_field(args, "node_type", "arguments")?;
+    let filters = build_attribute_filters_from(args, "arguments")?;
+    Ok(GetStatsRequest {
+        schema: Some(user_schema.to_string()),
+        node_type,
+        filters,
+    })
+}
+
+pub(super) async fn query_nodes(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
+    let request = match build_query_nodes_request(&user.vegapunk_schema, &args) {
+        Ok(r) => r,
+        Err(e) => return invalid_args_content("query_nodes", &e),
+    };
+    let mut client = state.vegapunk.clone();
+    match client.query_nodes(request).await {
+        Err(status) => tonic_error_content("QueryNodes", status),
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            let nodes: Vec<Value> = resp
+                .nodes
+                .iter()
+                .map(|n| {
+                    json!({
+                        "node_id": n.node_id,
+                        "node_type": n.node_type,
+                        "attributes": n.attributes,
+                    })
+                })
+                .collect();
+            success_content(json!({
+                "nodes": nodes,
+                "total_count": resp.total_count,
+            }))
+        }
+    }
+}
+
+/// vegapunk の `ListSchemas` は全 schema を返す admin-ish RPC だが、wrapper
+/// 単位では user 1 人につき 1 schema (= `user.vegapunk_schema`) しか紐付かない
+/// 設計なので、結果を user の schema 名に厳格に filter する。これがないと、
+/// 他 tenant の schema 名と yaml が caller に丸見えになる (情報漏洩)。
+///
+/// filter 実装は cross-tenant 防止の要なので、pure な
+/// [`filter_schemas_for_user`] に切り出して unit test で pin する。
+pub(super) async fn list_schemas(state: &AppState, user: &AuthenticatedUser) -> Value {
+    let mut client = state.vegapunk.clone();
+    match client.list_schemas(ListSchemasRequest {}).await {
+        Err(status) => tonic_error_content("ListSchemas", status),
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            let schemas = filter_schemas_for_user(&resp.schemas, &user.vegapunk_schema);
+            success_content(json!({ "schemas": schemas }))
+        }
+    }
+}
+
+/// `ListSchemas` レスポンスから、要求 user の vegapunk_schema に **完全一致**
+/// する entry のみを抜き出して JSON に整形する。`list_schemas` ハンドラの
+/// security-critical な部分なので、handler 自体を gRPC 込みで mock しなくても
+/// この pure function だけで cross-tenant filter の挙動を試験できる。
+fn filter_schemas_for_user(schemas: &[SchemaListItem], user_schema: &str) -> Vec<Value> {
+    schemas
+        .iter()
+        .filter(|s| s.name == user_schema)
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "version": s.version,
+                "description": s.description,
+                "schema_yaml": s.schema_yaml,
+            })
+        })
+        .collect()
+}
+
+pub(super) async fn stats(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
+    let request = match build_get_stats_request(&user.vegapunk_schema, &args) {
+        Ok(r) => r,
+        Err(e) => return invalid_args_content("stats", &e),
+    };
+    let mut client = state.vegapunk.clone();
+    match client.get_stats(request).await {
+        Err(status) => tonic_error_content("GetStats", status),
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            success_content(json!({
+                "node_count": resp.node_count,
+                "edge_count": resp.edge_count,
+                "vector_count": resp.vector_count,
+                "community_count": resp.community_count,
             }))
         }
     }
@@ -842,6 +1068,241 @@ mod tests {
         assert!(md.author.is_none(), "got: {:?}", md.author);
         assert!(md.channel.is_none(), "got: {:?}", md.channel);
         assert!(md.timestamp.is_none(), "got: {:?}", md.timestamp);
+    }
+
+    // ── query_nodes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn query_nodes_request_uses_user_schema_and_ignores_args_schema() {
+        let args = json!({ "node_type": "Message", "schema": "evil" });
+        let req = build_query_nodes_request("alice-tenant", &args).unwrap();
+        assert_eq!(req.schema, "alice-tenant");
+        assert_eq!(req.node_type, "Message");
+        // defaults
+        assert_eq!(req.limit, Some(QUERY_NODES_LIMIT_DEFAULT));
+        assert_eq!(req.offset, Some(0));
+        assert_eq!(
+            req.sort_order.as_deref(),
+            Some(QUERY_NODES_SORT_ORDER_DEFAULT)
+        );
+        assert!(req.filters.is_empty());
+        assert!(req.sort_by.is_none());
+        assert!(req.traverse.is_none());
+    }
+
+    #[test]
+    fn query_nodes_request_rejects_missing_node_type() {
+        let err = build_query_nodes_request("t", &json!({})).unwrap_err();
+        assert!(err.contains("node_type"), "got: {err}");
+    }
+
+    #[test]
+    fn query_nodes_request_maps_filters() {
+        let req = build_query_nodes_request(
+            "t",
+            &json!({
+                "node_type": "Message",
+                "filters": [
+                    {"key": "channel_id", "op": "eq", "value": "C123"},
+                    {"key": "timestamp", "op": "gte", "value": "2026-01-01T00:00:00Z"}
+                ]
+            }),
+        )
+        .unwrap();
+        assert_eq!(req.filters.len(), 2);
+        assert_eq!(req.filters[0].key, "channel_id");
+        assert_eq!(req.filters[0].op, "eq");
+        assert_eq!(req.filters[0].value, "C123");
+        assert_eq!(req.filters[1].op, "gte");
+    }
+
+    #[test]
+    fn query_nodes_request_rejects_unknown_filter_op() {
+        let err = build_query_nodes_request(
+            "t",
+            &json!({
+                "node_type": "Message",
+                "filters": [{"key": "x", "op": "contains", "value": "y"}]
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("filters[0].op"), "got: {err}");
+        assert!(err.contains("contains"), "got: {err}");
+    }
+
+    #[test]
+    fn query_nodes_request_rejects_non_array_filters() {
+        let err = build_query_nodes_request("t", &json!({ "node_type": "M", "filters": "nope" }))
+            .unwrap_err();
+        assert!(
+            err.contains("filters") && err.contains("array"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn query_nodes_request_filter_value_accepts_empty_string() {
+        // `value` は eq "" のような検索用に空文字を許す (key / op は不可)。
+        let req = build_query_nodes_request(
+            "t",
+            &json!({
+                "node_type": "M",
+                "filters": [{"key": "k", "op": "eq", "value": ""}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(req.filters[0].value, "");
+    }
+
+    #[test]
+    fn query_nodes_request_rejects_unknown_sort_order() {
+        let err =
+            build_query_nodes_request("t", &json!({ "node_type": "M", "sort_order": "rand" }))
+                .unwrap_err();
+        // 他フィールドと同じ `'arguments.<field>'` 形式で報告する。
+        assert!(err.contains("'arguments.sort_order'"), "got: {err}");
+    }
+
+    #[test]
+    fn query_nodes_request_rejects_non_string_sort_order_with_fully_qualified_path() {
+        let err = build_query_nodes_request("t", &json!({ "node_type": "M", "sort_order": 1 }))
+            .unwrap_err();
+        assert!(err.contains("'arguments.sort_order'"), "got: {err}");
+        assert!(err.contains("string"), "got: {err}");
+    }
+
+    #[test]
+    fn query_nodes_request_rejects_limit_out_of_range() {
+        let err =
+            build_query_nodes_request("t", &json!({ "node_type": "M", "limit": 0 })).unwrap_err();
+        assert!(err.contains("limit"), "got: {err}");
+
+        let err = build_query_nodes_request("t", &json!({ "node_type": "M", "limit": 1001 }))
+            .unwrap_err();
+        assert!(err.contains("limit"), "got: {err}");
+    }
+
+    #[test]
+    fn query_nodes_request_rejects_negative_offset() {
+        let err =
+            build_query_nodes_request("t", &json!({ "node_type": "M", "offset": -1 })).unwrap_err();
+        assert!(err.contains("offset"), "got: {err}");
+    }
+
+    #[test]
+    fn query_nodes_request_accepts_full_args() {
+        let req = build_query_nodes_request(
+            "t",
+            &json!({
+                "node_type": "Message",
+                "filters": [{"key": "k", "op": "lt", "value": "v"}],
+                "sort_by": "timestamp",
+                "sort_order": "asc",
+                "limit": 25,
+                "offset": 5
+            }),
+        )
+        .unwrap();
+        assert_eq!(req.sort_by.as_deref(), Some("timestamp"));
+        assert_eq!(req.sort_order.as_deref(), Some("asc"));
+        assert_eq!(req.limit, Some(25));
+        assert_eq!(req.offset, Some(5));
+    }
+
+    // ── stats ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn stats_request_uses_user_schema_and_ignores_args_schema() {
+        let req = build_get_stats_request("alice", &json!({ "schema": "evil" })).unwrap();
+        assert_eq!(req.schema.as_deref(), Some("alice"));
+        assert!(req.node_type.is_none());
+        assert!(req.filters.is_empty());
+    }
+
+    #[test]
+    fn stats_request_always_sets_schema_even_when_args_empty() {
+        // proto では schema は optional だが、wrapper は cross-tenant 防止のため
+        // 必ず user.vegapunk_schema をセットする ("admin Dashboard default" 経路
+        // に漏らさない)。
+        let req = build_get_stats_request("alice", &json!({})).unwrap();
+        assert_eq!(req.schema.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn stats_request_accepts_filters_and_node_type() {
+        let req = build_get_stats_request(
+            "t",
+            &json!({
+                "node_type": "Message",
+                "filters": [{"key": "channel", "op": "eq", "value": "C1"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(req.node_type.as_deref(), Some("Message"));
+        assert_eq!(req.filters.len(), 1);
+    }
+
+    // ── list_schemas filter (cross-tenant guard) ────────────────────────
+
+    fn schema_item(name: &str) -> SchemaListItem {
+        SchemaListItem {
+            name: name.to_string(),
+            version: 1,
+            description: format!("schema for {name}"),
+            schema_yaml: format!("name: {name}\n"),
+        }
+    }
+
+    #[test]
+    fn filter_schemas_returns_only_matching_user_schema() {
+        let schemas = vec![
+            schema_item("alice-tenant"),
+            schema_item("bob-tenant"),
+            schema_item("eve-tenant"),
+        ];
+        let out = filter_schemas_for_user(&schemas, "bob-tenant");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["name"], "bob-tenant");
+        assert_eq!(out[0]["schema_yaml"], "name: bob-tenant\n");
+    }
+
+    #[test]
+    fn filter_schemas_drops_other_tenants_completely() {
+        // alice / eve は出力に絶対に含まれない (cross-tenant guard の核)。
+        let schemas = vec![schema_item("alice-tenant"), schema_item("eve-tenant")];
+        let out = filter_schemas_for_user(&schemas, "bob-tenant");
+        assert!(out.is_empty(), "got: {out:?}");
+    }
+
+    #[test]
+    fn filter_schemas_uses_exact_match_not_substring() {
+        // "bob-tenant" を要求した時に "bob-tenant-v2" のような prefix-match が
+        // 入らないこと (substring leak の典型パターンを潰す)。
+        let schemas = vec![
+            schema_item("bob-tenant"),
+            schema_item("bob-tenant-v2"),
+            schema_item("bob"),
+        ];
+        let out = filter_schemas_for_user(&schemas, "bob-tenant");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["name"], "bob-tenant");
+    }
+
+    #[test]
+    fn filter_schemas_returns_empty_when_user_has_no_match() {
+        let schemas = vec![schema_item("alice-tenant")];
+        let out = filter_schemas_for_user(&schemas, "bob-tenant");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn stats_request_rejects_unknown_filter_op() {
+        let err = build_get_stats_request(
+            "t",
+            &json!({ "filters": [{"key": "k", "op": "like", "value": "v"}] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("filters[0].op"), "got: {err}");
     }
 
     #[test]
