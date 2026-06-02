@@ -54,6 +54,10 @@ fn require_str_field(obj: &Map<String, Value>, field: &str, owner: &str) -> Resu
 }
 
 /// 任意の string field: null / missing は None、非 string は error。
+/// 空白だけの値 (`""` や `"   "`) は「省略」と同じ扱いにする — 例えば
+/// `ingest_raw.metadata.timestamp` の advertised default は「省略時 server time」
+/// だが、`""` を Some として通すと server time fallback が走らず空文字が
+/// proto に乗ってしまう。trim して empty なら None に下す。
 fn optional_str_field(
     obj: &Map<String, Value>,
     field: &str,
@@ -62,7 +66,14 @@ fn optional_str_field(
     match obj.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(v) => match v.as_str() {
-            Some(s) => Ok(Some(s.to_string())),
+            Some(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(trimmed.to_string()))
+                }
+            }
             None => Err(format!("'{owner}.{field}' must be a string")),
         },
     }
@@ -722,6 +733,21 @@ mod tests {
     }
 
     #[test]
+    fn ingest_request_treats_empty_optional_metadata_as_omitted() {
+        // ingest 側の optional metadata field (author_id, channel_id, thread_id)
+        // も同じく空白は None として落とす。
+        let mut msg = good_message();
+        msg["metadata"]["author_id"] = json!("");
+        msg["metadata"]["channel_id"] = json!("   ");
+        msg["metadata"]["thread_id"] = json!("\t\n");
+        let req = build_ingest_request("t", &json!({ "messages": [msg] })).unwrap();
+        let md = req.messages[0].metadata.as_ref().unwrap();
+        assert!(md.author_id.is_none());
+        assert!(md.channel_id.is_none());
+        assert!(md.thread_id.is_none());
+    }
+
+    #[test]
     fn ingest_request_accepts_optional_id_and_metadata_fields() {
         let mut msg = good_message();
         msg["id"] = json!("client-supplied-id");
@@ -791,6 +817,31 @@ mod tests {
         let err =
             build_ingest_raw_request("t", &json!({ "text": "x", "metadata": {} })).unwrap_err();
         assert!(err.contains("metadata.source_type"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_raw_request_treats_empty_optional_fields_as_omitted() {
+        // `""` や `"   "` を `Some("")` のまま乗せると、proto 側で
+        // "timestamp omitted → server time" の fallback が効かない。
+        // optional_str_field が trim + empty→None に下すことを ingest_raw
+        // のフル経路でも確認する。
+        let req = build_ingest_raw_request(
+            "t",
+            &json!({
+                "text": "hello",
+                "metadata": {
+                    "source_type": "wiki",
+                    "author": "  ",
+                    "channel": "",
+                    "timestamp": " \t ",
+                }
+            }),
+        )
+        .unwrap();
+        let md = req.metadata.unwrap();
+        assert!(md.author.is_none(), "got: {:?}", md.author);
+        assert!(md.channel.is_none(), "got: {:?}", md.channel);
+        assert!(md.timestamp.is_none(), "got: {:?}", md.timestamp);
     }
 
     #[test]

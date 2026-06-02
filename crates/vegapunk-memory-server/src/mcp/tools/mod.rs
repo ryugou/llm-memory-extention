@@ -120,6 +120,7 @@ fn tool_descriptor(name: &str) -> Value {
                                         "timestamp": {
                                             "type": "string",
                                             "minLength": 1,
+                                            "pattern": "\\S",
                                             "description": "RFC3339 timestamp, e.g. 2026-06-02T10:00:00+09:00."
                                         }
                                     },
@@ -154,7 +155,8 @@ fn tool_descriptor(name: &str) -> Value {
                             "timestamp": {
                                 "type": "string",
                                 "minLength": 1,
-                                "description": "RFC3339 timestamp. Server uses current time if omitted."
+                                "pattern": "\\S",
+                                "description": "RFC3339 timestamp. Server uses current time if omitted; whitespace-only is treated as omitted."
                             }
                         },
                         "required": ["source_type"]
