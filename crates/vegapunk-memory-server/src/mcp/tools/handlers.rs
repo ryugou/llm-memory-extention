@@ -116,17 +116,47 @@ pub(super) fn success_content(structured: Value) -> Value {
     })
 }
 
-/// `tonic::Status` を MCP tool error content に詰める。code は `gRPC <code>` の
-/// プレフィクス付きで text に残す (= client が retry 判断に使える)。
+/// `tonic::Status` を MCP tool error content に詰める。
+///
+/// gRPC code は client が retry 判定に使うので常に露出するが、`Internal` /
+/// `Unknown` / `DataLoss` / `Unimplemented` の message は backend 内部の trace
+/// やパスを含むことがあり、wrapper の public surface に流すと情報漏洩リスクが
+/// ある。そういう code では message を落として code だけを返し、full message
+/// は tracing に残してオペレータが追えるようにする。
+/// client-actionable な code (InvalidArgument / NotFound / Unauthenticated 等)
+/// は message も含める — 何を直せばいいか伝わらないと意味が無いため。
 pub(super) fn tonic_error_content(method: &str, status: tonic::Status) -> Value {
     let code = status.code();
-    let msg = status.message();
-    let body = format!("vegapunk {method} failed: gRPC {code:?}: {msg}");
-    tracing::warn!(method = method, code = ?code, message = msg, "vegapunk gRPC error");
+    let raw_msg = status.message();
+    tracing::warn!(method = method, code = ?code, message = raw_msg, "vegapunk gRPC error");
+    let body = if message_is_client_safe(code) {
+        format!("vegapunk {method} failed: gRPC {code:?}: {raw_msg}")
+    } else {
+        format!("vegapunk {method} failed: gRPC {code:?} (details suppressed)")
+    };
     json!({
         "content": [{ "type": "text", "text": body }],
         "isError": true,
     })
+}
+
+fn message_is_client_safe(code: tonic::Code) -> bool {
+    use tonic::Code::*;
+    matches!(
+        code,
+        Cancelled
+            | InvalidArgument
+            | DeadlineExceeded
+            | NotFound
+            | AlreadyExists
+            | PermissionDenied
+            | ResourceExhausted
+            | FailedPrecondition
+            | Aborted
+            | OutOfRange
+            | Unavailable
+            | Unauthenticated
+    )
 }
 
 /// `arguments` 不備など handler 内で生じた client 起因エラーを tool error にする。
@@ -380,7 +410,50 @@ mod tests {
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Search"));
         assert!(text.contains("PermissionDenied"), "got: {text}");
-        assert!(text.contains("no access"));
+        // PermissionDenied は client-safe code なので message も含まれる。
+        assert!(text.contains("no access"), "got: {text}");
+    }
+
+    #[test]
+    fn tonic_error_content_redacts_internal_message() {
+        // Internal は backend trace / file path / stack を含む可能性があるので
+        // message は public surface に流さず、code だけ返す。
+        let status = tonic::Status::internal(
+            "SQL: SELECT * FROM secrets WHERE token='...' caused panic at vegapunk/src/db.rs:42",
+        );
+        let v = tonic_error_content("Search", status);
+        assert_eq!(v["isError"], true);
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Internal"), "got: {text}");
+        assert!(
+            text.contains("details suppressed"),
+            "internal message must be suppressed: {text}"
+        );
+        assert!(
+            !text.contains("SELECT") && !text.contains("vegapunk/src/db.rs"),
+            "internal details leaked into client error: {text}"
+        );
+    }
+
+    #[test]
+    fn tonic_error_content_redacts_unknown_message() {
+        let status =
+            tonic::Status::unknown("backend panicked: thread 'tokio-runtime' panicked at ...");
+        let v = tonic_error_content("Search", status);
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Unknown"));
+        assert!(text.contains("details suppressed"));
+        assert!(!text.contains("panicked"), "got: {text}");
+    }
+
+    #[test]
+    fn tonic_error_content_keeps_invalid_argument_message() {
+        // InvalidArgument は何を直せばいいか伝える必要があるので message を保持。
+        let status = tonic::Status::invalid_argument("schema 'foo' not found");
+        let v = tonic_error_content("GetSchema", status);
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("InvalidArgument"));
+        assert!(text.contains("schema 'foo' not found"), "got: {text}");
     }
 
     #[test]

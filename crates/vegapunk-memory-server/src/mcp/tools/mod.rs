@@ -217,6 +217,12 @@ pub async fn call(
     id: Option<Value>,
     params: Value,
 ) -> JsonRpcResponse {
+    // MCP `tools/call` params must be a JSON object. Calling `.get("name")` on
+    // an array / string / null would silently return `None` and surface as a
+    // misleading "missing 'name'" error.
+    if !params.is_object() {
+        return JsonRpcResponse::error(id, -32602, "Invalid params: must be a JSON object");
+    }
     let name = match params.get("name") {
         None | Some(Value::Null) => {
             return JsonRpcResponse::error(id, -32602, "Invalid params: missing 'name'");
@@ -370,6 +376,23 @@ mod tests {
             msg.contains("'name'") && msg.contains("string"),
             "got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn call_non_object_params_returns_type_error() {
+        // `params` が array / string / null だと `.get("name")` が None になり
+        // 「missing 'name'」と返ってしまうので、ここで弾く。
+        for bad in [json!(["search"]), json!("search"), json!(null), json!(42)] {
+            let state = test_state().await;
+            let resp = call(state, user(), Some(json!(1)), bad.clone()).await;
+            let v = serde_json::to_value(resp).unwrap();
+            assert_eq!(v["error"]["code"], -32602, "input {bad:?} should be -32602");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("JSON object"),
+                "input {bad:?} expected shape error; got: {msg}"
+            );
+        }
     }
 
     #[tokio::test]
