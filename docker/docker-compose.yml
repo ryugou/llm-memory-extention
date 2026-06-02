@@ -8,6 +8,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      target: llm-memory-server
     image: llm-memory-server:local
     # env_file は 2 つ列挙:
     # 1. `../.env`: 非 secret の app/deploy config (Vertex / PUBLIC_URL 等)
@@ -61,6 +62,40 @@ services:
       - litestream
     restart: unless-stopped
 
+  # vegapunk-memory-server: OAuth/MCP wrapper for the punkrecord-egghead
+  # vegapunk gRPC backend (10.10.0.2:6840 over VPC peering). 既存の `server`
+  # と共存し、別 subdomain (VEGAPUNK_PUBLIC_DOMAIN) + 別 DB volume で動かす。
+  # litestream の backup には現状載せない (wiki と vegapunk は別 backend なので、
+  # 復旧優先度が異なる; 必要なら後で別 litestream service を追加する)。
+  vegapunk-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: vegapunk-memory-server
+    image: vegapunk-memory-server:local
+    env_file:
+      - path: ../.env
+        required: true
+      - path: ${SECRETS_ENV_FILE:-/dev/null}
+        required: false
+    # Docker 内固定値の上書き。
+    # - DATABASE_URL: server 用 `data` volume とは別の `vegapunk_data` に分離。
+    # - BIND_ADDR: 8081 で listen。同 VM 同居なので 8080 (llm-memory-server) と衝突回避。
+    # - PUBLIC_URL: 別 subdomain で見えるように `.env` の VEGAPUNK_PUBLIC_URL を流す
+    #   (vegapunk-memory-server の config は `PUBLIC_URL` をそのまま読むので、
+    #    interpolation で書き換える)。
+    environment:
+      - DATABASE_URL=sqlite:///data/db.sqlite
+      - BIND_ADDR=0.0.0.0:8081
+      - PUBLIC_URL=${VEGAPUNK_PUBLIC_URL}
+    volumes:
+      - vegapunk_data:/data
+    expose:
+      - "8081"
+    extra_hosts:
+      - "metadata.google.internal:169.254.169.254"
+    restart: unless-stopped
+
   litestream:
     image: litestream/litestream:0.3.13
     # litestream.yml が `${LITESTREAM_BUCKET}` を参照するので、コンテナ環境に
@@ -92,11 +127,14 @@ services:
       - caddy_config:/config
     environment:
       - PUBLIC_DOMAIN=${PUBLIC_DOMAIN}
+      - VEGAPUNK_PUBLIC_DOMAIN=${VEGAPUNK_PUBLIC_DOMAIN}
     depends_on:
       - server
+      - vegapunk-server
     restart: unless-stopped
 
 volumes:
   data:
+  vegapunk_data:
   caddy_data:
   caddy_config:

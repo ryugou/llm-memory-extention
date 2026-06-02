@@ -85,10 +85,15 @@ if [[ "${NEED_SECRETS}" == "true" ]]; then
 
   # secret-name : env-var-name のマッピング。
   # JWT 鍵を rotation するときは `jwt-signing-key-v2:JWT_SIGNING_KEY_v2` を追加する。
+  # vegapunk-bearer-token は vegapunk-memory-server が vegapunk gRPC backend
+  # (punkrecord-egghead VPC) に接続するときの bearer token (consumer 側で
+  # 自前管理しているコピー)。両 server で共通 env として注入するが、
+  # llm-memory-server は触らない (unused env として無視される)。
   SECRETS=(
     "google-oauth-client-id:GOOGLE_OAUTH_CLIENT_ID"
     "google-oauth-client-secret:GOOGLE_OAUTH_CLIENT_SECRET"
     "jwt-signing-key-v1:JWT_SIGNING_KEY_v1"
+    "vegapunk-bearer-token:VEGAPUNK_BEARER_TOKEN"
   )
 
   echo "Fetching secrets from Secret Manager (project=${PROJECT}) → ${TMPENV} ..."

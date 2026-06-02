@@ -1,7 +1,10 @@
-# nip.io 等の public hostname を `.env` の `PUBLIC_DOMAIN` で指定する。
+# nip.io 等の public hostname を `.env` の `PUBLIC_DOMAIN` /
+# `VEGAPUNK_PUBLIC_DOMAIN` で指定する。
 # Let's Encrypt HTTP-01 / TLS-ALPN-01 で証明書を自動取得する。
 # 必要バージョン: Caddy 2.5+ (`log_skip` directive 利用のため)。
 # docker-compose.yml の image: caddy:2-alpine は 2.7+ 系を pull するので OK。
+
+# ── llm-memory-server (wiki backend) ─────────────────────────────────────
 {$PUBLIC_DOMAIN} {
     encode zstd gzip
 
@@ -17,5 +20,24 @@
         output stdout
         format json
         # access log は上の `log_skip` で /oauth/callback/google を抑止済み
+    }
+}
+
+# ── vegapunk-memory-server (vegapunk backend) ────────────────────────────
+# wiki とは別 origin で動かす。OAuth metadata
+# (`/.well-known/oauth-authorization-server`) も origin で完全に分離されるので、
+# Claude.ai / ChatGPT 等の MCP client から「2 つの connector」として並列に
+# 接続できる。subdomain を変えるために `.env` で別途指定する
+# (例: vegapunk-136-110-78-245.nip.io)。
+{$VEGAPUNK_PUBLIC_DOMAIN} {
+    encode zstd gzip
+
+    log_skip /oauth/callback/google
+
+    reverse_proxy vegapunk-server:8081
+
+    log {
+        output stdout
+        format json
     }
 }
