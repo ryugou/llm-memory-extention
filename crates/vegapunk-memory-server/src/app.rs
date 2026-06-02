@@ -93,38 +93,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
-    use vegapunk_client::BearerAuthInterceptor;
-    use vegapunk_client::graphrag::graph_rag_engine_client::GraphRagEngineClient;
 
-    /// HTTP transport の routing 確認用に AppState を組み立てる。
-    /// 実 vegapunk への接続は使わず、無効な channel に Bearer interceptor を
-    /// 被せた client を仕込む (= route まで届けば良く、handler が gRPC を
-    /// 呼ばない限り問題ない)。
-    async fn test_state() -> AppState {
-        let pool = vegapunk_memory_storage::pool::init_pool("sqlite::memory:")
-            .await
-            .unwrap();
-        let endpoint = tonic::transport::Endpoint::from_static("http://127.0.0.1:0");
-        let channel = endpoint.connect_lazy();
-        let interceptor = BearerAuthInterceptor::new("dummy").unwrap();
-        let vegapunk = GraphRagEngineClient::with_interceptor(channel, interceptor);
-        let cfg = ServerConfig {
-            database_url: "sqlite::memory:".into(),
-            bind_addr: "0.0.0.0:8081".into(),
-            public_url: "https://test.example.com".into(),
-            google_client_id: "id".into(),
-            google_client_secret: "s".into(),
-            vegapunk_grpc_endpoint: "http://127.0.0.1:0".into(),
-            vegapunk_bearer_token: "dummy".into(),
-            trusted_proxy_count: 1,
-        };
-        AppState {
-            pool,
-            vegapunk,
-            jwt_keys: JwtKeys::for_tests(),
-            cfg: Arc::new(cfg),
-        }
-    }
+    use crate::test_support::test_state;
 
     #[tokio::test]
     async fn healthz_returns_ok() {

@@ -1,14 +1,27 @@
 //! MCP tool 一覧と dispatcher。
 //!
-//! `list()` で返す inputSchema は MCP client (Claude.ai 等) が tools/list で
-//! 取得し、tool call 時の引数 validation に使う。各 handler の実装は次 PR で
-//! 順次追加する想定で、本 PR ではすべて `not_implemented` を返す薄い dispatcher。
+//! `list()` は MCP client (Claude.ai 等) が `tools/list` で取得する inputSchema を返す。
+//! `call()` は `tools/call` を受けて個別 handler に dispatch する — 各 handler は
+//! `handlers` 子モジュールで実装する。未実装の tool は `tools/list` には載るが
+//! `call()` 経由で叩かれた場合 `isError: true` の "not yet implemented" content を返す
+//! (= client が capability discover した後で早めに気付ける)。
 
 use serde_json::{Value, json};
 
 use crate::mcp::transport::JsonRpcResponse;
 use crate::state::AppState;
 use vegapunk_memory_auth::middleware::AuthenticatedUser;
+
+mod handlers;
+
+// `search` tool の入出力契約。`tool_descriptor("search")` の inputSchema と
+// `handlers::build_search_request` の runtime validation が同じ値を見るために
+// ここを single source of truth にする。
+pub(super) const SEARCH_LIMIT_MIN: i64 = 1;
+pub(super) const SEARCH_LIMIT_MAX: i64 = 100;
+pub(super) const SEARCH_LIMIT_DEFAULT: i32 = 10;
+pub(super) const SEARCH_VALID_MODES: &[&str] = &["local", "global", "hybrid"];
+pub(super) const SEARCH_MODE_DEFAULT: &str = "hybrid";
 
 /// vegapunk wrapper として公開する tool 名の集合。
 /// 「公開しない vegapunk RPC」(= UpsertNodes / Reingest / Rebuild / Migrate /
@@ -48,9 +61,27 @@ fn tool_descriptor(name: &str) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "mode": {"type": "string", "enum": ["local", "global", "hybrid"], "default": "hybrid"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+                    // query must contain at least one non-whitespace character;
+                    // server-side `build_search_request` trims and rejects
+                    // whitespace-only input. minLength alone would still allow
+                    // " ", so the pattern guard is what enforces non-empty.
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S",
+                        "description": "Search query. Must contain at least one non-whitespace character."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": SEARCH_VALID_MODES,
+                        "default": SEARCH_MODE_DEFAULT,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": SEARCH_LIMIT_MIN,
+                        "maximum": SEARCH_LIMIT_MAX,
+                        "default": SEARCH_LIMIT_DEFAULT,
+                    }
                 },
                 "required": ["query"]
             }
@@ -184,38 +215,73 @@ fn tool_descriptor(name: &str) -> Value {
     }
 }
 
-/// `tools/call` dispatcher。本 PR では各 handler 未実装のため、すべて
-/// `not_implemented` の MCP tool error (= JSON-RPC 自体は success、
-/// `isError: true` の content を返す) を返す。
+/// `tools/call` dispatcher。
+///
+/// JSON-RPC 上は常に `success` で応答し、tool 失敗は MCP の `isError: true` content
+/// として返す (MCP spec: tool execution failure ≠ protocol error)。
+/// dispatch できない場合 (= name 欠落 / 未知 tool 名) のみ JSON-RPC `-32602` を返す。
 pub async fn call(
-    _state: AppState,
-    _user: AuthenticatedUser,
+    state: AppState,
+    user: AuthenticatedUser,
     id: Option<Value>,
     params: Value,
 ) -> JsonRpcResponse {
-    let name = match params.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
-        None => {
+    // MCP `tools/call` params must be a JSON object. Calling `.get("name")` on
+    // an array / string / null would silently return `None` and surface as a
+    // misleading "missing 'name'" error.
+    if !params.is_object() {
+        return JsonRpcResponse::error(id, -32602, "Invalid params: must be a JSON object");
+    }
+    let name = match params.get("name") {
+        None | Some(Value::Null) => {
             return JsonRpcResponse::error(id, -32602, "Invalid params: missing 'name'");
         }
+        Some(v) => match v.as_str() {
+            None => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "Invalid params: 'name' must be a string",
+                );
+            }
+            Some("") => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "Invalid params: 'name' must not be empty",
+                );
+            }
+            Some(s) => s.to_string(),
+        },
     };
-    if !TOOL_NAMES.contains(&name.as_str()) {
-        return JsonRpcResponse::error(
-            id,
-            -32602,
-            format!("Invalid params: unknown tool '{name}'"),
-        );
-    }
-    JsonRpcResponse::success(
-        id,
-        json!({
-            "content": [{
-                "type": "text",
-                "text": format!("tool '{name}' is registered but not yet implemented in this PR")
-            }],
-            "isError": true
-        }),
-    )
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let content = match name.as_str() {
+        "search" => handlers::search(&state, &user, args).await,
+        "get_schema" => handlers::get_schema(&state, &user).await,
+        other if TOOL_NAMES.contains(&other) => not_implemented_content(other),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("Invalid params: unknown tool '{name}'"),
+            );
+        }
+    };
+    JsonRpcResponse::success(id, content)
+}
+
+fn not_implemented_content(name: &str) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!("tool '{name}' is registered but not yet implemented"),
+        }],
+        "isError": true,
+    })
 }
 
 #[cfg(test)]
@@ -250,6 +316,102 @@ mod tests {
                 properties
             );
         }
+    }
+
+    use crate::test_support::{test_state, test_user};
+
+    #[tokio::test]
+    async fn call_missing_name_returns_minus_32602() {
+        let state = test_state().await;
+        let params = json!({ "arguments": {} });
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("missing"),
+            "got: {}",
+            v["error"]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn call_non_string_name_returns_type_error() {
+        // `{ "name": 1 }` を「missing 'name'」と返すと client が debug できない。
+        // 型エラーを区別する。
+        let state = test_state().await;
+        let params = json!({ "name": 1, "arguments": {} });
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("'name'") && msg.contains("string"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_non_object_params_returns_type_error() {
+        // `params` が array / string / null だと `.get("name")` が None になり
+        // 「missing 'name'」と返ってしまうので、ここで弾く。
+        for bad in [json!(["search"]), json!("search"), json!(null), json!(42)] {
+            let state = test_state().await;
+            let resp = call(state, test_user(), Some(json!(1)), bad.clone()).await;
+            let v = serde_json::to_value(resp).unwrap();
+            assert_eq!(v["error"]["code"], -32602, "input {bad:?} should be -32602");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("JSON object"),
+                "input {bad:?} expected shape error; got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn call_empty_string_name_returns_error() {
+        let state = test_state().await;
+        let params = json!({ "name": "", "arguments": {} });
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("empty"),
+            "got: {}",
+            v["error"]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn call_unknown_tool_returns_minus_32602() {
+        let state = test_state().await;
+        let params = json!({ "name": "no_such_tool", "arguments": {} });
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no_such_tool")
+        );
+    }
+
+    #[tokio::test]
+    async fn call_registered_but_unimplemented_tool_returns_iserror_content() {
+        // tools/list には載っているが本 PR ではまだ実装が無い tool は、
+        // JSON-RPC では success、tool 側で `isError: true` を返す。
+        // 「ingest」を例にとる (PR #16 で実装予定)。
+        let state = test_state().await;
+        let params = json!({ "name": "ingest", "arguments": {} });
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert!(
+            v["error"].is_null(),
+            "should be a tool error, not JSON-RPC error: {v}"
+        );
+        assert_eq!(v["result"]["isError"], true);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ingest") && text.contains("not yet implemented"));
     }
 
     #[test]
