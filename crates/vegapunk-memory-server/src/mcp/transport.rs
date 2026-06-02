@@ -237,55 +237,17 @@ async fn dispatch_one(state: AppState, user: AuthenticatedUser, req: JsonRpcRequ
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ServerConfig;
     use crate::state::AppState;
+    use crate::test_support::{test_state, test_user};
     use axum::Router;
     use axum::body::Body;
     use axum::http::Request;
-    use std::sync::Arc;
     use tower::ServiceExt;
-    use vegapunk_client::BearerAuthInterceptor;
-    use vegapunk_client::graphrag::graph_rag_engine_client::GraphRagEngineClient;
-    use vegapunk_memory_auth::jwt::JwtKeys;
-
-    async fn test_state() -> AppState {
-        let pool = vegapunk_memory_storage::pool::init_pool("sqlite::memory:")
-            .await
-            .unwrap();
-        let endpoint = tonic::transport::Endpoint::from_static("http://127.0.0.1:0");
-        let channel = endpoint.connect_lazy();
-        let interceptor = BearerAuthInterceptor::new("dummy").unwrap();
-        let vegapunk = GraphRagEngineClient::with_interceptor(channel, interceptor);
-        let cfg = ServerConfig {
-            database_url: "sqlite::memory:".into(),
-            bind_addr: "0.0.0.0:8081".into(),
-            public_url: "https://test.example.com".into(),
-            google_client_id: "id".into(),
-            google_client_secret: "s".into(),
-            vegapunk_grpc_endpoint: "http://127.0.0.1:0".into(),
-            vegapunk_bearer_token: "dummy".into(),
-            trusted_proxy_count: 1,
-        };
-        AppState {
-            pool,
-            vegapunk,
-            jwt_keys: JwtKeys::for_tests(),
-            cfg: Arc::new(cfg),
-        }
-    }
-
-    fn user() -> AuthenticatedUser {
-        AuthenticatedUser {
-            user_id: "u1".into(),
-            client_id: "c".into(),
-            vegapunk_schema: "u1-schema".into(),
-        }
-    }
 
     async fn invoke(state: AppState, body: Value) -> (axum::http::StatusCode, Value) {
         let app = Router::new()
             .route("/mcp", axum::routing::post(handle))
-            .layer(axum::Extension(user()))
+            .layer(axum::Extension(test_user()))
             .with_state(state);
         let req = Request::post("/mcp")
             .header("content-type", "application/json")
@@ -308,7 +270,7 @@ mod tests {
     async fn parse_error_returns_jsonrpc_envelope_with_null_id() {
         let app = Router::new()
             .route("/mcp", axum::routing::post(handle))
-            .layer(axum::Extension(user()))
+            .layer(axum::Extension(test_user()))
             .with_state(test_state().await);
         let req = Request::post("/mcp")
             .header("content-type", "application/json")

@@ -23,9 +23,11 @@ anyhow.workspace = true
 async-trait.workspace = true
 ulid.workspace = true
 url.workspace = true
-# tool handler が vegapunk gRPC を叩き、`tonic::Status` を MCP の isError content
-# にマップするため、production deps として transport feature だけ引き込む。
-tonic = { version = "0.12", default-features = false, features = ["transport"] }
+# production code は `tonic::Status` / `tonic::Code` (core types、feature gate 無し)
+# しか触らない。`transport` を release build に持ち込む必要は無いので
+# default-features = false で最小限に。test helpers が `tonic::transport::Endpoint`
+# を使うのは [dev-dependencies] 側で transport feature を足してカバーする。
+tonic = { version = "0.12", default-features = false }
 
 llm-memory-core = { path = "../llm-memory-core" }
 vegapunk-client = { path = "../vegapunk-client" }
@@ -35,3 +37,6 @@ vegapunk-memory-auth = { path = "../vegapunk-memory-auth" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }
+# test helpers (src/test_support.rs) で `tonic::transport::Endpoint::connect_lazy`
+# を使うため、tests のみ transport を有効化する。
+tonic = { version = "0.12", default-features = false, features = ["transport"] }

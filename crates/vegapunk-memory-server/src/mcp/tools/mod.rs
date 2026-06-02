@@ -318,50 +318,13 @@ mod tests {
         }
     }
 
-    async fn test_state() -> AppState {
-        use std::sync::Arc;
-        use vegapunk_client::BearerAuthInterceptor;
-        use vegapunk_client::graphrag::graph_rag_engine_client::GraphRagEngineClient;
-        use vegapunk_memory_auth::jwt::JwtKeys;
-
-        let pool = vegapunk_memory_storage::pool::init_pool("sqlite::memory:")
-            .await
-            .unwrap();
-        let endpoint = tonic::transport::Endpoint::from_static("http://127.0.0.1:0");
-        let channel = endpoint.connect_lazy();
-        let interceptor = BearerAuthInterceptor::new("dummy").unwrap();
-        let vegapunk = GraphRagEngineClient::with_interceptor(channel, interceptor);
-        let cfg = crate::config::ServerConfig {
-            database_url: "sqlite::memory:".into(),
-            bind_addr: "0.0.0.0:8081".into(),
-            public_url: "https://test.example.com".into(),
-            google_client_id: "id".into(),
-            google_client_secret: "s".into(),
-            vegapunk_grpc_endpoint: "http://127.0.0.1:0".into(),
-            vegapunk_bearer_token: "dummy".into(),
-            trusted_proxy_count: 1,
-        };
-        AppState {
-            pool,
-            vegapunk,
-            jwt_keys: JwtKeys::for_tests(),
-            cfg: Arc::new(cfg),
-        }
-    }
-
-    fn user() -> AuthenticatedUser {
-        AuthenticatedUser {
-            user_id: "u1".into(),
-            client_id: "c".into(),
-            vegapunk_schema: "u1-schema".into(),
-        }
-    }
+    use crate::test_support::{test_state, test_user};
 
     #[tokio::test]
     async fn call_missing_name_returns_minus_32602() {
         let state = test_state().await;
         let params = json!({ "arguments": {} });
-        let resp = call(state, user(), Some(json!(1)), params).await;
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
         let v = serde_json::to_value(resp).unwrap();
         assert_eq!(v["error"]["code"], -32602);
         assert!(
@@ -377,7 +340,7 @@ mod tests {
         // 型エラーを区別する。
         let state = test_state().await;
         let params = json!({ "name": 1, "arguments": {} });
-        let resp = call(state, user(), Some(json!(1)), params).await;
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
         let v = serde_json::to_value(resp).unwrap();
         assert_eq!(v["error"]["code"], -32602);
         let msg = v["error"]["message"].as_str().unwrap();
@@ -393,7 +356,7 @@ mod tests {
         // 「missing 'name'」と返ってしまうので、ここで弾く。
         for bad in [json!(["search"]), json!("search"), json!(null), json!(42)] {
             let state = test_state().await;
-            let resp = call(state, user(), Some(json!(1)), bad.clone()).await;
+            let resp = call(state, test_user(), Some(json!(1)), bad.clone()).await;
             let v = serde_json::to_value(resp).unwrap();
             assert_eq!(v["error"]["code"], -32602, "input {bad:?} should be -32602");
             let msg = v["error"]["message"].as_str().unwrap();
@@ -408,7 +371,7 @@ mod tests {
     async fn call_empty_string_name_returns_error() {
         let state = test_state().await;
         let params = json!({ "name": "", "arguments": {} });
-        let resp = call(state, user(), Some(json!(1)), params).await;
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
         let v = serde_json::to_value(resp).unwrap();
         assert_eq!(v["error"]["code"], -32602);
         assert!(
@@ -422,7 +385,7 @@ mod tests {
     async fn call_unknown_tool_returns_minus_32602() {
         let state = test_state().await;
         let params = json!({ "name": "no_such_tool", "arguments": {} });
-        let resp = call(state, user(), Some(json!(1)), params).await;
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
         let v = serde_json::to_value(resp).unwrap();
         assert_eq!(v["error"]["code"], -32602);
         assert!(
@@ -440,7 +403,7 @@ mod tests {
         // 「ingest」を例にとる (PR #16 で実装予定)。
         let state = test_state().await;
         let params = json!({ "name": "ingest", "arguments": {} });
-        let resp = call(state, user(), Some(json!(1)), params).await;
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
         let v = serde_json::to_value(resp).unwrap();
         assert!(
             v["error"].is_null(),

@@ -13,3 +13,6 @@ pub mod app;
 pub mod config;
 pub mod mcp;
 pub mod state;
+
+#[cfg(test)]
+mod test_support;
