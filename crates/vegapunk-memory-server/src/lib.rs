@@ -9,5 +9,6 @@
 //! 詳細仕様 doc は別 PR で `docs/superpowers/specs/` 配下に起こす予定。
 //! 本 PR は skeleton のみで、tool handler / HTTP transport は後続 PR で追加する。
 
+pub mod app;
 pub mod config;
 pub mod state;

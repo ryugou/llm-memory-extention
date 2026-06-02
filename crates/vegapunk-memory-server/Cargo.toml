@@ -25,9 +25,11 @@ ulid.workspace = true
 url.workspace = true
 
 llm-memory-core = { path = "../llm-memory-core" }
-llm-memory-auth = { path = "../llm-memory-auth" }
 vegapunk-client = { path = "../vegapunk-client" }
 vegapunk-memory-storage = { path = "../vegapunk-memory-storage" }
+vegapunk-memory-auth = { path = "../vegapunk-memory-auth" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+tonic = { version = "0.12", default-features = false, features = ["transport"] }
