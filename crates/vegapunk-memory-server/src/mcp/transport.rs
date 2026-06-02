@@ -183,9 +183,18 @@ pub async fn handle(
 
 async fn dispatch_one(state: AppState, user: AuthenticatedUser, req: JsonRpcRequest) -> Outcome {
     let id = req.id.clone();
-    if id.is_none() {
+    let is_notification = id.is_none();
+
+    // MCP lifecycle notifications (`notifications/initialized`,
+    // `notifications/cancelled`, ...) are fire-and-forget per JSON-RPC §4.1 /
+    // MCP spec: log only, never produce a response. We don't currently act on
+    // any of them (cancellation will land with the tool handlers in the next
+    // PR), so this is intentionally an ack-only path.
+    if req.method.starts_with("notifications/") {
+        tracing::debug!(method = %req.method, "MCP notification received (ack only)");
         return Outcome::Notification;
     }
+
     let response = match req.method.as_str() {
         "initialize" => JsonRpcResponse::success(
             id,
@@ -200,7 +209,14 @@ async fn dispatch_one(state: AppState, user: AuthenticatedUser, req: JsonRpcRequ
         "tools/call" => crate::mcp::tools::call(state, user, id, req.params).await,
         _ => JsonRpcResponse::error(id, -32601, "Method not found"),
     };
-    Outcome::Response(response)
+
+    // JSON-RPC §4.1: a request with no `id` is a Notification — the method
+    // still ran above, but we MUST NOT return a Response object.
+    if is_notification {
+        Outcome::Notification
+    } else {
+        Outcome::Response(response)
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +350,35 @@ mod tests {
     async fn notification_returns_202_with_no_body() {
         // id 省略 = notification → response 無し、HTTP 202
         let body = json!({"jsonrpc":"2.0","method":"initialize"});
+        let (status, v) = invoke(test_state().await, body).await;
+        assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+        assert!(v.is_null());
+    }
+
+    #[tokio::test]
+    async fn mcp_notifications_namespace_is_accepted_without_response() {
+        // MCP lifecycle messages (`notifications/initialized`,
+        // `notifications/cancelled`) come in via `/mcp` as JSON-RPC
+        // notifications — server must ack with 202 and produce no response.
+        for method in ["notifications/initialized", "notifications/cancelled"] {
+            let body = json!({"jsonrpc":"2.0","method":method});
+            let (status, v) = invoke(test_state().await, body).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::ACCEPTED,
+                "method {method} should return 202"
+            );
+            assert!(v.is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_with_only_notifications_returns_202() {
+        // Batch entirely of notifications → no responses → 202.
+        let body = json!([
+            {"jsonrpc":"2.0","method":"notifications/initialized"},
+            {"jsonrpc":"2.0","method":"ping"}
+        ]);
         let (status, v) = invoke(test_state().await, body).await;
         assert_eq!(status, axum::http::StatusCode::ACCEPTED);
         assert!(v.is_null());

@@ -119,7 +119,7 @@ fn tool_descriptor(name: &str) -> Value {
         }),
         "get_schema" => json!({
             "name": "get_schema",
-            "description": "Get schema definition by name (vegapunk GetSchema RPC).",
+            "description": "Get the active schema definition for the authenticated user (vegapunk GetSchema RPC). The schema name is injected server-side from the user's tenant, so this tool takes no arguments.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         "list_schemas" => json!({
@@ -152,13 +152,17 @@ fn tool_descriptor(name: &str) -> Value {
         }),
         "get_job_status" => json!({
             "name": "get_job_status",
-            "description": "Get the status of an ingest job by msg_id or job_id (vegapunk GetJobStatus RPC).",
+            "description": "Get the status of an ingest job by msg_id or job_id (vegapunk GetJobStatus RPC). At least one of msg_id / job_id is required.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "msg_id": {"type": "string"},
                     "job_id": {"type": "string"}
-                }
+                },
+                "anyOf": [
+                    {"required": ["msg_id"]},
+                    {"required": ["job_id"]}
+                ]
             }
         }),
         "get_traceable_chain" => json!({
@@ -246,5 +250,26 @@ mod tests {
                 properties
             );
         }
+    }
+
+    #[test]
+    fn get_job_status_requires_at_least_one_identifier() {
+        // msg_id / job_id どちらか必須を anyOf で表現していることを保証。
+        // 「{} で通る」抜け穴を防ぐ。
+        let v = tool_descriptor("get_job_status");
+        let any_of = v["inputSchema"]["anyOf"].as_array().unwrap();
+        let required_sets: Vec<Vec<String>> = any_of
+            .iter()
+            .map(|branch| {
+                branch["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect();
+        assert!(required_sets.contains(&vec!["msg_id".to_string()]));
+        assert!(required_sets.contains(&vec!["job_id".to_string()]));
     }
 }
