@@ -9,11 +9,12 @@ pub struct User {
     pub provider: String,
     pub subject: String,
     pub email: Option<String>,
-    /// 対応する vegapunk schema 名。初回 OAuth callback で
-    /// `user-{google_subject}` 形式 (現状 Google 以外の provider は無いので
-    /// provider prefix は付けない) に自動生成される (`find_or_provision`)。
-    /// 将来 Google 以外の provider を追加する場合は `user-{provider}-{subject}`
-    /// 形に拡張して衝突を防ぐこと。
+    /// 対応する vegapunk schema 名。`find_or_provision` は **呼び出し側
+    /// (OAuth callback) が決めた schema 名** を新規時のみ保存するだけで、
+    /// 名前自体は生成しない。現状 OAuth callback は `user-{google_subject}`
+    /// 形 (= Google 以外の provider が無いので provider prefix を省略) で
+    /// 渡す。将来 Google 以外の provider を追加する場合は
+    /// `user-{provider}-{subject}` 形に拡張して衝突を防ぐこと。
     /// 一度作られたら user 自身が動かす API は無く、middleware が tool 呼び
     /// 出し時の cross-tenant guard としてこの値を強制注入する。
     pub vegapunk_schema: String,
@@ -86,8 +87,8 @@ pub async fn insert(
 ///
 /// `id` / `vegapunk_schema` は **新規時のみ** 使われ、既存行は値が違っても
 /// 上書きしない (= schema の名前変更は別 API。ここで上書きすると wrapper の
-/// 強制注入 schema が user 操作で書き換わる事故になる)。`email` は新規時の
-/// み記録。
+/// 強制注入 schema が user 操作で書き換わる事故になる)。`email` も新規時のみ
+/// 記録。
 ///
 /// 同じ未登録 user が 2 つの OAuth callback でほぼ同時に来た場合の race を
 /// 吸収するため、`SELECT` → 無ければ `INSERT ... ON CONFLICT(provider, subject)

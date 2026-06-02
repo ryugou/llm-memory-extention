@@ -1,9 +1,12 @@
 //! `SchemaProvisioner` の vegapunk gRPC 実装。
 //!
-//! 初回 OAuth callback で `authorization_server::callback_google` から呼ばれ、
-//! 個人 schema (`user-{sub}`) と shared schema (`sivira-shared`) を idempotent
-//! に作成する。`AlreadyExists` は成功扱いに丸めるので、同じユーザの再 sign-in
-//! や複数ユーザによる shared schema 作成競合があっても OAuth フローは止まらない。
+//! `authorization_server::callback_google` は **OAuth callback ごとに**
+//! (新規ユーザだけでなく既存ユーザの再 sign-in でも) 個人 schema
+//! (`user-{sub}`) と shared schema (`sivira-shared`) に対して
+//! `ensure_schema` を呼ぶ。gRPC リクエスト自体は毎回送るが、本 impl は
+//! `AlreadyExists` を `Ok(())` に丸めるので結果は idempotent ―
+//! 同じユーザの再 sign-in や複数ユーザによる shared schema 作成競合が
+//! あっても OAuth フローは止まらない。
 //!
 //! template 名 (= 個人 schema を新規作成する際の vegapunk SchemaTemplate)
 //! は `ServerConfig.default_schema_template` で env から指定する

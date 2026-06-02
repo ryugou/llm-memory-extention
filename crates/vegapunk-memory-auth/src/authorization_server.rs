@@ -177,9 +177,10 @@ pub struct AsState {
     pub trusted_proxy_count: usize,
     /// 初回 OAuth callback で呼ぶ vegapunk schema provisioning hook。
     pub provisioner: Arc<dyn SchemaProvisioner>,
-    /// 全 user で共有する schema 名 (例: `sivira-shared`)。callback で
-    /// 初回 user 毎に idempotent に ensure される (= 最初の user の sign-in
-    /// で created、以降は exists 扱いで skip)。
+    /// 全 user で共有する schema 名 (例: `sivira-shared`)。callback ごとに
+    /// `ensure_schema` を呼ぶ (= 既存ユーザの再 sign-in でも毎回叩く)。
+    /// gRPC 自体は毎回走るが、provisioner 側で `AlreadyExists` を `Ok` に
+    /// 丸めるので結果は idempotent。
     pub shared_schema: String,
     sessions: InMemorySessions,
 }

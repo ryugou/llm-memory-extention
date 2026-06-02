@@ -61,13 +61,19 @@ impl ServerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1),
+            // 値自体も trim して持つ: env で先頭末尾に空白が紛れていても
+            // そのまま vegapunk へ渡さない (= "  sivira-shared  " のような
+            // 値が schema 名として保存されると vegapunk 側で別 schema 扱いに
+            // なって idempotent ensure_schema が壊れる)。
             shared_schema_name: std::env::var("VEGAPUNK_SHARED_SCHEMA_NAME")
                 .ok()
-                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "sivira-shared".to_string()),
             default_schema_template: std::env::var("VEGAPUNK_DEFAULT_SCHEMA_TEMPLATE")
                 .ok()
-                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "discussion".to_string()),
         })
     }
