@@ -39,10 +39,13 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn from_env() -> Result<Self> {
+        // `PUBLIC_URL` は末尾 `/` を取り除いて正規化する (詳細は
+        // `normalize_public_url` を参照)。
+        let public_url = normalize_public_url(env_required("PUBLIC_URL")?);
         Ok(Self {
             database_url: env_required("DATABASE_URL")?,
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string()),
-            public_url: env_required("PUBLIC_URL")?,
+            public_url,
             google_client_id: env_required("GOOGLE_OAUTH_CLIENT_ID")?,
             google_client_secret: env_required("GOOGLE_OAUTH_CLIENT_SECRET")?,
             vegapunk_grpc_endpoint: env_required("VEGAPUNK_GRPC_ENDPOINT")?,
@@ -55,6 +58,18 @@ impl ServerConfig {
     }
 }
 
+/// `PUBLIC_URL` の正規化: 末尾 `/` を取り除く。
+///
+/// 残したまま OAuth の redirect URI や issuer 文字列に `format!` で連結すると
+/// `https://host//oauth/callback/google` の double-slash になり、Google OAuth
+/// client 側に登録された redirect URI とマッチしないなどの紛らわしい failure
+/// を生む。`AsState::new` 側でも同じ正規化が行われるが、`ServerConfig` 自体の
+/// 値も Google redirect URI 構築に使われる (`app::build_router` 内) ため
+/// `from_env` の入口で一元的に正規化しておく。
+fn normalize_public_url(raw: String) -> String {
+    raw.trim_end_matches('/').to_string()
+}
+
 fn env_required(key: &str) -> Result<String> {
     let value = std::env::var(key).with_context(|| format!("missing required env var: {key}"))?;
     // 空文字 / whitespace-only な値は実用的には未設定と等価で、後段の API 呼び出しで
@@ -64,4 +79,36 @@ fn env_required(key: &str) -> Result<String> {
         anyhow::bail!("required env var {key} is empty or whitespace-only");
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_public_url;
+
+    /// `from_env` が経由する `normalize_public_url` を直接呼んで、
+    /// trailing slash が削られることを保証する (= 関数本体を消すと test が
+    /// fail することで回帰検知できる)。
+    #[test]
+    fn normalize_public_url_strips_single_trailing_slash() {
+        assert_eq!(
+            normalize_public_url("https://vegapunk-host.example.com/".into()),
+            "https://vegapunk-host.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_public_url_strips_multiple_trailing_slashes() {
+        assert_eq!(
+            normalize_public_url("https://vegapunk-host.example.com///".into()),
+            "https://vegapunk-host.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_public_url_passthrough_when_no_trailing_slash() {
+        assert_eq!(
+            normalize_public_url("https://vegapunk-host.example.com".into()),
+            "https://vegapunk-host.example.com"
+        );
+    }
 }
