@@ -8,11 +8,16 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    routing::{get, post},
+};
 
 use vegapunk_memory_auth::jwt::JwtKeys;
+use vegapunk_memory_auth::middleware::{AuthState, require_auth};
 
 use crate::config::ServerConfig;
+use crate::mcp;
 use crate::state::AppState;
 
 /// 起動時 state を組み立てる。
@@ -21,9 +26,10 @@ use crate::state::AppState;
 /// - JWT 鍵は caller (`main`) から渡す (= startup 失敗の局所化)
 pub async fn build_state(cfg: ServerConfig, jwt_keys: JwtKeys) -> Result<AppState> {
     let pool = vegapunk_memory_storage::pool::init_pool(&cfg.database_url).await?;
-    let vegapunk = vegapunk_client::connect(&cfg.vegapunk_grpc_endpoint, &cfg.vegapunk_bearer_token)
-        .await
-        .map_err(|e| anyhow::anyhow!("vegapunk gRPC connect failed: {e}"))?;
+    let vegapunk =
+        vegapunk_client::connect(&cfg.vegapunk_grpc_endpoint, &cfg.vegapunk_bearer_token)
+            .await
+            .map_err(|e| anyhow::anyhow!("vegapunk gRPC connect failed: {e}"))?;
     Ok(AppState {
         pool,
         vegapunk,
@@ -41,8 +47,8 @@ pub async fn build_state(cfg: ServerConfig, jwt_keys: JwtKeys) -> Result<AppStat
 ///   `/oauth/authorize`, `/oauth/callback/google`, `/oauth/token`,
 ///   `/oauth/revoke`
 ///
-/// MCP `/mcp` および account 操作系 (= JWT 認証必須) は次 PR で
-/// `route_layer(require_auth)` 配下に追加する。
+/// 認証必須エンドポイント (`route_layer(require_auth)` 配下):
+/// - `POST /mcp`: MCP Streamable HTTP transport
 pub fn build_router(state: AppState) -> Router {
     // OAuth Authorization Server は独自の AsState を持つ別 router として組む。
     let google = Arc::new(vegapunk_memory_auth::google::GoogleClient::new(
@@ -61,8 +67,18 @@ pub fn build_router(state: AppState) -> Router {
     );
     let as_router = vegapunk_memory_auth::authorization_server::router().with_state(as_state);
 
+    let auth_state = AuthState::new(state.jwt_keys.clone(), state.pool.clone());
+    let protected_router = Router::new()
+        .route("/mcp", post(mcp::transport::handle))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            require_auth,
+        ))
+        .with_state(state.clone());
+
     Router::new()
         .merge(as_router)
+        .merge(protected_router)
         .route("/healthz", get(healthz))
         .with_state(state)
 }
@@ -121,6 +137,24 @@ mod tests {
         assert_eq!(res.status(), 200);
         let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn mcp_endpoint_requires_auth() {
+        // 認証ヘッダ無しで /mcp を叩いたら 401。 protected_router が
+        // require_auth middleware 配下に置かれていることの保証。
+        let state = test_state().await;
+        let router = build_router(state);
+        let res = router
+            .oneshot(
+                Request::post("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
     }
 
     #[tokio::test]

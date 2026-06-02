@@ -86,16 +86,16 @@ impl GoogleClient {
                     // を経由して型変換する。
                     let method = reqwest::Method::from_bytes(request.method.as_str().as_bytes())
                         .expect("oauth2 always passes valid HTTP method bytes");
-                    let mut builder =
-                        http.request(method, request.url.as_str()).body(request.body);
+                    let mut builder = http
+                        .request(method, request.url.as_str())
+                        .body(request.body);
                     for (name, value) in &request.headers {
                         builder = builder.header(name.as_str(), value.as_bytes());
                     }
                     let req = builder.build()?;
                     let resp = http.execute(req).await?;
-                    let status =
-                        oauth2::http::StatusCode::from_u16(resp.status().as_u16())
-                            .expect("reqwest StatusCode is always valid http 0.x StatusCode");
+                    let status = oauth2::http::StatusCode::from_u16(resp.status().as_u16())
+                        .expect("reqwest StatusCode is always valid http 0.x StatusCode");
                     let mut oauth_headers = oauth2::http::HeaderMap::new();
                     for (name, value) in resp.headers() {
                         if let (Ok(n), Ok(v)) = (
