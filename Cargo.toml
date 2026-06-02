@@ -9,6 +9,7 @@ members = [
     "crates/llm-memory-server",
     "crates/vegapunk-client",
     "crates/vegapunk-memory-storage",
+    "crates/vegapunk-memory-auth",
     "crates/vegapunk-memory-server",
 ]
 

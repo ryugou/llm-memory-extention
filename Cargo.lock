@@ -3202,6 +3202,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "vegapunk-memory-auth"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "axum-extra",
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "llm-memory-core",
+ "oauth2",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+ "url",
+ "vegapunk-memory-storage",
+]
+
+[[package]]
 name = "vegapunk-memory-server"
 version = "0.0.0"
 dependencies = [
