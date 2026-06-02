@@ -23,6 +23,16 @@ pub(super) const SEARCH_LIMIT_DEFAULT: i32 = 10;
 pub(super) const SEARCH_VALID_MODES: &[&str] = &["local", "global", "hybrid"];
 pub(super) const SEARCH_MODE_DEFAULT: &str = "hybrid";
 
+// `query_nodes` tool 契約。schema と runtime validation を一致させる。
+pub(super) const QUERY_NODES_LIMIT_MIN: i64 = 1;
+pub(super) const QUERY_NODES_LIMIT_MAX: i64 = 1000;
+pub(super) const QUERY_NODES_LIMIT_DEFAULT: i32 = 50;
+pub(super) const QUERY_NODES_VALID_SORT_ORDERS: &[&str] = &["asc", "desc"];
+pub(super) const QUERY_NODES_SORT_ORDER_DEFAULT: &str = "desc";
+
+// `AttributeFilter.op` の許容セット (query_nodes / stats 共通)。
+pub(super) const ATTRIBUTE_FILTER_VALID_OPS: &[&str] = &["eq", "gt", "gte", "lt", "lte"];
+
 /// vegapunk wrapper として公開する tool 名の集合。
 /// 「公開しない vegapunk RPC」(= UpsertNodes / Reingest / Rebuild / Migrate /
 /// PurgeRawMessages / SetMaintenanceMode 等の admin) は意図的に外す。
@@ -167,26 +177,40 @@ fn tool_descriptor(name: &str) -> Value {
         }),
         "query_nodes" => json!({
             "name": "query_nodes",
-            "description": "List nodes by type with attribute filters (vegapunk QueryNodes RPC).",
+            "description": "List nodes by type with optional attribute filters (vegapunk QueryNodes RPC). Filters are AND-combined.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "node_type": {"type": "string"},
+                    "node_type": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S",
+                        "description": "Node type to list (e.g. \"Message\", \"Person\", \"Decision\")."
+                    },
                     "filters": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "key": {"type": "string"},
-                                "op": {"type": "string", "enum": ["eq", "gt", "gte", "lt", "lte"]},
+                                "key": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                                "op": {"type": "string", "enum": ATTRIBUTE_FILTER_VALID_OPS},
                                 "value": {"type": "string"}
                             },
                             "required": ["key", "op", "value"]
                         }
                     },
-                    "sort_by": {"type": "string"},
-                    "sort_order": {"type": "string", "enum": ["asc", "desc"], "default": "desc"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 50},
+                    "sort_by": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                    "sort_order": {
+                        "type": "string",
+                        "enum": QUERY_NODES_VALID_SORT_ORDERS,
+                        "default": QUERY_NODES_SORT_ORDER_DEFAULT,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": QUERY_NODES_LIMIT_MIN,
+                        "maximum": QUERY_NODES_LIMIT_MAX,
+                        "default": QUERY_NODES_LIMIT_DEFAULT,
+                    },
                     "offset": {"type": "integer", "minimum": 0, "default": 0}
                 },
                 "required": ["node_type"]
@@ -199,16 +223,28 @@ fn tool_descriptor(name: &str) -> Value {
         }),
         "list_schemas" => json!({
             "name": "list_schemas",
-            "description": "List all available schemas (vegapunk ListSchemas RPC).",
+            "description": "List schemas visible to the authenticated user (vegapunk ListSchemas RPC, filtered server-side to the user's tenant — other tenants' schemas are never returned).",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         "stats" => json!({
             "name": "stats",
-            "description": "Get knowledge graph statistics (vegapunk GetStats RPC).",
+            "description": "Get knowledge graph statistics for the authenticated user's schema (vegapunk GetStats RPC). Optional node_type and filters narrow node_count to a subset.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "node_type": {"type": "string"}
+                    "node_type": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                    "filters": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                                "op": {"type": "string", "enum": ATTRIBUTE_FILTER_VALID_OPS},
+                                "value": {"type": "string"}
+                            },
+                            "required": ["key", "op", "value"]
+                        }
+                    }
                 }
             }
         }),
@@ -308,6 +344,9 @@ pub async fn call(
         "get_schema" => handlers::get_schema(&state, &user).await,
         "ingest" => handlers::ingest(&state, &user, args).await,
         "ingest_raw" => handlers::ingest_raw(&state, &user, args).await,
+        "query_nodes" => handlers::query_nodes(&state, &user, args).await,
+        "list_schemas" => handlers::list_schemas(&state, &user).await,
+        "stats" => handlers::stats(&state, &user, args).await,
         other if TOOL_NAMES.contains(&other) => not_implemented_content(other),
         _ => {
             return JsonRpcResponse::error(
@@ -446,9 +485,9 @@ mod tests {
     async fn call_registered_but_unimplemented_tool_returns_iserror_content() {
         // tools/list には載っているが本 PR 時点で未実装の tool は、
         // JSON-RPC では success、tool 側で `isError: true` を返す。
-        // PR #17 で実装予定の `query_nodes` を例に取る。
+        // PR #18 で実装予定の `feedback` を例に取る。
         let state = test_state().await;
-        let params = json!({ "name": "query_nodes", "arguments": {} });
+        let params = json!({ "name": "feedback", "arguments": {} });
         let resp = call(state, test_user(), Some(json!(1)), params).await;
         let v = serde_json::to_value(resp).unwrap();
         assert!(
@@ -457,7 +496,20 @@ mod tests {
         );
         assert_eq!(v["result"]["isError"], true);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("query_nodes") && text.contains("not yet implemented"));
+        assert!(text.contains("feedback") && text.contains("not yet implemented"));
+    }
+
+    #[tokio::test]
+    async fn call_routes_query_nodes_into_handler_and_surfaces_validation_error() {
+        let state = test_state().await;
+        let params = json!({ "name": "query_nodes", "arguments": {} });
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert!(v["error"].is_null(), "expected tool error, got: {v}");
+        assert_eq!(v["result"]["isError"], true);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("query_nodes"), "got: {text}");
+        assert!(text.contains("node_type"), "got: {text}");
     }
 
     #[tokio::test]
