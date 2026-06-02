@@ -14,6 +14,15 @@ use vegapunk_memory_auth::middleware::AuthenticatedUser;
 
 mod handlers;
 
+// `search` tool の入出力契約。`tool_descriptor("search")` の inputSchema と
+// `handlers::build_search_request` の runtime validation が同じ値を見るために
+// ここを single source of truth にする。
+pub(super) const SEARCH_LIMIT_MIN: i64 = 1;
+pub(super) const SEARCH_LIMIT_MAX: i64 = 100;
+pub(super) const SEARCH_LIMIT_DEFAULT: i32 = 10;
+pub(super) const SEARCH_VALID_MODES: &[&str] = &["local", "global", "hybrid"];
+pub(super) const SEARCH_MODE_DEFAULT: &str = "hybrid";
+
 /// vegapunk wrapper として公開する tool 名の集合。
 /// 「公開しない vegapunk RPC」(= UpsertNodes / Reingest / Rebuild / Migrate /
 /// PurgeRawMessages / SetMaintenanceMode 等の admin) は意図的に外す。
@@ -53,8 +62,17 @@ fn tool_descriptor(name: &str) -> Value {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "mode": {"type": "string", "enum": ["local", "global", "hybrid"], "default": "hybrid"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+                    "mode": {
+                        "type": "string",
+                        "enum": SEARCH_VALID_MODES,
+                        "default": SEARCH_MODE_DEFAULT,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": SEARCH_LIMIT_MIN,
+                        "maximum": SEARCH_LIMIT_MAX,
+                        "default": SEARCH_LIMIT_DEFAULT,
+                    }
                 },
                 "required": ["query"]
             }
@@ -199,11 +217,27 @@ pub async fn call(
     id: Option<Value>,
     params: Value,
 ) -> JsonRpcResponse {
-    let name = match params.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
-        None => {
+    let name = match params.get("name") {
+        None | Some(Value::Null) => {
             return JsonRpcResponse::error(id, -32602, "Invalid params: missing 'name'");
         }
+        Some(v) => match v.as_str() {
+            None => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "Invalid params: 'name' must be a string",
+                );
+            }
+            Some("") => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "Invalid params: 'name' must not be empty",
+                );
+            }
+            Some(s) => s.to_string(),
+        },
     };
     let args = params
         .get("arguments")
@@ -315,7 +349,41 @@ mod tests {
         let resp = call(state, user(), Some(json!(1)), params).await;
         let v = serde_json::to_value(resp).unwrap();
         assert_eq!(v["error"]["code"], -32602);
-        assert!(v["error"]["message"].as_str().unwrap().contains("'name'"));
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("missing"),
+            "got: {}",
+            v["error"]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn call_non_string_name_returns_type_error() {
+        // `{ "name": 1 }` を「missing 'name'」と返すと client が debug できない。
+        // 型エラーを区別する。
+        let state = test_state().await;
+        let params = json!({ "name": 1, "arguments": {} });
+        let resp = call(state, user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("'name'") && msg.contains("string"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_empty_string_name_returns_error() {
+        let state = test_state().await;
+        let params = json!({ "name": "", "arguments": {} });
+        let resp = call(state, user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("empty"),
+            "got: {}",
+            v["error"]["message"]
+        );
     }
 
     #[tokio::test]

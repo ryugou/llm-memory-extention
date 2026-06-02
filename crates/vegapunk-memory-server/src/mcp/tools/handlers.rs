@@ -19,15 +19,10 @@ use vegapunk_memory_auth::middleware::AuthenticatedUser;
 
 use crate::state::AppState;
 
-/// `tools/list` advertised contract for `search.limit` / `search.mode`. Keep in
-/// sync with `tool_descriptor("search").inputSchema.properties.{limit,mode}`
-/// in `crate::mcp::tools::tool_descriptor` so the schema and the runtime
-/// validation don't drift.
-const SEARCH_LIMIT_MIN: i64 = 1;
-const SEARCH_LIMIT_MAX: i64 = 100;
-const SEARCH_LIMIT_DEFAULT: i32 = 10;
-const SEARCH_VALID_MODES: &[&str] = &["local", "global", "hybrid"];
-const SEARCH_MODE_DEFAULT: &str = "hybrid";
+use super::{
+    SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN, SEARCH_MODE_DEFAULT,
+    SEARCH_VALID_MODES,
+};
 
 /// `search` argument を `SearchRequest` に詰める。`schema` は `user_schema` で
 /// 強制上書きするので、`arguments` に schema 指定があっても無視する。
@@ -35,11 +30,18 @@ pub(super) fn build_search_request(
     user_schema: &str,
     args: &Value,
 ) -> Result<SearchRequest, String> {
+    // `arguments` は MCP spec で object と決まっている。client が string/array/null
+    // を渡してきた場合に「missing required argument」と言うのは誤導になるので
+    // 早めに shape を弾く。
+    let args = args
+        .as_object()
+        .ok_or_else(|| "'arguments' must be a JSON object".to_string())?;
     let text = args
         .get("query")
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "missing required argument: 'query'".to_string())?
+        .ok_or_else(|| "missing or empty required argument: 'query'".to_string())?
         .to_string();
     // `tools/list` advertises mode as enum {local, global, hybrid} with default
     // "hybrid"; vegapunk's SearchRequest.mode defaults to "local". The wrapper
@@ -327,6 +329,32 @@ mod tests {
         // 空文字を許すと vegapunk 側で意味の無い query が走ってリソースを食う。
         let err = build_search_request("t", &json!({"query": ""})).unwrap_err();
         assert!(err.contains("query"));
+    }
+
+    #[test]
+    fn search_request_rejects_whitespace_only_query() {
+        // " \t\n" 等の空白だけのクエリも実質的に空。trim してから判定する。
+        let err = build_search_request("t", &json!({"query": "   \t\n"})).unwrap_err();
+        assert!(err.contains("query"), "got: {err}");
+    }
+
+    #[test]
+    fn search_request_trims_surrounding_whitespace_in_query() {
+        let req = build_search_request("t", &json!({"query": "  hello world  "})).unwrap();
+        assert_eq!(req.text, "hello world");
+    }
+
+    #[test]
+    fn search_request_rejects_non_object_arguments() {
+        // MCP spec: tools/call の arguments は object。string/array/null を渡された
+        // ら "missing required argument" ではなく shape error として返す。
+        for bad in [json!("oops"), json!([1, 2]), json!(null), json!(42)] {
+            let err = build_search_request("t", &bad).unwrap_err();
+            assert!(
+                err.contains("'arguments'") && err.contains("object"),
+                "input {bad:?} should be rejected as wrong-shape; got: {err}"
+            );
+        }
     }
 
     #[test]
