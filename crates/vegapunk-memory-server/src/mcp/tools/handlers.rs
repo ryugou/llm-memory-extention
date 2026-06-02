@@ -19,6 +19,12 @@ use vegapunk_memory_auth::middleware::AuthenticatedUser;
 
 use crate::state::AppState;
 
+/// `tools/list` advertised range for `search.limit` (`top_k`). Keep in sync
+/// with `tool_descriptor("search").inputSchema.properties.limit` in
+/// `crate::mcp::tools::tool_descriptor`.
+const SEARCH_LIMIT_MIN: i64 = 1;
+const SEARCH_LIMIT_MAX: i64 = 100;
+
 /// `search` argument を `SearchRequest` に詰める。`schema` は `user_schema` で
 /// 強制上書きするので、`arguments` に schema 指定があっても無視する。
 pub(super) fn build_search_request(
@@ -40,7 +46,26 @@ pub(super) fn build_search_request(
             .unwrap_or("hybrid")
             .to_string(),
     );
-    let top_k = args.get("limit").and_then(Value::as_i64).map(|n| n as i32);
+    // `tools/list` advertises `limit: integer, minimum 1, maximum 100`. JSON
+    // Schema validation lives client-side, so the wrapper has to enforce the
+    // contract too — naïve `as i32` would silently wrap negatives / huge
+    // numbers and send a nonsense `top_k` to vegapunk.
+    let top_k = match args.get("limit") {
+        None => None,
+        Some(Value::Null) => None,
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| "'limit' must be an integer".to_string())?;
+            if !(SEARCH_LIMIT_MIN..=SEARCH_LIMIT_MAX).contains(&n) {
+                return Err(format!(
+                    "'limit' must be between {SEARCH_LIMIT_MIN} and {SEARCH_LIMIT_MAX}, got {n}"
+                ));
+            }
+            // bounds-checked above, so the i32 cast is safe.
+            Some(n as i32)
+        }
+    };
     Ok(SearchRequest {
         text,
         filter: None,
@@ -183,6 +208,47 @@ mod tests {
         // "local" なので、wrapper が明示的に "hybrid" を埋める必要がある。
         let req = build_search_request("t", &json!({"query": "q"})).unwrap();
         assert_eq!(req.mode.as_deref(), Some("hybrid"));
+    }
+
+    #[test]
+    fn search_request_rejects_negative_limit() {
+        let err = build_search_request("t", &json!({"query":"q","limit":-1})).unwrap_err();
+        assert!(err.contains("'limit'"), "got: {err}");
+    }
+
+    #[test]
+    fn search_request_rejects_limit_above_max() {
+        let err = build_search_request("t", &json!({"query":"q","limit":101})).unwrap_err();
+        assert!(err.contains("100"), "got: {err}");
+    }
+
+    #[test]
+    fn search_request_rejects_huge_limit_no_silent_wrap() {
+        // 2^40 を `as i32` で wrap させない (= 元値が範囲外なら range error)。
+        let err = build_search_request("t", &json!({"query":"q","limit":1_099_511_627_776_i64}))
+            .unwrap_err();
+        assert!(err.contains("'limit'"), "got: {err}");
+    }
+
+    #[test]
+    fn search_request_rejects_non_integer_limit() {
+        let err = build_search_request("t", &json!({"query":"q","limit":"ten"})).unwrap_err();
+        assert!(err.contains("integer"), "got: {err}");
+    }
+
+    #[test]
+    fn search_request_accepts_null_limit_as_omitted() {
+        // JSON null は省略と同じ扱い: top_k は None。
+        let req = build_search_request("t", &json!({"query":"q","limit":null})).unwrap();
+        assert_eq!(req.top_k, None);
+    }
+
+    #[test]
+    fn search_request_accepts_boundary_limit() {
+        let req_min = build_search_request("t", &json!({"query":"q","limit":1})).unwrap();
+        assert_eq!(req_min.top_k, Some(1));
+        let req_max = build_search_request("t", &json!({"query":"q","limit":100})).unwrap();
+        assert_eq!(req_max.top_k, Some(100));
     }
 
     #[test]
