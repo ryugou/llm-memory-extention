@@ -14,16 +14,20 @@
 
 use serde_json::{Value, json};
 
-use vegapunk_client::graphrag::{GetSchemaRequest, SearchRequest};
+use vegapunk_client::graphrag::{GetSchemaRequest, SearchRequest, SearchResultItem};
 use vegapunk_memory_auth::middleware::AuthenticatedUser;
 
 use crate::state::AppState;
 
-/// `tools/list` advertised range for `search.limit` (`top_k`). Keep in sync
-/// with `tool_descriptor("search").inputSchema.properties.limit` in
-/// `crate::mcp::tools::tool_descriptor`.
+/// `tools/list` advertised contract for `search.limit` / `search.mode`. Keep in
+/// sync with `tool_descriptor("search").inputSchema.properties.{limit,mode}`
+/// in `crate::mcp::tools::tool_descriptor` so the schema and the runtime
+/// validation don't drift.
 const SEARCH_LIMIT_MIN: i64 = 1;
 const SEARCH_LIMIT_MAX: i64 = 100;
+const SEARCH_LIMIT_DEFAULT: i32 = 10;
+const SEARCH_VALID_MODES: &[&str] = &["local", "global", "hybrid"];
+const SEARCH_MODE_DEFAULT: &str = "hybrid";
 
 /// `search` argument を `SearchRequest` に詰める。`schema` は `user_schema` で
 /// 強制上書きするので、`arguments` に schema 指定があっても無視する。
@@ -37,22 +41,31 @@ pub(super) fn build_search_request(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "missing required argument: 'query'".to_string())?
         .to_string();
-    // `tools/list` advertises mode default = "hybrid", but vegapunk's
-    // SearchRequest.mode defaults to "local" if left empty. Inject "hybrid"
-    // explicitly so the advertised default matches actual behavior.
-    let mode = Some(
-        args.get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or("hybrid")
-            .to_string(),
-    );
-    // `tools/list` advertises `limit: integer, minimum 1, maximum 100`. JSON
-    // Schema validation lives client-side, so the wrapper has to enforce the
-    // contract too — naïve `as i32` would silently wrap negatives / huge
-    // numbers and send a nonsense `top_k` to vegapunk.
+    // `tools/list` advertises mode as enum {local, global, hybrid} with default
+    // "hybrid"; vegapunk's SearchRequest.mode defaults to "local". The wrapper
+    // can't rely on client-side JSON Schema validation, so enforce the enum
+    // here and inject "hybrid" when omitted to match the advertised default.
+    let mode = {
+        let raw = match args.get("mode") {
+            None | Some(Value::Null) => SEARCH_MODE_DEFAULT,
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| "'mode' must be a string".to_string())?,
+        };
+        if !SEARCH_VALID_MODES.contains(&raw) {
+            return Err(format!(
+                "'mode' must be one of {SEARCH_VALID_MODES:?}, got {raw:?}"
+            ));
+        }
+        Some(raw.to_string())
+    };
+    // `tools/list` advertises `limit: integer, minimum 1, maximum 100, default 10`.
+    // Inject the advertised default when omitted (vegapunk's SearchRequest
+    // would pick its own default otherwise, which we'd then be lying about),
+    // and bounds-check before casting so naïve `as i32` can't silently wrap
+    // negatives / huge numbers.
     let top_k = match args.get("limit") {
-        None => None,
-        Some(Value::Null) => None,
+        None | Some(Value::Null) => Some(SEARCH_LIMIT_DEFAULT),
         Some(v) => {
             let n = v
                 .as_i64()
@@ -123,6 +136,21 @@ pub(super) fn invalid_args_content(method: &str, reason: &str) -> Value {
     })
 }
 
+fn search_result_item_json(item: &SearchResultItem) -> Value {
+    json!({
+        "type": item.r#type,
+        "id": item.id,
+        "text": item.text,
+        "score": item.score,
+        "person": item.person,
+        "timestamp": item.timestamp,
+        "summary": item.summary,
+        "channel": item.channel,
+        "decided_at": item.decided_at,
+        "rationales": item.rationales,
+    })
+}
+
 pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
     let request = match build_search_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
@@ -133,21 +161,19 @@ pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Val
         Err(status) => tonic_error_content("Search", status),
         Ok(resp) => {
             let resp = resp.into_inner();
-            let results: Vec<Value> = resp
-                .results
+            let results: Vec<Value> = resp.results.iter().map(search_result_item_json).collect();
+            // Preserve Phase 3 cross-project similar_patterns from the
+            // backend (proto field 4) — drop nothing the server returns,
+            // even if today's clients ignore it.
+            let similar_patterns: Vec<Value> = resp
+                .similar_patterns
                 .iter()
-                .map(|item| {
+                .map(|sp| {
+                    let nodes: Vec<Value> = sp.nodes.iter().map(search_result_item_json).collect();
                     json!({
-                        "type": item.r#type,
-                        "id": item.id,
-                        "text": item.text,
-                        "score": item.score,
-                        "person": item.person,
-                        "timestamp": item.timestamp,
-                        "summary": item.summary,
-                        "channel": item.channel,
-                        "decided_at": item.decided_at,
-                        "rationales": item.rationales,
+                        "source_project": sp.source_project,
+                        "structural_similarity": sp.structural_similarity,
+                        "nodes": nodes,
                     })
                 })
                 .collect();
@@ -155,6 +181,7 @@ pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Val
                 "search_id": resp.search_id,
                 "total_count": resp.total_count,
                 "results": results,
+                "similar_patterns": similar_patterns,
             }))
         }
     }
@@ -188,9 +215,9 @@ mod tests {
         let req = build_search_request("alice-tenant", &args).unwrap();
         assert_eq!(req.schema, "alice-tenant");
         assert_eq!(req.text, "hello");
-        // mode は省略時 tools/list の default ("hybrid") と一致させる。
+        // mode は省略時 tools/list の default ("hybrid")、limit は default 10。
         assert_eq!(req.mode.as_deref(), Some("hybrid"));
-        assert_eq!(req.top_k, None);
+        assert_eq!(req.top_k, Some(SEARCH_LIMIT_DEFAULT));
     }
 
     #[test]
@@ -237,10 +264,48 @@ mod tests {
     }
 
     #[test]
-    fn search_request_accepts_null_limit_as_omitted() {
-        // JSON null は省略と同じ扱い: top_k は None。
+    fn search_request_treats_null_limit_as_omitted_and_applies_default() {
+        // JSON null は省略と同じ扱いになり、advertised default 10 が入る。
         let req = build_search_request("t", &json!({"query":"q","limit":null})).unwrap();
-        assert_eq!(req.top_k, None);
+        assert_eq!(req.top_k, Some(SEARCH_LIMIT_DEFAULT));
+    }
+
+    #[test]
+    fn search_request_defaults_limit_to_advertised_default() {
+        // limit を渡さなかった場合は tools/list の default (10) に揃える
+        // (vegapunk 側のバックエンド default に流されない)。
+        let req = build_search_request("t", &json!({"query":"q"})).unwrap();
+        assert_eq!(req.top_k, Some(SEARCH_LIMIT_DEFAULT));
+    }
+
+    #[test]
+    fn search_request_rejects_unknown_mode() {
+        let err = build_search_request("t", &json!({"query":"q","mode":"banana"})).unwrap_err();
+        assert!(err.contains("'mode'"), "got: {err}");
+        assert!(err.contains("banana"), "got: {err}");
+    }
+
+    #[test]
+    fn search_request_rejects_empty_mode() {
+        let err = build_search_request("t", &json!({"query":"q","mode":""})).unwrap_err();
+        assert!(err.contains("'mode'"), "got: {err}");
+    }
+
+    #[test]
+    fn search_request_rejects_non_string_mode() {
+        let err = build_search_request("t", &json!({"query":"q","mode": 42})).unwrap_err();
+        assert!(
+            err.contains("'mode'") && err.contains("string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn search_request_accepts_all_advertised_modes() {
+        for m in SEARCH_VALID_MODES {
+            let req = build_search_request("t", &json!({"query":"q","mode": m})).unwrap();
+            assert_eq!(req.mode.as_deref(), Some(*m));
+        }
     }
 
     #[test]
