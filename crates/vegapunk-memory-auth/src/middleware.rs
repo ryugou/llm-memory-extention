@@ -25,6 +25,11 @@ use crate::jwt::{self, JwtKeys};
 pub struct AuthenticatedUser {
     pub user_id: String,
     pub client_id: String,
+    /// users 行から取り出した vegapunk graph の tenant key。
+    /// tool handler は backend gRPC 呼び出し時にこの値を必ず注入し、
+    /// client が `schema` 引数で別 tenant を指定しても上書きできないようにする
+    /// (cross-tenant guard)。
+    pub vegapunk_schema: String,
 }
 
 /// 認証 middleware が必要とする state: JWT 鍵と、user 存在チェック用の DB pool。
@@ -57,19 +62,20 @@ pub async fn require_auth(
     // 削除済み user の token を弾く: vegapunk-memory-server で account 削除を
     // 実装した際、users 行が消えると次の API 呼び出しでこの query が None を
     // 返して 401 になる。
-    let user_exists = vegapunk_memory_storage::users::find_by_id(&auth.pool, &claims.sub)
+    //
+    // 行が見つかったら vegapunk_schema を AuthenticatedUser に詰める — tool
+    // handler の cross-tenant guard はこの値だけを信用する。
+    let user = vegapunk_memory_storage::users::find_by_id(&auth.pool, &claims.sub)
         .await
         .map_err(|e| {
             tracing::error!(user_id = %claims.sub, error = ?e, "users::find_by_id failed in auth middleware");
             StatusCode::INTERNAL_SERVER_ERROR
         })?
-        .is_some();
-    if !user_exists {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+        .ok_or(StatusCode::UNAUTHORIZED)?;
     req.extensions_mut().insert(AuthenticatedUser {
-        user_id: claims.sub,
+        user_id: user.id,
         client_id: claims.client_id,
+        vegapunk_schema: user.vegapunk_schema,
     });
     Ok(next.run(req).await)
 }
@@ -116,9 +122,19 @@ mod tests {
         "ok"
     }
 
+    /// Test handler that echoes the AuthenticatedUser's vegapunk_schema so
+    /// tests can verify the middleware loaded the right tenant key into the
+    /// request extensions.
+    async fn protected_schema_echo(
+        axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    ) -> String {
+        user.vegapunk_schema
+    }
+
     fn app(auth: AuthState) -> Router {
         Router::new()
             .route("/", get(protected))
+            .route("/schema", get(protected_schema_echo))
             .route_layer(from_fn_with_state(auth, require_auth))
             .with_state(())
     }
@@ -163,6 +179,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticated_user_carries_user_row_schema() {
+        // require_auth は users 行から vegapunk_schema を引いて
+        // AuthenticatedUser.vegapunk_schema にセットする。tool handler の
+        // cross-tenant guard はこの値だけを信用するので、列が正しく届くこと
+        // をハンドラ経由で確認する。
+        let user_id = "01HJAUTHUSER000000000000002";
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        users::insert(&pool, user_id, "google", "sub2", None, "tenant-xyz")
+            .await
+            .unwrap();
+        let auth = AuthState::new(keys(), pool);
+        let token = issue(&auth.jwt_keys, user_id, "c1", 3600).unwrap();
+        let res = app(auth)
+            .oneshot(
+                AxumRequest::get("/schema")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"tenant-xyz");
     }
 
     #[tokio::test]

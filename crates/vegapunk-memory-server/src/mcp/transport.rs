@@ -278,6 +278,7 @@ mod tests {
         AuthenticatedUser {
             user_id: "u1".into(),
             client_id: "c".into(),
+            vegapunk_schema: "u1-schema".into(),
         }
     }
 

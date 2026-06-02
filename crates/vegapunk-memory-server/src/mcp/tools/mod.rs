@@ -1,14 +1,18 @@
 //! MCP tool 一覧と dispatcher。
 //!
-//! `list()` で返す inputSchema は MCP client (Claude.ai 等) が tools/list で
-//! 取得し、tool call 時の引数 validation に使う。各 handler の実装は次 PR で
-//! 順次追加する想定で、本 PR ではすべて `not_implemented` を返す薄い dispatcher。
+//! `list()` は MCP client (Claude.ai 等) が `tools/list` で取得する inputSchema を返す。
+//! `call()` は `tools/call` を受けて個別 handler に dispatch する — 各 handler は
+//! `handlers` 子モジュールで実装する。未実装の tool は `tools/list` には載るが
+//! `call()` 経由で叩かれた場合 `isError: true` の "not yet implemented" content を返す
+//! (= client が capability discover した後で早めに気付ける)。
 
 use serde_json::{Value, json};
 
 use crate::mcp::transport::JsonRpcResponse;
 use crate::state::AppState;
 use vegapunk_memory_auth::middleware::AuthenticatedUser;
+
+mod handlers;
 
 /// vegapunk wrapper として公開する tool 名の集合。
 /// 「公開しない vegapunk RPC」(= UpsertNodes / Reingest / Rebuild / Migrate /
@@ -184,12 +188,14 @@ fn tool_descriptor(name: &str) -> Value {
     }
 }
 
-/// `tools/call` dispatcher。本 PR では各 handler 未実装のため、すべて
-/// `not_implemented` の MCP tool error (= JSON-RPC 自体は success、
-/// `isError: true` の content を返す) を返す。
+/// `tools/call` dispatcher。
+///
+/// JSON-RPC 上は常に `success` で応答し、tool 失敗は MCP の `isError: true` content
+/// として返す (MCP spec: tool execution failure ≠ protocol error)。
+/// dispatch できない場合 (= name 欠落 / 未知 tool 名) のみ JSON-RPC `-32602` を返す。
 pub async fn call(
-    _state: AppState,
-    _user: AuthenticatedUser,
+    state: AppState,
+    user: AuthenticatedUser,
     id: Option<Value>,
     params: Value,
 ) -> JsonRpcResponse {
@@ -199,23 +205,34 @@ pub async fn call(
             return JsonRpcResponse::error(id, -32602, "Invalid params: missing 'name'");
         }
     };
-    if !TOOL_NAMES.contains(&name.as_str()) {
-        return JsonRpcResponse::error(
-            id,
-            -32602,
-            format!("Invalid params: unknown tool '{name}'"),
-        );
-    }
-    JsonRpcResponse::success(
-        id,
-        json!({
-            "content": [{
-                "type": "text",
-                "text": format!("tool '{name}' is registered but not yet implemented in this PR")
-            }],
-            "isError": true
-        }),
-    )
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let content = match name.as_str() {
+        "search" => handlers::search(&state, &user, args).await,
+        "get_schema" => handlers::get_schema(&state, &user).await,
+        other if TOOL_NAMES.contains(&other) => not_implemented_content(other),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("Invalid params: unknown tool '{name}'"),
+            );
+        }
+    };
+    JsonRpcResponse::success(id, content)
+}
+
+fn not_implemented_content(name: &str) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!("tool '{name}' is registered but not yet implemented in this PR"),
+        }],
+        "isError": true,
+    })
 }
 
 #[cfg(test)]
@@ -250,6 +267,88 @@ mod tests {
                 properties
             );
         }
+    }
+
+    async fn test_state() -> AppState {
+        use std::sync::Arc;
+        use vegapunk_client::BearerAuthInterceptor;
+        use vegapunk_client::graphrag::graph_rag_engine_client::GraphRagEngineClient;
+        use vegapunk_memory_auth::jwt::JwtKeys;
+
+        let pool = vegapunk_memory_storage::pool::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        let endpoint = tonic::transport::Endpoint::from_static("http://127.0.0.1:0");
+        let channel = endpoint.connect_lazy();
+        let interceptor = BearerAuthInterceptor::new("dummy").unwrap();
+        let vegapunk = GraphRagEngineClient::with_interceptor(channel, interceptor);
+        let cfg = crate::config::ServerConfig {
+            database_url: "sqlite::memory:".into(),
+            bind_addr: "0.0.0.0:8081".into(),
+            public_url: "https://test.example.com".into(),
+            google_client_id: "id".into(),
+            google_client_secret: "s".into(),
+            vegapunk_grpc_endpoint: "http://127.0.0.1:0".into(),
+            vegapunk_bearer_token: "dummy".into(),
+            trusted_proxy_count: 1,
+        };
+        AppState {
+            pool,
+            vegapunk,
+            jwt_keys: JwtKeys::for_tests(),
+            cfg: Arc::new(cfg),
+        }
+    }
+
+    fn user() -> AuthenticatedUser {
+        AuthenticatedUser {
+            user_id: "u1".into(),
+            client_id: "c".into(),
+            vegapunk_schema: "u1-schema".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_missing_name_returns_minus_32602() {
+        let state = test_state().await;
+        let params = json!({ "arguments": {} });
+        let resp = call(state, user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        assert!(v["error"]["message"].as_str().unwrap().contains("'name'"));
+    }
+
+    #[tokio::test]
+    async fn call_unknown_tool_returns_minus_32602() {
+        let state = test_state().await;
+        let params = json!({ "name": "no_such_tool", "arguments": {} });
+        let resp = call(state, user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no_such_tool")
+        );
+    }
+
+    #[tokio::test]
+    async fn call_registered_but_unimplemented_tool_returns_iserror_content() {
+        // tools/list には載っているが本 PR ではまだ実装が無い tool は、
+        // JSON-RPC では success、tool 側で `isError: true` を返す。
+        // 「ingest」を例にとる (PR #16 で実装予定)。
+        let state = test_state().await;
+        let params = json!({ "name": "ingest", "arguments": {} });
+        let resp = call(state, user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert!(
+            v["error"].is_null(),
+            "should be a tool error, not JSON-RPC error: {v}"
+        );
+        assert_eq!(v["result"]["isError"], true);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ingest") && text.contains("not yet implemented"));
     }
 
     #[test]
