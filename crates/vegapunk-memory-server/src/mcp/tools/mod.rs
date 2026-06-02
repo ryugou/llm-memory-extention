@@ -61,7 +61,16 @@ fn tool_descriptor(name: &str) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
+                    // query must contain at least one non-whitespace character;
+                    // server-side `build_search_request` trims and rejects
+                    // whitespace-only input. minLength alone would still allow
+                    // " ", so the pattern guard is what enforces non-empty.
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S",
+                        "description": "Search query. Must contain at least one non-whitespace character."
+                    },
                     "mode": {
                         "type": "string",
                         "enum": SEARCH_VALID_MODES,
@@ -269,7 +278,7 @@ fn not_implemented_content(name: &str) -> Value {
     json!({
         "content": [{
             "type": "text",
-            "text": format!("tool '{name}' is registered but not yet implemented in this PR"),
+            "text": format!("tool '{name}' is registered but not yet implemented"),
         }],
         "isError": true,
     })

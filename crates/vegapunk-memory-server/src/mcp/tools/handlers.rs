@@ -96,8 +96,8 @@ pub(super) fn build_search_request(
 }
 
 /// `get_schema` request を組む。MCP 側 inputSchema は no-arg なので、user の
-/// vegapunk_schema をそのまま `name` に入れる。arguments は (将来 fields が
-/// 増えるかもしれないので signature だけ受け取り) 現状は使わない。
+/// vegapunk_schema をそのまま `name` に入れる。tool 側で arguments が来ても
+/// handler が無視する設計なので、ここでは引数を受け取らない。
 pub(super) fn build_get_schema_request(user_schema: &str) -> GetSchemaRequest {
     GetSchemaRequest {
         name: user_schema.to_string(),
