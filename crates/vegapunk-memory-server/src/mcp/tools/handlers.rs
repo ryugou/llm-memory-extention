@@ -15,9 +15,9 @@
 use serde_json::{Map, Value, json};
 
 use vegapunk_client::graphrag::{
-    AttributeFilter, GetSchemaRequest, GetStatsRequest, IngestMessage, IngestRawMetadata,
-    IngestRawRequest, IngestRequest, ListSchemasRequest, MessageMetadata, QueryNodesRequest,
-    SchemaListItem, SearchRequest, SearchResultItem,
+    AttributeFilter, GetSchemaRequest, GetStatsRequest, GetTraceableChainRequest, IngestMessage,
+    IngestRawMetadata, IngestRawRequest, IngestRequest, ListSchemasRequest, MessageMetadata,
+    QueryNodesRequest, SchemaListItem, SearchRequest, SearchResultItem,
 };
 use vegapunk_memory_auth::middleware::AuthenticatedUser;
 
@@ -27,7 +27,8 @@ use super::{
     ATTRIBUTE_FILTER_VALID_OPS, QUERY_NODES_LIMIT_DEFAULT, QUERY_NODES_LIMIT_MAX,
     QUERY_NODES_LIMIT_MIN, QUERY_NODES_SORT_ORDER_DEFAULT, QUERY_NODES_VALID_SORT_ORDERS,
     SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN, SEARCH_MODE_DEFAULT,
-    SEARCH_VALID_MODES,
+    SEARCH_VALID_MODES, TRACEABLE_CHAIN_MAX_DEPTH_DEFAULT, TRACEABLE_CHAIN_MAX_DEPTH_MAX,
+    TRACEABLE_CHAIN_MAX_DEPTH_MIN,
 };
 
 /// MCP `tools/call.arguments` を共通の作法で object に降ろす。
@@ -634,6 +635,72 @@ pub(super) async fn stats(state: &AppState, user: &AuthenticatedUser, args: Valu
                 "vector_count": resp.vector_count,
                 "community_count": resp.community_count,
             }))
+        }
+    }
+}
+
+// `feedback` / `get_job_status` handlers are intentionally absent in this PR.
+// Their proto requests (FeedbackRequest / GetJobStatusRequest) carry no schema
+// field, and the wrapper has no ownership-tracking table yet to verify the
+// caller actually owns the supplied `search_id` / `msg_id`. Without that, a
+// caller who learns another tenant's identifier could rate / inspect it.
+// They will land in a follow-up PR once we record (search_id, msg_id) →
+// user_id mapping during search / ingest.
+
+/// `get_traceable_chain` argument を `GetTraceableChainRequest` に詰める。
+/// `schema` は wrapper が user.vegapunk_schema を強制注入 (cross-tenant guard)。
+/// proto では `max_depth` default 5, max 10。tools/list と整合する範囲で
+/// runtime guard する。
+pub(super) fn build_get_traceable_chain_request(
+    user_schema: &str,
+    args: &Value,
+) -> Result<GetTraceableChainRequest, String> {
+    let args = require_object_args(args)?;
+    let node_id = require_str_field(args, "node_id", "arguments")?;
+    let max_depth = optional_bounded_i32(
+        args,
+        "max_depth",
+        TRACEABLE_CHAIN_MAX_DEPTH_MIN,
+        TRACEABLE_CHAIN_MAX_DEPTH_MAX,
+        Some(TRACEABLE_CHAIN_MAX_DEPTH_DEFAULT),
+        "arguments",
+    )?;
+    Ok(GetTraceableChainRequest {
+        node_id,
+        schema: Some(user_schema.to_string()),
+        max_depth,
+    })
+}
+
+pub(super) async fn get_traceable_chain(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    args: Value,
+) -> Value {
+    let request = match build_get_traceable_chain_request(&user.vegapunk_schema, &args) {
+        Ok(r) => r,
+        Err(e) => return invalid_args_content("get_traceable_chain", &e),
+    };
+    let mut client = state.vegapunk.clone();
+    match client.get_traceable_chain(request).await {
+        Err(status) => tonic_error_content("GetTraceableChain", status),
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            let links: Vec<Value> = resp
+                .links
+                .iter()
+                .map(|l| {
+                    json!({
+                        "node_id": l.node_id,
+                        "node_type": l.node_type,
+                        "display_text": l.display_text,
+                        "edge_type": l.edge_type,
+                        "depth": l.depth,
+                        "timestamp": l.timestamp,
+                    })
+                })
+                .collect();
+            success_content(json!({ "links": links }))
         }
     }
 }
@@ -1293,6 +1360,44 @@ mod tests {
         let schemas = vec![schema_item("alice-tenant")];
         let out = filter_schemas_for_user(&schemas, "bob-tenant");
         assert!(out.is_empty());
+    }
+
+    // ── get_traceable_chain ────────────────────────────────────────────
+
+    #[test]
+    fn get_traceable_chain_request_uses_user_schema_and_ignores_args_schema() {
+        let req = build_get_traceable_chain_request(
+            "alice-tenant",
+            &json!({"node_id": "n1", "schema": "evil"}),
+        )
+        .unwrap();
+        assert_eq!(req.schema.as_deref(), Some("alice-tenant"));
+        assert_eq!(req.node_id, "n1");
+        // 省略時は advertised default が入る (proto の default 5 と一致)。
+        assert_eq!(req.max_depth, Some(TRACEABLE_CHAIN_MAX_DEPTH_DEFAULT));
+    }
+
+    #[test]
+    fn get_traceable_chain_request_rejects_missing_node_id() {
+        let err = build_get_traceable_chain_request("t", &json!({})).unwrap_err();
+        assert!(err.contains("node_id"), "got: {err}");
+    }
+
+    #[test]
+    fn get_traceable_chain_request_rejects_max_depth_out_of_range() {
+        let err = build_get_traceable_chain_request("t", &json!({"node_id": "n", "max_depth": 0}))
+            .unwrap_err();
+        assert!(err.contains("max_depth"), "got: {err}");
+        let err = build_get_traceable_chain_request("t", &json!({"node_id": "n", "max_depth": 11}))
+            .unwrap_err();
+        assert!(err.contains("max_depth"), "got: {err}");
+    }
+
+    #[test]
+    fn get_traceable_chain_request_accepts_max_depth_in_range() {
+        let req = build_get_traceable_chain_request("t", &json!({"node_id": "n", "max_depth": 7}))
+            .unwrap();
+        assert_eq!(req.max_depth, Some(7));
     }
 
     #[test]

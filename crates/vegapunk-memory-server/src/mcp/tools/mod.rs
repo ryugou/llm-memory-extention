@@ -33,9 +33,21 @@ pub(super) const QUERY_NODES_SORT_ORDER_DEFAULT: &str = "desc";
 // `AttributeFilter.op` の許容セット (query_nodes / stats 共通)。
 pub(super) const ATTRIBUTE_FILTER_VALID_OPS: &[&str] = &["eq", "gt", "gte", "lt", "lte"];
 
+// `get_traceable_chain.max_depth` 契約 (proto: default 5, max 10)。
+pub(super) const TRACEABLE_CHAIN_MAX_DEPTH_MIN: i64 = 1;
+pub(super) const TRACEABLE_CHAIN_MAX_DEPTH_MAX: i64 = 10;
+pub(super) const TRACEABLE_CHAIN_MAX_DEPTH_DEFAULT: i32 = 5;
+
 /// vegapunk wrapper として公開する tool 名の集合。
 /// 「公開しない vegapunk RPC」(= UpsertNodes / Reingest / Rebuild / Migrate /
 /// PurgeRawMessages / SetMaintenanceMode 等の admin) は意図的に外す。
+// NOTE: `feedback` と `get_job_status` は意図的に外している。proto 上、
+// `FeedbackRequest` / `GetJobStatusRequest` には schema フィールドが無く、
+// 識別子 (`search_id` / `msg_id`) だけで vegapunk に投げる API。wrapper 側で
+// 「その識別子が caller の tenant のものか」を確認する仕組み (ownership
+// tracking テーブル) が無い状態で advertise すると、他 tenant の id を
+// 推測 / 漏洩経由で知った caller が cross-tenant でアクセスできてしまう
+// (Codex P1/P2)。ownership tracking を別 PR で入れてから再 advertise する。
 const TOOL_NAMES: &[&str] = &[
     "search",
     "ingest",
@@ -44,8 +56,6 @@ const TOOL_NAMES: &[&str] = &[
     "get_schema",
     "list_schemas",
     "stats",
-    "feedback",
-    "get_job_status",
     "get_traceable_chain",
 ];
 
@@ -248,41 +258,23 @@ fn tool_descriptor(name: &str) -> Value {
                 }
             }
         }),
-        "feedback" => json!({
-            "name": "feedback",
-            "description": "Submit feedback (1-5 rating) for a previous search result (vegapunk Feedback RPC).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "search_id": {"type": "string"},
-                    "rating": {"type": "integer", "minimum": 1, "maximum": 5},
-                    "note": {"type": "string"}
-                },
-                "required": ["search_id", "rating"]
-            }
-        }),
-        "get_job_status" => json!({
-            "name": "get_job_status",
-            "description": "Get the status of an ingest job by msg_id or job_id (vegapunk GetJobStatus RPC). At least one of msg_id / job_id is required.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "msg_id": {"type": "string"},
-                    "job_id": {"type": "string"}
-                },
-                "anyOf": [
-                    {"required": ["msg_id"]},
-                    {"required": ["job_id"]}
-                ]
-            }
-        }),
         "get_traceable_chain" => json!({
             "name": "get_traceable_chain",
-            "description": "Get a traceable chain of provenance from a node back to its source (vegapunk GetTraceableChain RPC).",
+            "description": "Walk the provenance chain from a node back to its source within the authenticated user's schema (vegapunk GetTraceableChain RPC).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "node_id": {"type": "string"}
+                    "node_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S"
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "minimum": TRACEABLE_CHAIN_MAX_DEPTH_MIN,
+                        "maximum": TRACEABLE_CHAIN_MAX_DEPTH_MAX,
+                        "default": TRACEABLE_CHAIN_MAX_DEPTH_DEFAULT,
+                    }
                 },
                 "required": ["node_id"]
             }
@@ -347,6 +339,7 @@ pub async fn call(
         "query_nodes" => handlers::query_nodes(&state, &user, args).await,
         "list_schemas" => handlers::list_schemas(&state, &user).await,
         "stats" => handlers::stats(&state, &user, args).await,
+        "get_traceable_chain" => handlers::get_traceable_chain(&state, &user, args).await,
         other if TOOL_NAMES.contains(&other) => not_implemented_content(other),
         _ => {
             return JsonRpcResponse::error(
@@ -482,24 +475,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_registered_but_unimplemented_tool_returns_iserror_content() {
-        // tools/list には載っているが本 PR 時点で未実装の tool は、
-        // JSON-RPC では success、tool 側で `isError: true` を返す。
-        // PR #18 で実装予定の `feedback` を例に取る。
-        let state = test_state().await;
-        let params = json!({ "name": "feedback", "arguments": {} });
-        let resp = call(state, test_user(), Some(json!(1)), params).await;
-        let v = serde_json::to_value(resp).unwrap();
-        assert!(
-            v["error"].is_null(),
-            "should be a tool error, not JSON-RPC error: {v}"
-        );
-        assert_eq!(v["result"]["isError"], true);
-        let text = v["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("feedback") && text.contains("not yet implemented"));
-    }
-
-    #[tokio::test]
     async fn call_routes_query_nodes_into_handler_and_surfaces_validation_error() {
         let state = test_state().await;
         let params = json!({ "name": "query_nodes", "arguments": {} });
@@ -510,6 +485,19 @@ mod tests {
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("query_nodes"), "got: {text}");
         assert!(text.contains("node_type"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn call_routes_get_traceable_chain_into_handler_and_surfaces_validation_error() {
+        let state = test_state().await;
+        let params = json!({ "name": "get_traceable_chain", "arguments": {} });
+        let resp = call(state, test_user(), Some(json!(1)), params).await;
+        let v = serde_json::to_value(resp).unwrap();
+        assert!(v["error"].is_null(), "expected tool error, got: {v}");
+        assert_eq!(v["result"]["isError"], true);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("get_traceable_chain"), "got: {text}");
+        assert!(text.contains("node_id"), "got: {text}");
     }
 
     #[tokio::test]
@@ -541,23 +529,13 @@ mod tests {
     }
 
     #[test]
-    fn get_job_status_requires_at_least_one_identifier() {
-        // msg_id / job_id どちらか必須を anyOf で表現していることを保証。
-        // 「{} で通る」抜け穴を防ぐ。
-        let v = tool_descriptor("get_job_status");
-        let any_of = v["inputSchema"]["anyOf"].as_array().unwrap();
-        let required_sets: Vec<Vec<String>> = any_of
-            .iter()
-            .map(|branch| {
-                branch["required"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|s| s.as_str().unwrap().to_string())
-                    .collect()
-            })
-            .collect();
-        assert!(required_sets.contains(&vec!["msg_id".to_string()]));
-        assert!(required_sets.contains(&vec!["job_id".to_string()]));
+    fn feedback_and_get_job_status_are_not_advertised() {
+        // proto: FeedbackRequest / GetJobStatusRequest には schema が無く、
+        // wrapper 側で「その識別子は caller の tenant か」を確認する仕組み
+        // (ownership tracking) が未実装。それまで tools/list に出すと
+        // cross-tenant の rating 改竄 / job 状態漏洩を許してしまうので、
+        // TOOL_NAMES に含めないことを test で pin する。
+        assert!(!TOOL_NAMES.contains(&"feedback"));
+        assert!(!TOOL_NAMES.contains(&"get_job_status"));
     }
 }
