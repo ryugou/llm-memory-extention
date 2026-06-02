@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 use vegapunk_client::graphrag::{
     AttributeFilter, GetSchemaRequest, GetStatsRequest, IngestMessage, IngestRawMetadata,
     IngestRawRequest, IngestRequest, ListSchemasRequest, MessageMetadata, QueryNodesRequest,
-    SearchRequest, SearchResultItem,
+    SchemaListItem, SearchRequest, SearchResultItem,
 };
 use vegapunk_memory_auth::middleware::AuthenticatedUser;
 
@@ -503,11 +503,11 @@ pub(super) fn build_query_nodes_request(
             None | Some(Value::Null) => QUERY_NODES_SORT_ORDER_DEFAULT,
             Some(v) => v
                 .as_str()
-                .ok_or_else(|| "'sort_order' must be a string".to_string())?,
+                .ok_or_else(|| "'arguments.sort_order' must be a string".to_string())?,
         };
         if !QUERY_NODES_VALID_SORT_ORDERS.contains(&raw) {
             return Err(format!(
-                "'sort_order' must be one of {QUERY_NODES_VALID_SORT_ORDERS:?}, got {raw:?}"
+                "'arguments.sort_order' must be one of {QUERY_NODES_VALID_SORT_ORDERS:?}, got {raw:?}"
             ));
         }
         Some(raw.to_string())
@@ -584,28 +584,38 @@ pub(super) async fn query_nodes(state: &AppState, user: &AuthenticatedUser, args
 /// 単位では user 1 人につき 1 schema (= `user.vegapunk_schema`) しか紐付かない
 /// 設計なので、結果を user の schema 名に厳格に filter する。これがないと、
 /// 他 tenant の schema 名と yaml が caller に丸見えになる (情報漏洩)。
+///
+/// filter 実装は cross-tenant 防止の要なので、pure な
+/// [`filter_schemas_for_user`] に切り出して unit test で pin する。
 pub(super) async fn list_schemas(state: &AppState, user: &AuthenticatedUser) -> Value {
     let mut client = state.vegapunk.clone();
     match client.list_schemas(ListSchemasRequest {}).await {
         Err(status) => tonic_error_content("ListSchemas", status),
         Ok(resp) => {
             let resp = resp.into_inner();
-            let schemas: Vec<Value> = resp
-                .schemas
-                .iter()
-                .filter(|s| s.name == user.vegapunk_schema)
-                .map(|s| {
-                    json!({
-                        "name": s.name,
-                        "version": s.version,
-                        "description": s.description,
-                        "schema_yaml": s.schema_yaml,
-                    })
-                })
-                .collect();
+            let schemas = filter_schemas_for_user(&resp.schemas, &user.vegapunk_schema);
             success_content(json!({ "schemas": schemas }))
         }
     }
+}
+
+/// `ListSchemas` レスポンスから、要求 user の vegapunk_schema に **完全一致**
+/// する entry のみを抜き出して JSON に整形する。`list_schemas` ハンドラの
+/// security-critical な部分なので、handler 自体を gRPC 込みで mock しなくても
+/// この pure function だけで cross-tenant filter の挙動を試験できる。
+fn filter_schemas_for_user(schemas: &[SchemaListItem], user_schema: &str) -> Vec<Value> {
+    schemas
+        .iter()
+        .filter(|s| s.name == user_schema)
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "version": s.version,
+                "description": s.description,
+                "schema_yaml": s.schema_yaml,
+            })
+        })
+        .collect()
 }
 
 pub(super) async fn stats(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
@@ -1149,7 +1159,16 @@ mod tests {
         let err =
             build_query_nodes_request("t", &json!({ "node_type": "M", "sort_order": "rand" }))
                 .unwrap_err();
-        assert!(err.contains("sort_order"), "got: {err}");
+        // 他フィールドと同じ `'arguments.<field>'` 形式で報告する。
+        assert!(err.contains("'arguments.sort_order'"), "got: {err}");
+    }
+
+    #[test]
+    fn query_nodes_request_rejects_non_string_sort_order_with_fully_qualified_path() {
+        let err = build_query_nodes_request("t", &json!({ "node_type": "M", "sort_order": 1 }))
+            .unwrap_err();
+        assert!(err.contains("'arguments.sort_order'"), "got: {err}");
+        assert!(err.contains("string"), "got: {err}");
     }
 
     #[test]
@@ -1221,6 +1240,59 @@ mod tests {
         .unwrap();
         assert_eq!(req.node_type.as_deref(), Some("Message"));
         assert_eq!(req.filters.len(), 1);
+    }
+
+    // ── list_schemas filter (cross-tenant guard) ────────────────────────
+
+    fn schema_item(name: &str) -> SchemaListItem {
+        SchemaListItem {
+            name: name.to_string(),
+            version: 1,
+            description: format!("schema for {name}"),
+            schema_yaml: format!("name: {name}\n"),
+        }
+    }
+
+    #[test]
+    fn filter_schemas_returns_only_matching_user_schema() {
+        let schemas = vec![
+            schema_item("alice-tenant"),
+            schema_item("bob-tenant"),
+            schema_item("eve-tenant"),
+        ];
+        let out = filter_schemas_for_user(&schemas, "bob-tenant");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["name"], "bob-tenant");
+        assert_eq!(out[0]["schema_yaml"], "name: bob-tenant\n");
+    }
+
+    #[test]
+    fn filter_schemas_drops_other_tenants_completely() {
+        // alice / eve は出力に絶対に含まれない (cross-tenant guard の核)。
+        let schemas = vec![schema_item("alice-tenant"), schema_item("eve-tenant")];
+        let out = filter_schemas_for_user(&schemas, "bob-tenant");
+        assert!(out.is_empty(), "got: {out:?}");
+    }
+
+    #[test]
+    fn filter_schemas_uses_exact_match_not_substring() {
+        // "bob-tenant" を要求した時に "bob-tenant-v2" のような prefix-match が
+        // 入らないこと (substring leak の典型パターンを潰す)。
+        let schemas = vec![
+            schema_item("bob-tenant"),
+            schema_item("bob-tenant-v2"),
+            schema_item("bob"),
+        ];
+        let out = filter_schemas_for_user(&schemas, "bob-tenant");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["name"], "bob-tenant");
+    }
+
+    #[test]
+    fn filter_schemas_returns_empty_when_user_has_no_match() {
+        let schemas = vec![schema_item("alice-tenant")];
+        let out = filter_schemas_for_user(&schemas, "bob-tenant");
+        assert!(out.is_empty());
     }
 
     #[test]
