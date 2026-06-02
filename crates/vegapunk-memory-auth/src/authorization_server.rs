@@ -5,17 +5,17 @@
 //! 2. Client redirects user to /oauth/authorize with their PKCE challenge.
 //! 3. We redirect to Google. User authenticates.
 //! 4. Google returns to /oauth/callback/google with code+state.
-//! 5. We exchange Google code → userinfo → **find_by_provider_subject**
-//!    (= admin が事前 provision した users 行を引く、無ければ拒否) → issue
-//!    an auth code.
+//! 5. We exchange Google code → userinfo → **find_or_provision** the user row
+//!    (vegapunk_schema = `user-{google_sub}`) → idempotently ensure the user
+//!    schema and the shared schema exist on the vegapunk backend via the
+//!    injected `SchemaProvisioner` → issue an auth code.
 //! 6. We redirect back to the client's redirect_uri with our auth code.
 //! 7. Client calls /oauth/token with the auth code + PKCE verifier.
 //! 8. We verify PKCE and issue (access_token, refresh_token).
 //!
-//! 注: llm-memory-auth 版は (5) で `users::upsert` を使い未登録 user を auto
-//! insert していたが、vegapunk-memory-server は admin による事前
-//! provisioning 方針 (`users.vegapunk_schema` 必須) のため、未登録 user は
-//! `user_not_provisioned` で拒否する。
+//! Schema 命名規則と provisioning 詳細はトップレベル README §10-1 / memory
+//! `project-vegapunk-connection` を参照。新規ユーザは別管理 (admin の手動
+//! INSERT) を介さずに自分の Google アカウントで sign-in するだけで使える。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -145,6 +145,29 @@ impl InMemorySessions {
     }
 }
 
+/// 初回 OAuth callback で vegapunk side の schema を idempotent に「存在保証」する
+/// hook。`ensure_schema(name)` が `Ok(())` を返したら schema は使える状態
+/// (新規作成 or 既存どちらでも構わない)。
+///
+/// `vegapunk-memory-auth` crate は vegapunk gRPC を直接知らない設計なので、
+/// 上位 (`vegapunk-memory-server`) が実装を差し込む。No-op 実装も書きやすい
+/// (= テストで使う)。
+#[async_trait::async_trait]
+pub trait SchemaProvisioner: Send + Sync + std::fmt::Debug {
+    async fn ensure_schema(&self, name: &str) -> Result<(), String>;
+}
+
+/// 何もしない `SchemaProvisioner` (= テスト / vegapunk 未接続のデフォルト)。
+#[derive(Debug)]
+pub struct NoopSchemaProvisioner;
+
+#[async_trait::async_trait]
+impl SchemaProvisioner for NoopSchemaProvisioner {
+    async fn ensure_schema(&self, _name: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct AsState {
     pub pool: SqlitePool,
@@ -152,6 +175,12 @@ pub struct AsState {
     pub google: Arc<GoogleClient>,
     pub public_url: String,
     pub trusted_proxy_count: usize,
+    /// 初回 OAuth callback で呼ぶ vegapunk schema provisioning hook。
+    pub provisioner: Arc<dyn SchemaProvisioner>,
+    /// 全 user で共有する schema 名 (例: `sivira-shared`)。callback で
+    /// 初回 user 毎に idempotent に ensure される (= 最初の user の sign-in
+    /// で created、以降は exists 扱いで skip)。
+    pub shared_schema: String,
     sessions: InMemorySessions,
 }
 
@@ -162,6 +191,8 @@ impl AsState {
         google: Arc<GoogleClient>,
         public_url: String,
         trusted_proxy_count: usize,
+        provisioner: Arc<dyn SchemaProvisioner>,
+        shared_schema: String,
     ) -> Self {
         // env 由来の trailing slash を取り除く: そのまま放置すると
         // `${public_url}/oauth/authorize` が `https://host//oauth/authorize` の
@@ -174,6 +205,8 @@ impl AsState {
             google,
             public_url,
             trusted_proxy_count,
+            provisioner,
+            shared_schema,
             sessions: InMemorySessions::default(),
         }
     }
@@ -363,32 +396,45 @@ async fn callback_google(
             return bad_request("google_userinfo_failed", "google userinfo fetch failed");
         }
     };
-    // vegapunk-memory-server は admin による事前 provisioning 方針:
-    // 各 user の vegapunk_schema は admin が手動で割り当てた後にしか users 行が
-    // 存在しない。OAuth 認証経路では auto-insert せず、未登録ユーザは
-    // 明示エラーで拒否する。
-    let user = match vegapunk_memory_storage::users::find_by_provider_subject(
+    // 初回 OAuth callback で users 行を自動 provisioning する。命名規則:
+    //   - 個人 schema: `user-{google_sub}` (Google sub は不変・一意)
+    //   - 共有 schema: `state.shared_schema` (構成で固定、典型は `sivira-shared`)
+    // 既存ユーザは行をそのまま返す (`find_or_provision` の cross-tenant guard で
+    // 既存 schema が後勝ち書き換わらない)。
+    let new_user_id = new_ulid();
+    let new_schema = format!("user-{}", info.sub);
+    let user = match vegapunk_memory_storage::users::find_or_provision(
         &state.pool,
+        &new_user_id,
         "google",
         &info.sub,
+        info.email.as_deref(),
+        &new_schema,
     )
     .await
     {
-        Ok(Some(u)) => u,
-        Ok(None) => {
-            warn!(
-                provider = "google",
-                subject = %info.sub,
-                "user not provisioned in vegapunk-memory-server"
-            );
-            return bad_request(
-                "user_not_provisioned",
-                "your google account is not registered for this vegapunk instance. \
-                 ask the administrator to provision a vegapunk_schema for your user before signing in.",
-            );
-        }
+        Ok(u) => u,
         Err(e) => return server_error(&e.to_string()),
     };
+
+    // vegapunk side schema を idempotent に保証する。失敗しても OAuth 自体は
+    // 通す (= MCP 側で実 RPC が失敗した時点で client にエラーを返せばよい、
+    // 認証フローを止めるほどではない)。詳細は warn ログに残す。
+    if let Err(e) = state.provisioner.ensure_schema(&user.vegapunk_schema).await {
+        warn!(
+            schema = %user.vegapunk_schema,
+            user_id = %user.id,
+            error = %e,
+            "ensure_schema failed for user schema (continuing OAuth)",
+        );
+    }
+    if let Err(e) = state.provisioner.ensure_schema(&state.shared_schema).await {
+        warn!(
+            schema = %state.shared_schema,
+            error = %e,
+            "ensure_schema failed for shared schema (continuing OAuth)",
+        );
+    }
     // Issue our auth code.
     let code = new_ulid();
     state.sessions.put_code(
@@ -691,7 +737,15 @@ mod tests {
             client_secret: "s".into(),
             redirect_uri: "https://memory.example.com/oauth/callback/google".into(),
         }));
-        AsState::new(pool, keys, g, "https://memory.example.com".into(), 1)
+        AsState::new(
+            pool,
+            keys,
+            g,
+            "https://memory.example.com".into(),
+            1,
+            Arc::new(NoopSchemaProvisioner),
+            "sivira-shared".into(),
+        )
     }
 
     #[tokio::test]

@@ -35,6 +35,13 @@ pub struct ServerConfig {
     pub vegapunk_grpc_endpoint: String,
     pub vegapunk_bearer_token: String,
     pub trusted_proxy_count: usize,
+    /// 全 user で共有する vegapunk schema の名前 (例: `sivira-shared`)。
+    /// 初回 user の OAuth callback で idempotent に作成される。
+    pub shared_schema_name: String,
+    /// 個人 schema を新規作成するときに使う vegapunk template name
+    /// (例: `discussion`、`review`)。vegapunk の ListSchemaTemplates の
+    /// いずれかに一致する必要がある。
+    pub default_schema_template: String,
 }
 
 impl ServerConfig {
@@ -54,6 +61,14 @@ impl ServerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1),
+            shared_schema_name: std::env::var("VEGAPUNK_SHARED_SCHEMA_NAME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "sivira-shared".to_string()),
+            default_schema_template: std::env::var("VEGAPUNK_DEFAULT_SCHEMA_TEMPLATE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "discussion".to_string()),
         })
     }
 }
