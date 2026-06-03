@@ -275,15 +275,18 @@ fn is_word_char(c: char) -> bool {
 }
 
 /// 既に lowercased な `text_lc` 上で word boundary scan を行う。
-/// 呼び出し側で `text_lc.len() == text.len()` を確認済みであること
-/// (= byte offset が元 text とずれないという前提)。catalogue scan の
-/// ホットパスで `text.to_lowercase()` を per-entity に allocate しないよう、
-/// scan 本体はこの関数に切り出して 1 回作った `text_lc` を使い回す。
+/// catalogue scan のホットパスで `text.to_lowercase()` を per-entity に
+/// allocate しないよう、scan 本体はこの関数に切り出して、1 回作った
+/// `text_lc` を呼び出し側が使い回せるようにする。
 ///
-/// `text.to_lowercase()` の byte length が元と異なる場合 (例: Turkish
-/// dotted I `İ` (2 bytes) → `i\u{0307}` (3 bytes)) のサポートはここでは
-/// 持たない — 呼び出し側で no-match に倒すこと。non-ASCII の真の case
-/// 比較は NFC normalize 込みの別フェーズで扱う。
+/// **呼び出し側の責任**: `is_lowercase_byte_aligned(text)` が true な
+/// `text` から作った `text_lc` を渡すこと。`text_lc.len() == text.len()`
+/// だけでは不十分 — shrink + expand 打ち消し (KELVIN SIGN + Turkish
+/// dotted I の混在等) で per-char offset がずれているケースを通してしまい、
+/// `text_lc` 上で得た byte offset で `text` を slice すると char-boundary
+/// 違反で panic し得るため。strict guard が false のときは呼び出し側で
+/// no-match に倒すこと。non-ASCII の真の case 比較は NFC normalize 込み
+/// の別フェーズで扱う。
 fn word_boundary_contains_in_lowercased(text_lc: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
