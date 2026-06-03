@@ -407,58 +407,65 @@ pub(super) enum IngestPreCheck {
     Proceed,
 }
 
-/// ingest_raw / ingest 受信時の **wrapper レベル dedup pre-check**。
-///
-/// 順序:
-/// 1. shared + own personal の 2 schema について、`DEDUP_SCAN_NODE_TYPES`
-///    各 node_type の `attributes.name` 一覧を `query_nodes` で取得。
-/// 2. `text` に対し word boundary 一致 (case-insensitive) でスキャン:
-///    - **shared 側ヒット最優先**: 抑制 (`BlockedByShared`) して返す。
-///    - shared に無く personal にあれば表記揺れと判断、`Rewritten` で
-///      canonical name へ replace。
-/// 3. どちらにもヒットしなければ `Proceed`。
-///
-/// fetch 失敗は best-effort (= 警告のみで Proceed 扱い)。
-pub(super) async fn ingest_pre_check(
+/// `collect_dedup_catalogue` の戻り値: 1 リクエストで一度だけ fetch すれば
+/// 良い entity 一覧。`ingest` の batch 内では同一 catalogue を全 message で
+/// 共有して N×fetch を避ける。
+#[derive(Debug, Default, Clone)]
+pub(super) struct DedupCatalogue {
+    pub shared: Vec<EntityRef>,
+    pub personal: Vec<EntityRef>,
+}
+
+/// dedup pre-check 用の entity 一覧を **1 リクエスト 1 回だけ** 取得する。
+/// `DEDUP_SCAN_NODE_TYPES` × {shared, personal} の組み合わせ (= 上限 8) を
+/// query_nodes で集める。fetch 失敗 (個別 node_type / schema 単位) は
+/// `fetch_entity_names` の中で warn + 空 Vec に落とすので、pre-check 全体を
+/// 止めずに済む。
+pub(super) async fn collect_dedup_catalogue(
     state: &AppState,
     user: &AuthenticatedUser,
-    text: &str,
-) -> IngestPreCheck {
+) -> DedupCatalogue {
     let shared_schema = state.cfg.shared_schema_name.as_str();
-    // shared 側 entity を最優先で集める (抑制対象判定が早ければ早いほど良い)。
-    let mut shared_entities: Vec<EntityRef> = Vec::new();
-    let mut personal_entities: Vec<EntityRef> = Vec::new();
+    let mut shared: Vec<EntityRef> = Vec::new();
+    let mut personal: Vec<EntityRef> = Vec::new();
     for node_type in DEDUP_SCAN_NODE_TYPES {
         for name in fetch_entity_names(state, shared_schema, node_type).await {
-            shared_entities.push(EntityRef {
+            shared.push(EntityRef {
                 name,
                 node_type: (*node_type).to_string(),
                 schema: shared_schema.to_string(),
             });
         }
         for name in fetch_entity_names(state, &user.vegapunk_schema, node_type).await {
-            personal_entities.push(EntityRef {
+            personal.push(EntityRef {
                 name,
                 node_type: (*node_type).to_string(),
                 schema: user.vegapunk_schema.clone(),
             });
         }
     }
+    DedupCatalogue { shared, personal }
+}
 
-    // shared にヒットがあれば即抑制。複数ヒットでも 1 件返す (= user 向け説明用)。
-    for ent in &shared_entities {
+/// `text` に対し catalogue を当てて pre-check 結果を返す **pure な scan**。
+/// I/O 無しなので per-message ループで何度呼んでも safe。
+///
+/// 判定順:
+/// 1. shared にヒット → 抑制 (`BlockedByShared`)。複数ヒットでも 1 件返す。
+/// 2. shared 無し / personal にヒット → 表記揺れと判断、canonical name に rewrite。
+/// 3. いずれも該当無し → `Proceed`。
+pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -> IngestPreCheck {
+    for ent in &catalogue.shared {
         let key = normalize_entity_key(&ent.name);
         if word_boundary_contains_normalized(text, &key) {
             return IngestPreCheck::BlockedByShared { hit: ent.clone() };
         }
     }
 
-    // personal にヒットがあれば canonical name に rewrite。
     let mut new_text = text.to_string();
     let mut rewrites = Vec::new();
-    for ent in &personal_entities {
+    for ent in &catalogue.personal {
         let key = normalize_entity_key(&ent.name);
-        // 既に canonical name と完全一致 (= 大文字小文字も) なら rewrite 不要。
         if let Some(updated) = replace_word_case_insensitive(&new_text, &key, &ent.name) {
             if updated != new_text {
                 rewrites.push(ent.clone());
@@ -738,10 +745,12 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
         Ok(r) => r,
         Err(e) => return invalid_args_content("ingest", &e),
     };
-    // 各 message について dedup pre-check。shared 既存はバッチごと抑制、
-    // personal 表記揺れは text を canonical name に rewrite して続行する。
+    // dedup pre-check: entity 一覧の fetch を **batch 全体で 1 回**
+    // (= 8 query_nodes 上限) に抑え、scan は pure 関数で per-message に
+    // 適用する。N messages × 8 fetch の問題を回避する。
+    let catalogue = collect_dedup_catalogue(state, user).await;
     for (i, msg) in request.messages.iter_mut().enumerate() {
-        match ingest_pre_check(state, user, &msg.text).await {
+        match scan_text_with_catalogue(&catalogue, &msg.text) {
             IngestPreCheck::BlockedByShared { hit } => {
                 return shared_dedup_block_content(&format!("ingest (messages[{i}])"), &hit);
             }
@@ -775,7 +784,9 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
         Err(e) => return invalid_args_content("ingest_raw", &e),
     };
     // dedup pre-check。shared 既存は抑制、personal 表記揺れは canonical 化。
-    match ingest_pre_check(state, user, &request.text).await {
+    // catalogue 取得は ingest_raw 1 件あたり 1 回。
+    let catalogue = collect_dedup_catalogue(state, user).await;
+    match scan_text_with_catalogue(&catalogue, &request.text) {
         IngestPreCheck::BlockedByShared { hit } => {
             return shared_dedup_block_content("ingest_raw", &hit);
         }
@@ -1126,8 +1137,10 @@ pub(super) async fn get_traceable_chain(
     args: Value,
 ) -> Value {
     // node_id がどちらの schema にあるかは呼び出し側からは分からないので、
-    // 両 schema で並行に試行する。links が返った方を採用し、両方空 / 両方
-    // 失敗のときだけエラーにする。
+    // 両 schema で並行に試行する。links が返った方を優先採用し、**両方 Err
+    // のときだけ tonic error にして返す** (= 片方 Err は warn + 残った方を
+    // 使う、両方 Ok で両方 links 空でも personal 側の空 chain を success と
+    // して返す)。
     let personal_req = match build_get_traceable_chain_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("get_traceable_chain", &e),
