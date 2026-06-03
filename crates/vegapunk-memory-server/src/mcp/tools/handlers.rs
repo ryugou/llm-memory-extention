@@ -605,10 +605,16 @@ pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Val
         })
         .collect();
 
+    // backward compat: 既存 client は top-level `search_id` (= personal の id)
+    // を `feedback` tool に渡す前提なのでそのまま残す。新規 client は
+    // `search_ids.{personal,shared}` で両方の id を取得できる。
+    let personal_search_id = personal.search_id;
+    let shared_search_id = shared.as_ref().map(|s| s.search_id.clone());
     success_content(json!({
+        "search_id": personal_search_id.clone(),
         "search_ids": {
-            "personal": personal.search_id,
-            "shared": shared.as_ref().map(|s| s.search_id.clone()),
+            "personal": personal_search_id,
+            "shared": shared_search_id,
         },
         "total_count": personal.total_count + shared.as_ref().map(|s| s.total_count).unwrap_or(0),
         "results": merged_results,
@@ -655,13 +661,15 @@ pub(super) async fn get_schema(state: &AppState, user: &AuthenticatedUser) -> Va
         }
     };
 
+    // backward compat: 既存 client は top-level の name / schema_yaml /
+    // version / description を読む前提で書かれているので、personal schema の
+    // 値をそのまま top-level に残す。`shared` は新規 field として optional に
+    // 併設する (shared schema 未作成時は null)。
     success_content(json!({
-        "personal": {
-            "name": personal.name,
-            "schema_yaml": personal.schema_yaml,
-            "version": personal.version,
-            "description": personal.description,
-        },
+        "name": personal.name,
+        "schema_yaml": personal.schema_yaml,
+        "version": personal.version,
+        "description": personal.description,
         "shared": shared_json,
     }))
 }
@@ -976,7 +984,18 @@ pub(super) async fn query_nodes(state: &AppState, user: &AuthenticatedUser, args
     // データが優先表示」という直感的な挙動を担保する。
     let client_offset = personal_req.offset.unwrap_or(0).max(0);
     let client_limit = personal_req.limit;
-    let fetch_limit = client_limit.map(|l| client_offset.saturating_add(l.max(0)));
+    // fetch_limit = `offset + limit` を投げて merge 後に slice したいが、
+    // `client_offset + client_limit` が proto/wrapper の上限 (= QUERY_NODES_LIMIT_MAX)
+    // を超えると vegapunk が invalid_argument を返してしまう。client が validate
+    // 範囲内の値を渡しても fan-out で上限超過になり得るので、ここで上限へ
+    // clamp する。トレードオフ: `offset + limit > LIMIT_MAX` の領域では片方の
+    // schema からの fetch 量が LIMIT_MAX に頭打ちになり、結果 page から欠落
+    // しうる (= deep pagination は backend 仕様で制約される)。
+    let fetch_limit = client_limit.map(|l| {
+        client_offset
+            .saturating_add(l.max(0))
+            .min(QUERY_NODES_LIMIT_MAX as i32)
+    });
     let mut personal_req = personal_req;
     personal_req.offset = Some(0);
     personal_req.limit = fetch_limit;
@@ -1114,13 +1133,14 @@ pub(super) async fn stats(state: &AppState, user: &AuthenticatedUser, args: Valu
             Value::Null
         }
     };
+    // backward compat: 既存 client は top-level の counter を読む前提なので
+    // personal の値を top-level に残し、`shared` は新規 field として併設する
+    // (shared 取得失敗時は null)。
     success_content(json!({
-        "personal": {
-            "node_count": personal.node_count,
-            "edge_count": personal.edge_count,
-            "vector_count": personal.vector_count,
-            "community_count": personal.community_count,
-        },
+        "node_count": personal.node_count,
+        "edge_count": personal.edge_count,
+        "vector_count": personal.vector_count,
+        "community_count": personal.community_count,
         "shared": shared_json,
     }))
 }
