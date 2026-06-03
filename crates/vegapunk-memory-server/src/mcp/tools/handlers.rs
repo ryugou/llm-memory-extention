@@ -250,20 +250,18 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// `text` に `needle` (= 正規化済キー) が **word boundary 境界** で含まれて
-/// いるかを case-insensitive で判定する。`Vegapunk` で「Vegapunk Inc.」は
-/// 検出するが「Vegapunker」は検出しない。
+/// 既に lowercased な `text_lc` 上で word boundary scan を行う。
+/// 呼び出し側で `text_lc.len() == text.len()` を確認済みであること
+/// (= byte offset が元 text とずれないという前提)。catalogue scan の
+/// ホットパスで `text.to_lowercase()` を per-entity に allocate しないよう、
+/// scan 本体はこの関数に切り出して 1 回作った `text_lc` を使い回す。
 ///
-/// 制約: `text.to_lowercase()` の byte length が元と異なる場合 (例: Turkish
-/// dotted I `İ` (2 bytes) → `i\u{0307}` (3 bytes)) は byte offset が元 text
-/// にマップできないため conservative に `false` (= no match) を返す。
-/// non-ASCII の真の case 比較は NFC normalize 込みの別フェーズで扱う。
-fn word_boundary_contains_normalized(text: &str, needle: &str) -> bool {
+/// `text.to_lowercase()` の byte length が元と異なる場合 (例: Turkish
+/// dotted I `İ` (2 bytes) → `i\u{0307}` (3 bytes)) のサポートはここでは
+/// 持たない — 呼び出し側で no-match に倒すこと。non-ASCII の真の case
+/// 比較は NFC normalize 込みの別フェーズで扱う。
+fn word_boundary_contains_in_lowercased(text_lc: &str, needle: &str) -> bool {
     if needle.is_empty() {
-        return false;
-    }
-    let text_lc = text.to_lowercase();
-    if text_lc.len() != text.len() {
         return false;
     }
     let mut start = 0usize;
@@ -296,9 +294,9 @@ fn word_boundary_contains_normalized(text: &str, needle: &str) -> bool {
 /// 出現する箇所を、`canonical` で **case-preserving に置換** した文字列を返す。
 /// 出現がなければ `None`。複数出現は全置換。
 ///
-/// 制約: `word_boundary_contains_normalized` と同じく、`to_lowercase()` で
-/// byte length が変わるケースでは元 text に offset を反映できないため no-op
-/// (= `None`) を返す。NFC 正規化込みの真の対応は別フェーズ。
+/// 制約: `word_boundary_contains_in_lowercased` と同じく、`to_lowercase()`
+/// で byte length が変わるケースでは元 text に offset を反映できないため
+/// no-op (= `None`) を返す。NFC 正規化込みの真の対応は別フェーズ。
 fn replace_word_case_insensitive(
     text: &str,
     needle_normalized: &str,
@@ -462,13 +460,30 @@ pub(super) async fn collect_dedup_catalogue(
 /// 2. shared 無し / personal にヒット → 表記揺れと判断、canonical name に rewrite。
 /// 3. いずれも該当無し → `Proceed`。
 pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -> IngestPreCheck {
+    // shared scan は text を変更しないので `text_lc` を 1 回作って per-entity
+    // で再利用する。catalogue.shared は最大 8000 entity × messages 件数まで
+    // 膨らみ得るため、ここで per-entity に lowercase を allocate すると
+    // ホットパスのコストが O(entity × text_len) になってしまう。
+    let text_lc = text.to_lowercase();
+    let text_lc_byte_aligned = text_lc.len() == text.len();
     for ent in &catalogue.shared {
         let key = normalize_entity_key(&ent.name);
-        if word_boundary_contains_normalized(text, &key) {
+        let hit = if text_lc_byte_aligned {
+            word_boundary_contains_in_lowercased(&text_lc, &key)
+        } else {
+            // byte length が一致しないケースは元の helper と同じく
+            // conservative に no-match (= NFC を絡める将来フェーズで扱う)。
+            false
+        };
+        if hit {
             return IngestPreCheck::BlockedByShared { hit: ent.clone() };
         }
     }
 
+    // personal scan は rewrite で `new_text` が変わるため、各 iteration で
+    // lowercase が必要になる (= replace_word_case_insensitive 側で 1 回作る
+    // 既存挙動のままにする)。personal entity 数は通常自分の schema 内に
+    // 限られるため、shared 側ほどホットではない。
     let mut new_text = text.to_string();
     let mut rewrites = Vec::new();
     for ent in &catalogue.personal {
@@ -568,8 +583,18 @@ pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Val
         .unwrap_or(&empty_results);
     for item in personal.results.iter().chain(shared_results.iter()) {
         let v = search_result_item_json(item);
-        let key = format!("{}:{}", v["type"], v["id"]);
-        if seen.insert(key) {
+        // id が文字列で非空のときだけ dedup する。proto 的に `id` は optional
+        // で、`null` / 空文字を含めて `"{type}:null"` という同一 key にまとめて
+        // しまうと、id 無しの結果が 2 件目以降ごっそり落ちる事故になる。
+        // id が無いものは dedup の対象外 (= 全部素通し) にする。
+        let should_keep = match v["id"].as_str() {
+            Some(id) if !id.is_empty() => {
+                let key = format!("{}:{}", v["type"], id);
+                seen.insert(key)
+            }
+            _ => true,
+        };
+        if should_keep {
             // None / NaN は両方 NEG_INFINITY に正規化して必ず最下位に落とす。
             // (total_cmp の全順序では負の NaN が NEG_INFINITY より下に来る
             //  ので、生 NaN を素通しすると top_k truncate が不安定になる。)
@@ -1879,46 +1904,45 @@ mod tests {
         assert_eq!(normalize_entity_key("\tfoo BAR\n"), "foo bar");
     }
 
+    // test helper: 旧 `word_boundary_contains_normalized` 相当の薄い wrapper。
+    // production は lowercased text を再利用するホットパスで直接 helper を
+    // 呼ぶ (= scan_text_with_catalogue 参照)、test はこの簡便版を使う。
+    fn wb_contains_for_test(text: &str, needle: &str) -> bool {
+        if needle.is_empty() {
+            return false;
+        }
+        let text_lc = text.to_lowercase();
+        if text_lc.len() != text.len() {
+            return false;
+        }
+        word_boundary_contains_in_lowercased(&text_lc, needle)
+    }
+
     #[test]
     fn word_boundary_contains_matches_isolated_words() {
-        assert!(word_boundary_contains_normalized(
-            "hello vegapunk world",
-            "vegapunk"
-        ));
-        assert!(word_boundary_contains_normalized(
-            "Vegapunk launched",
-            "vegapunk"
-        ));
-        assert!(word_boundary_contains_normalized(
-            "VEGAPUNK ROCKS",
-            "vegapunk"
-        ));
+        assert!(wb_contains_for_test("hello vegapunk world", "vegapunk"));
+        assert!(wb_contains_for_test("Vegapunk launched", "vegapunk"));
+        assert!(wb_contains_for_test("VEGAPUNK ROCKS", "vegapunk"));
     }
 
     #[test]
     fn word_boundary_contains_rejects_substring_inside_word() {
         // "Vegapunker" inside should NOT match "vegapunk" alone.
-        assert!(!word_boundary_contains_normalized(
-            "Vegapunker rocks",
-            "vegapunk"
-        ));
-        assert!(!word_boundary_contains_normalized("XVegapunkX", "vegapunk"));
+        assert!(!wb_contains_for_test("Vegapunker rocks", "vegapunk"));
+        assert!(!wb_contains_for_test("XVegapunkX", "vegapunk"));
     }
 
     #[test]
     fn word_boundary_contains_handles_punctuation_boundaries() {
         // 句読点や括弧は word boundary として扱う。
-        assert!(word_boundary_contains_normalized("Vegapunk.", "vegapunk"));
-        assert!(word_boundary_contains_normalized("(Vegapunk)", "vegapunk"));
-        assert!(word_boundary_contains_normalized(
-            "see: vegapunk!",
-            "vegapunk"
-        ));
+        assert!(wb_contains_for_test("Vegapunk.", "vegapunk"));
+        assert!(wb_contains_for_test("(Vegapunk)", "vegapunk"));
+        assert!(wb_contains_for_test("see: vegapunk!", "vegapunk"));
     }
 
     #[test]
     fn word_boundary_contains_returns_false_for_empty_needle() {
-        assert!(!word_boundary_contains_normalized("anything", ""));
+        assert!(!wb_contains_for_test("anything", ""));
     }
 
     #[test]
