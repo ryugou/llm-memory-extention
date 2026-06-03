@@ -326,21 +326,44 @@ fn word_boundary_contains_in_lowercased(text_lc: &str, needle: &str) -> bool {
 /// 制約: `word_boundary_contains_in_lowercased` と同じく、`to_lowercase()`
 /// で byte length が変わるケースでは元 text に offset を反映できないため
 /// no-op (= `None`) を返す。NFC 正規化込みの真の対応は別フェーズ。
+/// `replace_word_case_insensitive_with_lc` の薄い stand-alone wrapper。
+/// 現状は tests からのみ呼ばれる (= production の hot-path は直接
+/// `_with_lc` 版を使い、`text_lc` を catalogue 全体で再利用するため)。
+#[cfg(test)]
 fn replace_word_case_insensitive(
     text: &str,
+    needle_normalized: &str,
+    canonical: &str,
+) -> Option<String> {
+    if !is_lowercase_byte_aligned(text) {
+        return None;
+    }
+    let text_lc = text.to_lowercase();
+    replace_word_case_insensitive_with_lc(text, &text_lc, needle_normalized, canonical)
+}
+
+/// `text` の中に `needle_normalized` (= 正規化済キー) が word boundary で
+/// 出現する箇所を、すべて `canonical` 文字列に置換した結果を返す。
+/// 既に作ってある `text_lc` を渡すことで、ホットパス (= catalogue を回す
+/// per-entity ループ) で `text.to_lowercase()` を allocate しなくて済む。
+///
+/// **呼び出し側の責任**:
+/// - `text_lc == text.to_lowercase()` であること。
+/// - `is_lowercase_byte_aligned(text)` が true であること
+///   (= `text_lc` の byte offset を `text` の slice に直接マップしても
+///   char-boundary を踏まない前提)。
+///
+/// 戻り値は実際に書き換えが起きたときだけ `Some(updated)`。全 match が
+/// canonical と一致するなら `None`。
+fn replace_word_case_insensitive_with_lc(
+    text: &str,
+    text_lc: &str,
     needle_normalized: &str,
     canonical: &str,
 ) -> Option<String> {
     if needle_normalized.is_empty() {
         return None;
     }
-    // strict guard: per-char で byte 長一致でない場合は no-op。
-    // 単純な `text_lc.len() == text.len()` では shrink + expand 打ち消し
-    // (KELVIN SIGN + Turkish dotted I の混在) を見逃すため使えない。
-    if !is_lowercase_byte_aligned(text) {
-        return None;
-    }
-    let text_lc = text.to_lowercase();
     // lazy alloc: 「実際に書き換わる match (= 元 span が canonical と異なる)」を
     // 初めて見つけるまで `out` を allocate しない。全 match が既に canonical
     // と一致する text (例: 元から正しい表記の "Vegapunk" を含む文章) では、
@@ -554,20 +577,35 @@ pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -
         }
     }
 
-    // personal scan は rewrite で `new_text` が変わるため、各 iteration で
-    // lowercase が必要になる (= replace_word_case_insensitive 側で 1 回作る
-    // 既存挙動のままにする)。personal entity 数は通常自分の schema 内に
-    // 限られるため、shared 側ほどホットではない。
+    // personal scan: text_lc を再利用して per-entity の `to_lowercase()`
+    // を排除する。最大 4000 entity (= 4 node_type × 1000) × messages 件数
+    // を 1 ingest で回す可能性があり、per-entity に text 全体を lowercase
+    // すると O(entities × text_len) の alloc が発生する。
+    //
+    // 戦略: rewrite が起きるまでは 1 度作った `text_lc` を全 entity で
+    // 再利用 (= shared scan で使ったものをそのまま move して引き継ぐ)。
+    // rewrite が起きたら `new_text.to_lowercase()` を作り直す。なお
+    // canonical 名が `is_lowercase_byte_aligned` を崩す可能性は理論上
+    // ある (Turkish I 等を含むケース) ので、rebuild 前に再 check する。
     let mut new_text = text.to_string();
+    let mut new_text_lc: String = text_lc;
     let mut rewrites = Vec::new();
     for ent in &catalogue.personal {
-        // replace_word_case_insensitive は実書き換えが起きたときだけ
-        // Some(updated) を返す。既に canonical な text は None。
-        if let Some(updated) =
-            replace_word_case_insensitive(&new_text, &ent.normalized_key, &ent.name)
-        {
+        let updated = replace_word_case_insensitive_with_lc(
+            &new_text,
+            &new_text_lc,
+            &ent.normalized_key,
+            &ent.name,
+        );
+        if let Some(updated) = updated {
             rewrites.push(ent.clone());
             new_text = updated;
+            if !is_lowercase_byte_aligned(&new_text) {
+                // 後続の scan は safety guard を再保証できないので break。
+                // ここまでの rewrite は確定として `new_text` に乗っている。
+                break;
+            }
+            new_text_lc = new_text.to_lowercase();
         }
     }
 
@@ -874,9 +912,11 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
                 return shared_dedup_block_content(&format!("ingest (messages[{i}])"), &hit);
             }
             IngestPreCheck::Rewritten { new_text, rewrites } => {
-                tracing::info!(
+                // entity 名 (Person 等) を default 出力する INFO に載せると
+                // 個人情報の漏えいリスクがあるので DEBUG に下げ、本数のみ出す。
+                tracing::debug!(
                     message_index = i,
-                    rewrites = ?rewrites,
+                    rewrite_count = rewrites.len(),
                     "ingest text normalized to existing canonical names",
                 );
                 msg.text = new_text;
@@ -910,8 +950,9 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
             return shared_dedup_block_content("ingest_raw", &hit);
         }
         IngestPreCheck::Rewritten { new_text, rewrites } => {
-            tracing::info!(
-                rewrites = ?rewrites,
+            // ingest と同じく entity 名は default log に載せず、本数のみ DEBUG。
+            tracing::debug!(
+                rewrite_count = rewrites.len(),
                 "ingest_raw text normalized to existing canonical names",
             );
             request.text = new_text;
