@@ -510,29 +510,29 @@ pub(super) async fn collect_dedup_catalogue(
 /// 2. shared 無し / personal にヒット → 表記揺れと判断、canonical name に rewrite。
 /// 3. いずれも該当無し → `Proceed`。
 pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -> IngestPreCheck {
-    // shared scan は text を変更しないので `text_lc` を 1 回作って per-entity
-    // で再利用する。catalogue.shared は最大 8000 entity × messages 件数まで
-    // 膨らみ得るため、ここで per-entity に lowercase を allocate すると
-    // ホットパスのコストが O(entity × text_len) になってしまう。
-    //
     // alignment guard は `is_lowercase_byte_aligned(text)` を使う。
     // (`text_lc.len() == text.len()` だけだと shrink + expand 打ち消しの
     // ケース — KELVIN SIGN U+212A → 'k' と Turkish dotted I U+0130 →
     // i\u{0307} が混在する text — を検出できず、`text_lc` 上の byte offset
     // で `text` を slice したときに char-boundary 違反で panic し得る。)
-    let text_lc_byte_aligned = is_lowercase_byte_aligned(text);
+    //
+    // guard が false な text は shared scan も personal rewrite (=
+    // replace_word_case_insensitive の strict guard) も全部 no-op に倒れる
+    // ので、結果は確実に `Proceed`。`to_lowercase()` (= 大きな String alloc)
+    // と entity loop の両方を skip して early return する。
+    if !is_lowercase_byte_aligned(text) {
+        return IngestPreCheck::Proceed;
+    }
+
+    // shared scan は text を変更しないので `text_lc` を 1 回作って per-entity
+    // で再利用する。catalogue.shared は最大 8000 entity × messages 件数まで
+    // 膨らみ得るため、ここで per-entity に lowercase を allocate すると
+    // ホットパスのコストが O(entity × text_len) になってしまう。
     let text_lc = text.to_lowercase();
     for ent in &catalogue.shared {
         // ent.normalized_key は catalogue 構築時に 1 回だけ作ってあるので
         // scan のホットパスでは `trim + to_lowercase` を回さず再利用する。
-        let hit = if text_lc_byte_aligned {
-            word_boundary_contains_in_lowercased(&text_lc, &ent.normalized_key)
-        } else {
-            // byte alignment が崩れているケースは conservative に no-match
-            // (= NFC を絡める将来フェーズで扱う)。
-            false
-        };
-        if hit {
+        if word_boundary_contains_in_lowercased(&text_lc, &ent.normalized_key) {
             return IngestPreCheck::BlockedByShared { hit: ent.clone() };
         }
     }
