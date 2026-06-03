@@ -582,37 +582,43 @@ pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -
     // を 1 ingest で回す可能性があり、per-entity に text 全体を lowercase
     // すると O(entities × text_len) の alloc が発生する。
     //
-    // 戦略: rewrite が起きるまでは 1 度作った `text_lc` を全 entity で
-    // 再利用 (= shared scan で使ったものをそのまま move して引き継ぐ)。
-    // rewrite が起きたら `new_text.to_lowercase()` を作り直す。なお
-    // canonical 名が `is_lowercase_byte_aligned` を崩す可能性は理論上
-    // ある (Turkish I 等を含むケース) ので、rebuild 前に再 check する。
-    let mut new_text = text.to_string();
+    // 戦略:
+    // - rewrite が起きるまでは `text` を借りたまま、`text_lc` も
+    //   shared scan で作ったものをそのまま再利用する (= no-rewrite な
+    //   一般ケースで `text.to_string()` の alloc を完全に省く)。
+    // - rewrite が起きた瞬間に `new_text_owned: String` を持ち始める。
+    //   以降の scan はこの owned 文字列に対して走る。
+    // - rewrite 後の `new_text.to_lowercase()` を作り直すが、その前に
+    //   `is_lowercase_byte_aligned` を再 check する。canonical 名が
+    //   Turkish I 等 alignment を崩す char を含む可能性があり、崩れたら
+    //   後続 scan は safety guard を再保証できないので break する。
+    let mut new_text_owned: Option<String> = None;
     let mut new_text_lc: String = text_lc;
     let mut rewrites = Vec::new();
     for ent in &catalogue.personal {
+        let current_text = new_text_owned.as_deref().unwrap_or(text);
         let updated = replace_word_case_insensitive_with_lc(
-            &new_text,
+            current_text,
             &new_text_lc,
             &ent.normalized_key,
             &ent.name,
         );
         if let Some(updated) = updated {
             rewrites.push(ent.clone());
-            new_text = updated;
-            if !is_lowercase_byte_aligned(&new_text) {
-                // 後続の scan は safety guard を再保証できないので break。
-                // ここまでの rewrite は確定として `new_text` に乗っている。
+            let aligned = is_lowercase_byte_aligned(&updated);
+            new_text_owned = Some(updated);
+            if !aligned {
                 break;
             }
-            new_text_lc = new_text.to_lowercase();
+            // unwrap: Some(updated) を直前で代入したので確実に Some。
+            new_text_lc = new_text_owned.as_deref().unwrap().to_lowercase();
         }
     }
 
-    if rewrites.is_empty() {
-        IngestPreCheck::Proceed
-    } else {
-        IngestPreCheck::Rewritten { new_text, rewrites }
+    match new_text_owned {
+        Some(new_text) if !rewrites.is_empty() => IngestPreCheck::Rewritten { new_text, rewrites },
+        // rewrite が無い (= alloc も発生していない) 一般ケース。
+        _ => IngestPreCheck::Proceed,
     }
 }
 
