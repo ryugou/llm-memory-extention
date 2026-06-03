@@ -315,7 +315,9 @@ fn word_boundary_contains_in_lowercased(text_lc: &str, needle: &str) -> bool {
 }
 
 /// `text` の中に `needle_normalized` (= 正規化済キー) が word boundary で
-/// 出現する箇所を、`canonical` で **case-preserving に置換** した文字列を返す。
+/// 出現する箇所を、すべて `canonical` 文字列に置換した結果を返す。
+/// マッチ箇所の元のケースは失われ、`canonical` のケースに統一される
+/// (= case-preserving ではなく、case-normalizing な置換)。
 /// 出現がなければ `None`。複数出現は全置換。
 ///
 /// 制約: `word_boundary_contains_in_lowercased` と同じく、`to_lowercase()`
@@ -415,6 +417,24 @@ pub(super) struct EntityRef {
     pub name: String,
     pub node_type: String,
     pub schema: String,
+    /// `normalize_entity_key(name)` の事前計算結果。catalogue 構築時に
+    /// 一度だけ計算し、scan のホットパスで reuse する。shared catalogue
+    /// 単独で最大 8000 entity 規模 × messages 件数の組み合わせで scan が
+    /// 走るため、per-scan に `trim + to_lowercase` を再計算すると無駄な
+    /// `String` allocate がホットパスを支配する。
+    pub normalized_key: String,
+}
+
+impl EntityRef {
+    fn new(name: String, node_type: String, schema: String) -> Self {
+        let normalized_key = normalize_entity_key(&name);
+        Self {
+            name,
+            node_type,
+            schema,
+            normalized_key,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,18 +482,18 @@ pub(super) async fn collect_dedup_catalogue(
             fetch_entity_names(state, &user.vegapunk_schema, node_type),
         );
         for name in shared_names {
-            shared.push(EntityRef {
+            shared.push(EntityRef::new(
                 name,
-                node_type: (*node_type).to_string(),
-                schema: shared_schema.to_string(),
-            });
+                (*node_type).to_string(),
+                shared_schema.to_string(),
+            ));
         }
         for name in personal_names {
-            personal.push(EntityRef {
+            personal.push(EntityRef::new(
                 name,
-                node_type: (*node_type).to_string(),
-                schema: user.vegapunk_schema.clone(),
-            });
+                (*node_type).to_string(),
+                user.vegapunk_schema.clone(),
+            ));
         }
     }
     DedupCatalogue { shared, personal }
@@ -500,9 +520,10 @@ pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -
     let text_lc_byte_aligned = is_lowercase_byte_aligned(text);
     let text_lc = text.to_lowercase();
     for ent in &catalogue.shared {
-        let key = normalize_entity_key(&ent.name);
+        // ent.normalized_key は catalogue 構築時に 1 回だけ作ってあるので
+        // scan のホットパスでは `trim + to_lowercase` を回さず再利用する。
         let hit = if text_lc_byte_aligned {
-            word_boundary_contains_in_lowercased(&text_lc, &key)
+            word_boundary_contains_in_lowercased(&text_lc, &ent.normalized_key)
         } else {
             // byte alignment が崩れているケースは conservative に no-match
             // (= NFC を絡める将来フェーズで扱う)。
@@ -520,8 +541,9 @@ pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -
     let mut new_text = text.to_string();
     let mut rewrites = Vec::new();
     for ent in &catalogue.personal {
-        let key = normalize_entity_key(&ent.name);
-        if let Some(updated) = replace_word_case_insensitive(&new_text, &key, &ent.name) {
+        if let Some(updated) =
+            replace_word_case_insensitive(&new_text, &ent.normalized_key, &ent.name)
+        {
             if updated != new_text {
                 rewrites.push(ent.clone());
                 new_text = updated;
@@ -2034,11 +2056,7 @@ mod tests {
     fn shared_dedup_block_content_marks_iserror_and_names_entity() {
         let v = shared_dedup_block_content(
             "ingest_raw",
-            &EntityRef {
-                name: "Vegapunk".into(),
-                node_type: "Project".into(),
-                schema: "sivira-shared".into(),
-            },
+            &EntityRef::new("Vegapunk".into(), "Project".into(), "sivira-shared".into()),
         );
         assert_eq!(v["isError"], true);
         let text = v["content"][0]["text"].as_str().unwrap();
