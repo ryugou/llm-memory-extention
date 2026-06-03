@@ -13,19 +13,27 @@
 //! 8. We verify PKCE and issue (access_token, refresh_token).
 //!
 //! Schema naming (step 5):
-//! - **Personal**: `user-{google_subject}` — derived right here in the
-//!   callback. Google sub is unique and immutable; we don't add a provider
-//!   prefix because Google is currently the only supported IdP (extend to
-//!   `user-{provider}-{subject}` if a second one is added).
+//! - **Personal**: when a brand-new user row is being created in this same
+//!   callback, the wrapper assigns `user-{google_subject}` as the schema
+//!   name. Google sub is unique and immutable; no provider prefix because
+//!   Google is currently the only supported IdP (extend to
+//!   `user-{provider}-{subject}` if a second one is added). For **existing**
+//!   users `find_or_provision` returns the row as-is — whatever
+//!   `vegapunk_schema` value the row already holds is what gets used. The
+//!   cross-tenant guard in `users::find_or_provision` deliberately blocks
+//!   re-naming on re-sign-in (= a schema migration is an explicit admin
+//!   action, not a side effect of OAuth).
 //! - **Shared**: `AsState.shared_schema` — operator-configured via
 //!   `ServerConfig.shared_schema_name` (env `VEGAPUNK_SHARED_SCHEMA_NAME`,
 //!   default `sivira-shared`).
 //!
-//! Both schemas are ensured on every callback; the provisioner folds
-//! `AlreadyExists` into success, so re-sign-ins are no-ops on the wrapper
-//! side. Failures of `ensure_schema` are warned and the OAuth flow proceeds
-//! — the user can still complete sign-in and the failure will resurface
-//! as a tonic error the moment they invoke a tool that needs the schema.
+//! Both schemas are ensured on every callback (the personal one is the
+//! actual stored value, not the freshly-derived `user-{sub}` form). The
+//! provisioner folds `AlreadyExists` into success, so re-sign-ins are
+//! no-ops on the wrapper side. Failures of `ensure_schema` are warned and
+//! the OAuth flow proceeds — the user can still complete sign-in and the
+//! failure will resurface as a tonic error the moment they invoke a tool
+//! that needs the schema.
 
 use std::collections::HashMap;
 use std::sync::Arc;

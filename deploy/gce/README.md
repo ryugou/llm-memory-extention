@@ -516,10 +516,10 @@ vegapunk-memory-server の `users` テーブルは wiki と独立 (`crates/vegap
 
 命名規則:
 
-- 個人 schema: `user-{google_subject}` (Google sub は不変・一意なので衝突しない。Google 以外の provider を追加するときは `user-{provider}-{subject}` に拡張する)
+- 個人 schema: **新規 user の初回 sign-in 時のみ** `user-{google_subject}` で provision される (Google sub は不変・一意なので衝突しない、Google 以外の provider を追加するときは `user-{provider}-{subject}` に拡張する)。既存 user の `users.vegapunk_schema` は OAuth callback では **絶対に上書きされない** ので、過去に別命名で provision したユーザはその値が維持される (cross-tenant guard)。スキーマ名を変更したい場合は admin が手動で別途処理する。
 - 共有 schema: `${VEGAPUNK_SHARED_SCHEMA_NAME}` (default `sivira-shared`)
 
-OAuth callback は両 schema に対して `ensure_schema` (= vegapunk `CreateSchema`) を毎回 idempotent に呼ぶ (`AlreadyExists` は無視)。新規 schema の YAML source は `${VEGAPUNK_DEFAULT_SCHEMA_TEMPLATE}` で指定された vegapunk `SchemaTemplate` (default `discussion`) からコピーされる。template 名が vegapunk 側に存在しないと `CreateSchema` が失敗するので、`ListSchemaTemplates` で利用可能な template を確認しておく。
+OAuth callback は両 schema に対して `ensure_schema` (= vegapunk `CreateSchema`) を毎回 idempotent に呼ぶ (個人側は `users` 行が持つ実値 / 共有側は env で固定、いずれも `AlreadyExists` は無視)。新規 schema の YAML source は `${VEGAPUNK_DEFAULT_SCHEMA_TEMPLATE}` で指定された vegapunk `SchemaTemplate` (default `discussion`) からコピーされる。template 名が vegapunk 側に存在しないと `CreateSchema` が失敗するので、`ListSchemaTemplates` で利用可能な template を確認しておく。
 
 `ensure_schema` が失敗しても OAuth フロー自体は通る (= log に warn が出る)。失敗の影響は最初に tool を呼んだ時の tonic error として client 側に surface する設計。
 
