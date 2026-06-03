@@ -244,6 +244,30 @@ fn normalize_entity_key(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
+/// `text.to_lowercase()` の各 char が **元 char と 1 対 1 + byte 長一致** で
+/// 対応しているかを確認する strict alignment guard。
+///
+/// 「`text_lc.len() == text.len()`」だけでは不十分: 例えば KELVIN SIGN
+/// (U+212A, 3 bytes) は `k` (1 byte) に shrink し、Turkish dotted I
+/// (U+0130, 2 bytes) は `i\u{0307}` (3 bytes) に expand する。両者が混在
+/// すれば total byte 長が偶然一致しても per-char offset がずれ、
+/// `text_lc` 上で得た byte offset で `text` を slice すると **char 境界外
+/// で panic** する可能性がある (= UTF-8 char boundary 違反)。
+///
+/// この関数が `true` を返す場合に限り、`text_lc` 上の byte offset を
+/// `text` に直接マップして slice しても安全と見做せる。それ以外
+/// (= 1 char が複数 lowercase char にマップされる / 長さが変わる) は
+/// conservative に scan / rewrite を no-op に倒す。
+fn is_lowercase_byte_aligned(text: &str) -> bool {
+    text.chars().all(|c| {
+        let mut iter = c.to_lowercase();
+        match (iter.next(), iter.next()) {
+            (Some(lc), None) => lc.len_utf8() == c.len_utf8(),
+            _ => false,
+        }
+    })
+}
+
 /// `is_word_char` 風の判定。alphanumeric + underscore に CJK (= 連続した
 /// 日本語名で word boundary を区切りたくないため) を含める粗い定義。
 fn is_word_char(c: char) -> bool {
@@ -305,10 +329,13 @@ fn replace_word_case_insensitive(
     if needle_normalized.is_empty() {
         return None;
     }
-    let text_lc = text.to_lowercase();
-    if text_lc.len() != text.len() {
+    // strict guard: per-char で byte 長一致でない場合は no-op。
+    // 単純な `text_lc.len() == text.len()` では shrink + expand 打ち消し
+    // (KELVIN SIGN + Turkish dotted I の混在) を見逃すため使えない。
+    if !is_lowercase_byte_aligned(text) {
         return None;
     }
+    let text_lc = text.to_lowercase();
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
     let mut found_any = false;
@@ -464,15 +491,21 @@ pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -
     // で再利用する。catalogue.shared は最大 8000 entity × messages 件数まで
     // 膨らみ得るため、ここで per-entity に lowercase を allocate すると
     // ホットパスのコストが O(entity × text_len) になってしまう。
+    //
+    // alignment guard は `is_lowercase_byte_aligned(text)` を使う。
+    // (`text_lc.len() == text.len()` だけだと shrink + expand 打ち消しの
+    // ケース — KELVIN SIGN U+212A → 'k' と Turkish dotted I U+0130 →
+    // i\u{0307} が混在する text — を検出できず、`text_lc` 上の byte offset
+    // で `text` を slice したときに char-boundary 違反で panic し得る。)
+    let text_lc_byte_aligned = is_lowercase_byte_aligned(text);
     let text_lc = text.to_lowercase();
-    let text_lc_byte_aligned = text_lc.len() == text.len();
     for ent in &catalogue.shared {
         let key = normalize_entity_key(&ent.name);
         let hit = if text_lc_byte_aligned {
             word_boundary_contains_in_lowercased(&text_lc, &key)
         } else {
-            // byte length が一致しないケースは元の helper と同じく
-            // conservative に no-match (= NFC を絡める将来フェーズで扱う)。
+            // byte alignment が崩れているケースは conservative に no-match
+            // (= NFC を絡める将来フェーズで扱う)。
             false
         };
         if hit {
@@ -1907,14 +1940,16 @@ mod tests {
     // test helper: 旧 `word_boundary_contains_normalized` 相当の薄い wrapper。
     // production は lowercased text を再利用するホットパスで直接 helper を
     // 呼ぶ (= scan_text_with_catalogue 参照)、test はこの簡便版を使う。
+    // alignment guard は production と同じ `is_lowercase_byte_aligned` を使い、
+    // 挙動の差が出ないようにする。
     fn wb_contains_for_test(text: &str, needle: &str) -> bool {
         if needle.is_empty() {
             return false;
         }
-        let text_lc = text.to_lowercase();
-        if text_lc.len() != text.len() {
+        if !is_lowercase_byte_aligned(text) {
             return false;
         }
+        let text_lc = text.to_lowercase();
         word_boundary_contains_in_lowercased(&text_lc, needle)
     }
 
@@ -1943,6 +1978,27 @@ mod tests {
     #[test]
     fn word_boundary_contains_returns_false_for_empty_needle() {
         assert!(!wb_contains_for_test("anything", ""));
+    }
+
+    #[test]
+    fn replace_word_case_insensitive_returns_none_on_misaligned_lowercase() {
+        // U+212A KELVIN SIGN (3 bytes) → 'k' (1 byte) = shrink -2
+        // U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE (2 bytes) →
+        //   "i\u{0307}" (3 bytes) = expand +1
+        // 全体長は (3 + 2 + 2) → (1 + 3 + 3) = 7 で同じだが、per-char で
+        // byte offset がずれているため `text_lc` の byte index を `text` に
+        // 直接マップすると char-boundary 違反で panic する。
+        // strict guard 経由で no-op (None) を返すこと。
+        let text = "\u{212A}\u{0130}\u{0130}";
+        assert_eq!(text.to_lowercase().len(), text.len());
+        assert!(!is_lowercase_byte_aligned(text));
+        let out = replace_word_case_insensitive(text, "kii", "Foo");
+        assert!(
+            out.is_none(),
+            "strict guard must drop misaligned lowercase to avoid panic"
+        );
+        // wb_contains_for_test も同じ guard で false に倒す。
+        assert!(!wb_contains_for_test(text, "kii"));
     }
 
     #[test]
