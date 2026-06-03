@@ -341,9 +341,14 @@ fn replace_word_case_insensitive(
         return None;
     }
     let text_lc = text.to_lowercase();
-    let mut out = String::with_capacity(text.len());
+    // lazy alloc: 「実際に書き換わる match (= 元 span が canonical と異なる)」を
+    // 初めて見つけるまで `out` を allocate しない。全 match が既に canonical
+    // と一致する text (例: 元から正しい表記の "Vegapunk" を含む文章) では、
+    // String::with_capacity も実 copy も発生せず `None` を返せる。これにより
+    // scan_text_with_catalogue 内で personal catalogue × messages を回す
+    // ホットパスの per-entity alloc が消える。
+    let mut out: Option<String> = None;
     let mut cursor = 0usize;
-    let mut found_any = false;
     let mut search_from = 0usize;
     while let Some(rel) = text_lc[search_from..].find(needle_normalized) {
         let abs = search_from + rel;
@@ -357,10 +362,22 @@ fn replace_word_case_insensitive(
             Some(c) => !is_word_char(c),
         };
         if before_ok && after_ok {
-            out.push_str(&text[cursor..abs]);
-            out.push_str(canonical);
-            cursor = end;
-            found_any = true;
+            let span = &text[abs..end];
+            if span != canonical {
+                // 初めての実書き換え match: ここで初めて alloc する。
+                let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
+                buf.push_str(&text[cursor..abs]);
+                buf.push_str(canonical);
+                cursor = end;
+            } else if let Some(buf) = out.as_mut() {
+                // 既に build 中なら、canonical と同一 match の区間も
+                // そのまま out にコピーして cursor を進める。
+                buf.push_str(&text[cursor..end]);
+                cursor = end;
+            }
+            // out が未 alloc かつ span == canonical の場合は何もしない
+            // (= cursor も進めない。後続で実書き換え match を見つけたら
+            //  そこから先頭の prefix としてまとめて copy される)。
             search_from = end;
         } else {
             search_from = abs
@@ -371,9 +388,9 @@ fn replace_word_case_insensitive(
                     .unwrap_or(1);
         }
     }
-    if found_any {
-        out.push_str(&text[cursor..]);
-        Some(out)
+    if let Some(mut buf) = out {
+        buf.push_str(&text[cursor..]);
+        Some(buf)
     } else {
         None
     }
@@ -544,13 +561,13 @@ pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -
     let mut new_text = text.to_string();
     let mut rewrites = Vec::new();
     for ent in &catalogue.personal {
+        // replace_word_case_insensitive は実書き換えが起きたときだけ
+        // Some(updated) を返す。既に canonical な text は None。
         if let Some(updated) =
             replace_word_case_insensitive(&new_text, &ent.normalized_key, &ent.name)
         {
-            if updated != new_text {
-                rewrites.push(ent.clone());
-                new_text = updated;
-            }
+            rewrites.push(ent.clone());
+            new_text = updated;
         }
     }
 
@@ -2028,12 +2045,31 @@ mod tests {
 
     #[test]
     fn replace_word_case_insensitive_rewrites_to_canonical() {
+        // text が既に canonical 表記なら None (= 実書き換え無し)。
         let out = replace_word_case_insensitive("we use Vegapunk daily", "vegapunk", "Vegapunk");
-        assert_eq!(out.as_deref(), Some("we use Vegapunk daily"));
+        assert_eq!(
+            out, None,
+            "no rewrite expected when match already equals canonical"
+        );
+        // 大文字 / 小文字違いは canonical へ書き換え。
         let out = replace_word_case_insensitive("we use VEGAPUNK daily", "vegapunk", "Vegapunk");
         assert_eq!(out.as_deref(), Some("we use Vegapunk daily"));
         let out = replace_word_case_insensitive("we use vegapunk daily", "vegapunk", "Vegapunk");
         assert_eq!(out.as_deref(), Some("we use Vegapunk daily"));
+    }
+
+    #[test]
+    fn replace_word_case_insensitive_mixed_canonical_and_off_case() {
+        // 1 文中で「既に canonical な match」と「書き換え対象 match」が
+        // 混在するケース: alloc は遅延だが、書き換え後の出力は両方の match
+        // を含む完全な文字列であること。
+        let out =
+            replace_word_case_insensitive("Vegapunk and VEGAPUNK rocks", "vegapunk", "Vegapunk");
+        assert_eq!(out.as_deref(), Some("Vegapunk and Vegapunk rocks"));
+        // 逆順 (= off-case が先、canonical が後) も同様に正しく結合される。
+        let out =
+            replace_word_case_insensitive("VEGAPUNK and Vegapunk rocks", "vegapunk", "Vegapunk");
+        assert_eq!(out.as_deref(), Some("Vegapunk and Vegapunk rocks"));
     }
 
     #[test]
