@@ -724,6 +724,7 @@ async fn ensure_user_and_shared_schemas(
     if let Err(e) = provisioner.ensure_schema(shared_schema).await {
         warn!(
             schema = %shared_schema,
+            user_id = %user_id,
             error = %e,
             "ensure_schema failed for shared schema (continuing OAuth)",
         );
