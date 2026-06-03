@@ -964,10 +964,24 @@ pub(super) async fn query_nodes(state: &AppState, user: &AuthenticatedUser, args
         Ok(r) => r,
         Err(e) => return invalid_args_content("query_nodes", &e),
     };
+    // fan-out 用に request を組み直す。client が指定した `offset` / `limit` は
+    // **union (personal + shared) に対する意味** として解釈し直し、各 schema
+    // には `offset=0`, `limit=client_offset+client_limit` を投げる。これにより
+    //   - client の `offset` が片方の集合だけにかかってしまう問題を回避
+    //   - merge 後に正しく `[offset, offset+limit)` の range を slice できる
+    // sort_by / sort_order は **per-schema 適用** で、cross-schema 全体 sort
+    // は wrapper では再現しない (= proto の sort は backend 側の属性順序を
+    // 使うため、クライアント側で再ソートすると属性の型推測が必要になる)。
+    // personal を先・shared を後ろの安定 order で merge することで「自分の
+    // データが優先表示」という直感的な挙動を担保する。
+    let client_offset = personal_req.offset.unwrap_or(0).max(0);
+    let client_limit = personal_req.limit;
+    let fetch_limit = client_limit.map(|l| client_offset.saturating_add(l.max(0)));
+    let mut personal_req = personal_req;
+    personal_req.offset = Some(0);
+    personal_req.limit = fetch_limit;
     let mut shared_req = personal_req.clone();
     shared_req.schema = state.cfg.shared_schema_name.clone();
-    // merge 後 truncate に使うため、limit を控える。
-    let merged_limit = personal_req.limit;
 
     let mut client_p = state.vegapunk.clone();
     let mut client_s = state.vegapunk.clone();
@@ -993,7 +1007,6 @@ pub(super) async fn query_nodes(state: &AppState, user: &AuthenticatedUser, args
     };
     // node_id は schema を prefix に持つ ULID なので両 schema 跨ぎで衝突
     // しないはず。safety net として dedup を入れる (先勝ち = personal 優先)。
-    // fan-out で limit が 2 倍になるのを防ぐため、merge 後 limit で truncate。
     let mut seen = std::collections::HashSet::new();
     let mut nodes: Vec<Value> = Vec::new();
     let empty_nodes = Vec::new();
@@ -1007,7 +1020,10 @@ pub(super) async fn query_nodes(state: &AppState, user: &AuthenticatedUser, args
             }));
         }
     }
-    if let Some(limit) = merged_limit {
+    // union 全体に対して [client_offset, client_offset + client_limit) で slice。
+    let start = (client_offset as usize).min(nodes.len());
+    nodes.drain(..start);
+    if let Some(limit) = client_limit {
         let limit = limit.max(0) as usize;
         nodes.truncate(limit);
     }
@@ -1148,15 +1164,17 @@ pub(super) async fn get_traceable_chain(
     args: Value,
 ) -> Value {
     // node_id がどちらの schema にあるかは呼び出し側からは分からないので、
-    // 両 schema で並行に試行する。links が返った方を優先採用するが、
-    // **致命的なエラー (= 認証 / 一時的 unavailable など) は素通ししない**:
+    // 両 schema で並行に試行する。エラーの扱いは他 read handler と揃える:
     //
-    // - shared 側の Err は schema 未作成 (= NotFound) のみ非致命扱いとし、
-    //   それ以外 (Unauthenticated / PermissionDenied / Unavailable など) は
-    //   personal が Ok でもエラーで返す。fan-out で片側の本物の障害を
-    //   黙らせると、cross-tenant guard や authz が壊れていても気付けない。
-    // - personal 側の Err も同じく NotFound のみ非致命扱い。
-    // - 両方 Err は素直に personal の Err を tonic_error_content で返す。
+    // - **shared** 側の Err は **best-effort warn + 続行** (= 他 read と同じ
+    //   方針)。shared は誰でも触れる共有 schema で、未作成 / Unavailable /
+    //   PermissionDenied などの状態でも personal が answer を持ち得るので、
+    //   片側で完結できる限り処理を止めない。
+    // - **personal** 側の Err は **NotFound のみ非致命** で、それ以外
+    //   (Unauthenticated / PermissionDenied / Unavailable など) は致命扱い。
+    //   personal の本物の障害を shared が Ok だからと黙らせると、cross-tenant
+    //   guard や authz が壊れていても気付けない。
+    // - 両方 Err は personal の Err を tonic_error_content で返す。
     // - 両方 Ok で両方 links 空のときは personal 側の空 chain を success と
     //   して返す (= "no chain found" を呼び出し側に伝える)。
     let personal_req = match build_get_traceable_chain_request(&user.vegapunk_schema, &args) {
@@ -1186,15 +1204,11 @@ pub(super) async fn get_traceable_chain(
             }
         }
         (Ok(p), Err(s_err)) => {
-            if s_err.code() == tonic::Code::NotFound {
-                tracing::warn!(
-                    code = ?s_err.code(),
-                    "shared get_traceable_chain NotFound (continuing with personal)",
-                );
-                ("personal", p.into_inner())
-            } else {
-                return tonic_error_content("GetTraceableChain (shared)", s_err);
-            }
+            tracing::warn!(
+                code = ?s_err.code(),
+                "shared get_traceable_chain failed (continuing with personal)",
+            );
+            ("personal", p.into_inner())
         }
         (Err(p_err), Ok(s)) => {
             if p_err.code() == tonic::Code::NotFound {
