@@ -436,24 +436,13 @@ async fn callback_google(
         Err(e) => return server_error(&e.to_string()),
     };
 
-    // vegapunk side schema を idempotent に保証する。失敗しても OAuth 自体は
-    // 通す (= MCP 側で実 RPC が失敗した時点で client にエラーを返せばよい、
-    // 認証フローを止めるほどではない)。詳細は warn ログに残す。
-    if let Err(e) = state.provisioner.ensure_schema(&user.vegapunk_schema).await {
-        warn!(
-            schema = %user.vegapunk_schema,
-            user_id = %user.id,
-            error = %e,
-            "ensure_schema failed for user schema (continuing OAuth)",
-        );
-    }
-    if let Err(e) = state.provisioner.ensure_schema(&state.shared_schema).await {
-        warn!(
-            schema = %state.shared_schema,
-            error = %e,
-            "ensure_schema failed for shared schema (continuing OAuth)",
-        );
-    }
+    ensure_user_and_shared_schemas(
+        state.provisioner.as_ref(),
+        &user.id,
+        &user.vegapunk_schema,
+        &state.shared_schema,
+    )
+    .await;
     // Issue our auth code.
     let code = new_ulid();
     state.sessions.put_code(
@@ -712,6 +701,35 @@ async fn revoke(State(state): State<AsState>, Form(body): Form<RevokeForm>) -> i
 
 type Response = axum::response::Response;
 
+/// 個人 / 共有 schema を **両方とも** idempotent に ensure する。失敗は
+/// `warn!` で残しつつ後続フローを止めない (= OAuth は通す、tool 呼び出し時に
+/// tonic Status として client に surface する設計)。
+///
+/// `callback_google` から実 `dyn SchemaProvisioner` で呼ばれ、tests からは
+/// 記録専用 (`RecordingProvisioner`) で呼んで挙動を pin する。
+async fn ensure_user_and_shared_schemas(
+    provisioner: &dyn SchemaProvisioner,
+    user_id: &str,
+    user_schema: &str,
+    shared_schema: &str,
+) {
+    if let Err(e) = provisioner.ensure_schema(user_schema).await {
+        warn!(
+            schema = %user_schema,
+            user_id = %user_id,
+            error = %e,
+            "ensure_schema failed for user schema (continuing OAuth)",
+        );
+    }
+    if let Err(e) = provisioner.ensure_schema(shared_schema).await {
+        warn!(
+            schema = %shared_schema,
+            error = %e,
+            "ensure_schema failed for shared schema (continuing OAuth)",
+        );
+    }
+}
+
 fn bad_request(error: &str, description: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -739,7 +757,53 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
     use tower::ServiceExt;
+
+    /// `ensure_user_and_shared_schemas` の挙動を pin する記録専用 provisioner。
+    /// 渡された schema 名を順に push し、`fail` フラグが立っていれば Err を返す。
+    #[derive(Debug, Default)]
+    struct RecordingProvisioner {
+        calls: StdMutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl RecordingProvisioner {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SchemaProvisioner for RecordingProvisioner {
+        async fn ensure_schema(&self, name: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(name.to_string());
+            if self.fail {
+                Err("forced".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_user_and_shared_calls_both_in_order() {
+        let provisioner = RecordingProvisioner::default();
+        ensure_user_and_shared_schemas(&provisioner, "u-id", "user-abc", "sivira-shared").await;
+        assert_eq!(provisioner.calls(), vec!["user-abc", "sivira-shared"]);
+    }
+
+    #[tokio::test]
+    async fn ensure_user_and_shared_attempts_both_even_when_user_schema_fails() {
+        // user schema が失敗しても shared を試みる (= OAuth フローを止めない)。
+        // panic も propagation も無いことを assert。
+        let provisioner = RecordingProvisioner {
+            fail: true,
+            ..Default::default()
+        };
+        ensure_user_and_shared_schemas(&provisioner, "u-id", "user-abc", "shared").await;
+        assert_eq!(provisioner.calls(), vec!["user-abc", "shared"]);
+    }
 
     async fn test_state() -> AsState {
         let pool = vegapunk_memory_storage::pool::init_pool("sqlite::memory:")

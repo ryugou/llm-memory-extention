@@ -230,18 +230,14 @@ mod tests {
         // できて、pool が複数 connection を開くと task 間で別 DB を見る形に
         // なり race を再現できない。`file::memory:?cache=shared` で全
         // connection が同じ in-memory DB を共有する。各テストで instance が
-        // 衝突しないよう unique な vfs name を付ける。
+        // 衝突しないよう unique な vfs name を付ける (clock-based だと粗い
+        // 時計分解能で衝突する OS があり、 cargo test 並列実行で flaky に
+        // なるので ULID で衝突確率を実質ゼロにする)。
         //
         // 注 2: `tokio::spawn` を介すると scheduler が 2 task を逐次実行する
         // 余地が残り race が観測できないことがある。`tokio::join!` で同一
         // poll cycle に並べて両者が SELECT await を確実に同時に踏むようにする。
-        let vfs = format!(
-            "race-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let vfs = format!("race-{}", llm_memory_core::id::new_ulid());
         let url = format!("sqlite:file:{vfs}?mode=memory&cache=shared");
         let pool = init_pool(&url).await.unwrap();
         let (a, b) = tokio::join!(

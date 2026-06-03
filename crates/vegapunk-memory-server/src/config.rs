@@ -13,12 +13,18 @@
 //! - `VEGAPUNK_BEARER_TOKEN`     (vegapunk server.auth.token と一致)
 //!
 //! オプション (default あり):
-//! - `BIND_ADDR`                 (default `0.0.0.0:8081`)
-//! - `TRUSTED_PROXY_COUNT`       (default 1)
+//! - `BIND_ADDR` (default `0.0.0.0:8081`)
+//! - `TRUSTED_PROXY_COUNT` (default `1`)
+//! - `VEGAPUNK_SHARED_SCHEMA_NAME` (default `sivira-shared`).
+//!   全 user で共有する schema 名。OAuth callback ごとに idempotent に
+//!   `ensure_schema` される。値は trim される。
+//! - `VEGAPUNK_DEFAULT_SCHEMA_TEMPLATE` (default `discussion`).
+//!   個人 schema を新規 provision するときに vegapunk へ渡す
+//!   `SchemaTemplate` の名前。値は trim される。`ListSchemaTemplates` で
+//!   利用可能な template を確認しておくこと。
 //!
-//! 後続 PR で追加予定 (本 skeleton では未読込):
-//! - `JWT_SIGNING_KEY_<kid>`     (HS256 base64 32+ bytes、HTTP transport 実装と
-//!   合わせて `llm_memory_auth::jwt::JwtKeys::from_env()` 経由で読み込む)
+//! 別経路で読まれる env (本ファイルでは扱わない):
+//! - `JWT_SIGNING_KEY_<kid>` (HS256 base64 32+ bytes、`jwt::JwtKeys::from_env()`)
 
 use anyhow::{Context, Result};
 
