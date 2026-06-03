@@ -13,12 +13,18 @@
 //! - `VEGAPUNK_BEARER_TOKEN`     (vegapunk server.auth.token と一致)
 //!
 //! オプション (default あり):
-//! - `BIND_ADDR`                 (default `0.0.0.0:8081`)
-//! - `TRUSTED_PROXY_COUNT`       (default 1)
+//! - `BIND_ADDR` (default `0.0.0.0:8081`)
+//! - `TRUSTED_PROXY_COUNT` (default `1`)
+//! - `VEGAPUNK_SHARED_SCHEMA_NAME` (default `sivira-shared`).
+//!   全 user で共有する schema 名。OAuth callback ごとに idempotent に
+//!   `ensure_schema` される。値は trim される。
+//! - `VEGAPUNK_DEFAULT_SCHEMA_TEMPLATE` (default `discussion`).
+//!   個人 schema を新規 provision するときに vegapunk へ渡す
+//!   `SchemaTemplate` の名前。値は trim される。`ListSchemaTemplates` で
+//!   利用可能な template を確認しておくこと。
 //!
-//! 後続 PR で追加予定 (本 skeleton では未読込):
-//! - `JWT_SIGNING_KEY_<kid>`     (HS256 base64 32+ bytes、HTTP transport 実装と
-//!   合わせて `llm_memory_auth::jwt::JwtKeys::from_env()` 経由で読み込む)
+//! 別経路で読まれる env (本ファイルでは扱わない):
+//! - `JWT_SIGNING_KEY_<kid>` (HS256 base64 32+ bytes、`jwt::JwtKeys::from_env()`)
 
 use anyhow::{Context, Result};
 
@@ -35,6 +41,13 @@ pub struct ServerConfig {
     pub vegapunk_grpc_endpoint: String,
     pub vegapunk_bearer_token: String,
     pub trusted_proxy_count: usize,
+    /// 全 user で共有する vegapunk schema の名前 (例: `sivira-shared`)。
+    /// 初回 user の OAuth callback で idempotent に作成される。
+    pub shared_schema_name: String,
+    /// 個人 schema を新規作成するときに使う vegapunk template name
+    /// (例: `discussion`、`review`)。vegapunk の ListSchemaTemplates の
+    /// いずれかに一致する必要がある。
+    pub default_schema_template: String,
 }
 
 impl ServerConfig {
@@ -54,6 +67,20 @@ impl ServerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1),
+            // 値自体も trim して持つ: env で先頭末尾に空白が紛れていても
+            // そのまま vegapunk へ渡さない (= "  sivira-shared  " のような
+            // 値が schema 名として保存されると vegapunk 側で別 schema 扱いに
+            // なって idempotent ensure_schema が壊れる)。
+            shared_schema_name: std::env::var("VEGAPUNK_SHARED_SCHEMA_NAME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "sivira-shared".to_string()),
+            default_schema_template: std::env::var("VEGAPUNK_DEFAULT_SCHEMA_TEMPLATE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "discussion".to_string()),
         })
     }
 }

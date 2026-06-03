@@ -12,6 +12,7 @@
 pub mod app;
 pub mod config;
 pub mod mcp;
+pub mod schema_provisioner;
 pub mod state;
 
 #[cfg(test)]

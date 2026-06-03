@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 llm-memory-core = { path = "../llm-memory-core" }
 vegapunk-memory-storage = { path = "../vegapunk-memory-storage" }
+async-trait.workspace = true
 axum.workspace = true
 axum-extra.workspace = true
 jsonwebtoken.workspace = true

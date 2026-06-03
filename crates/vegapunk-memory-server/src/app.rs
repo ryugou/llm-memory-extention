@@ -58,12 +58,18 @@ pub fn build_router(state: AppState) -> Router {
             redirect_uri: format!("{}/oauth/callback/google", state.cfg.public_url),
         },
     ));
+    let provisioner = Arc::new(crate::schema_provisioner::VegapunkSchemaProvisioner::new(
+        state.vegapunk.clone(),
+        state.cfg.default_schema_template.clone(),
+    ));
     let as_state = vegapunk_memory_auth::authorization_server::AsState::new(
         state.pool.clone(),
         state.jwt_keys.clone(),
         google,
         state.cfg.public_url.clone(),
         state.cfg.trusted_proxy_count,
+        provisioner,
+        state.cfg.shared_schema_name.clone(),
     );
     let as_router = vegapunk_memory_auth::authorization_server::router().with_state(as_state);
 

@@ -35,6 +35,8 @@ pub(crate) async fn test_state() -> AppState {
         vegapunk_grpc_endpoint: "http://127.0.0.1:0".into(),
         vegapunk_bearer_token: "dummy".into(),
         trusted_proxy_count: 1,
+        shared_schema_name: "sivira-shared".into(),
+        default_schema_template: "discussion".into(),
     };
     AppState {
         pool,
