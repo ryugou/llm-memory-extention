@@ -428,15 +428,22 @@ pub(super) async fn collect_dedup_catalogue(
     let shared_schema = state.cfg.shared_schema_name.as_str();
     let mut shared: Vec<EntityRef> = Vec::new();
     let mut personal: Vec<EntityRef> = Vec::new();
+    // 各 node_type について shared と personal の fetch は独立なので
+    // `tokio::join!` で並列に走らせ、レイテンシを node_type 数比例から
+    // (node_type 数 × 1 ラウンド) まで圧縮する。
     for node_type in DEDUP_SCAN_NODE_TYPES {
-        for name in fetch_entity_names(state, shared_schema, node_type).await {
+        let (shared_names, personal_names) = tokio::join!(
+            fetch_entity_names(state, shared_schema, node_type),
+            fetch_entity_names(state, &user.vegapunk_schema, node_type),
+        );
+        for name in shared_names {
             shared.push(EntityRef {
                 name,
                 node_type: (*node_type).to_string(),
                 schema: shared_schema.to_string(),
             });
         }
-        for name in fetch_entity_names(state, &user.vegapunk_schema, node_type).await {
+        for name in personal_names {
             personal.push(EntityRef {
                 name,
                 node_type: (*node_type).to_string(),
@@ -485,10 +492,10 @@ pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -
 /// `method` は debug 用に "ingest" / "ingest_raw" / "ingest (messages[i])" 等
 /// を渡す (= 抑制対象が確定するためどの handler / どの message が原因か残す)。
 pub(super) fn shared_dedup_block_content(method: &str, hit: &EntityRef) -> Value {
+    // 改行 + インデント混入を避けるため 1 行で組み立てる
+    // (= "Reference the existing" の前に連続スペースが入らない)。
     let body = format!(
-        "{method} blocked: '{}' ({}) already exists in schema '{}'. \
-         Reference the existing entity instead of re-ingesting it; this avoids \
-         cross-schema duplication.",
+        "{method} blocked: '{}' ({}) already exists in schema '{}'. Reference the existing entity instead of re-ingesting it; this avoids cross-schema duplication.",
         hit.name, hit.node_type, hit.schema
     );
     json!({
@@ -563,11 +570,15 @@ pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Val
         let v = search_result_item_json(item);
         let key = format!("{}:{}", v["type"], v["id"]);
         if seen.insert(key) {
-            let score = item.score.unwrap_or(f32::NEG_INFINITY);
+            // None / NaN は両方 NEG_INFINITY に正規化して必ず最下位に落とす。
+            // (total_cmp の全順序では負の NaN が NEG_INFINITY より下に来る
+            //  ので、生 NaN を素通しすると top_k truncate が不安定になる。)
+            let raw = item.score.unwrap_or(f32::NEG_INFINITY);
+            let score = if raw.is_nan() { f32::NEG_INFINITY } else { raw };
             all_results.push((score, v));
         }
     }
-    // 降順 sort (= NaN は最下位扱い)。total_cmp は IEEE-754 全順序で確定。
+    // 降順 sort。NaN は上の正規化で除いてあるので total_cmp の挙動は安全。
     all_results.sort_by(|a, b| b.0.total_cmp(&a.0));
     if let Some(limit) = merged_limit {
         let limit = limit.max(0) as usize;
@@ -1137,10 +1148,17 @@ pub(super) async fn get_traceable_chain(
     args: Value,
 ) -> Value {
     // node_id がどちらの schema にあるかは呼び出し側からは分からないので、
-    // 両 schema で並行に試行する。links が返った方を優先採用し、**両方 Err
-    // のときだけ tonic error にして返す** (= 片方 Err は warn + 残った方を
-    // 使う、両方 Ok で両方 links 空でも personal 側の空 chain を success と
-    // して返す)。
+    // 両 schema で並行に試行する。links が返った方を優先採用するが、
+    // **致命的なエラー (= 認証 / 一時的 unavailable など) は素通ししない**:
+    //
+    // - shared 側の Err は schema 未作成 (= NotFound) のみ非致命扱いとし、
+    //   それ以外 (Unauthenticated / PermissionDenied / Unavailable など) は
+    //   personal が Ok でもエラーで返す。fan-out で片側の本物の障害を
+    //   黙らせると、cross-tenant guard や authz が壊れていても気付けない。
+    // - personal 側の Err も同じく NotFound のみ非致命扱い。
+    // - 両方 Err は素直に personal の Err を tonic_error_content で返す。
+    // - 両方 Ok で両方 links 空のときは personal 側の空 chain を success と
+    //   して返す (= "no chain found" を呼び出し側に伝える)。
     let personal_req = match build_get_traceable_chain_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("get_traceable_chain", &e),
@@ -1155,8 +1173,6 @@ pub(super) async fn get_traceable_chain(
         client_s.get_traceable_chain(shared_req),
     );
 
-    // どちらか / 両方の Ok から links を取り、空でない方を優先採用する。
-    // 両方 Err のときだけ tonic_error_content。片方 Err は warn + 残る方を使う。
     let (found_in, resp) = match (personal, shared) {
         (Ok(p), Ok(s)) => {
             let p = p.into_inner();
@@ -1170,18 +1186,26 @@ pub(super) async fn get_traceable_chain(
             }
         }
         (Ok(p), Err(s_err)) => {
-            tracing::warn!(
-                error = %s_err,
-                "shared get_traceable_chain failed (continuing with personal)",
-            );
-            ("personal", p.into_inner())
+            if s_err.code() == tonic::Code::NotFound {
+                tracing::warn!(
+                    code = ?s_err.code(),
+                    "shared get_traceable_chain NotFound (continuing with personal)",
+                );
+                ("personal", p.into_inner())
+            } else {
+                return tonic_error_content("GetTraceableChain (shared)", s_err);
+            }
         }
         (Err(p_err), Ok(s)) => {
-            tracing::warn!(
-                error = %p_err,
-                "personal get_traceable_chain failed (continuing with shared)",
-            );
-            ("shared", s.into_inner())
+            if p_err.code() == tonic::Code::NotFound {
+                tracing::warn!(
+                    code = ?p_err.code(),
+                    "personal get_traceable_chain NotFound (continuing with shared)",
+                );
+                ("shared", s.into_inner())
+            } else {
+                return tonic_error_content("GetTraceableChain (personal)", p_err);
+            }
         }
         (Err(p_err), Err(_)) => {
             return tonic_error_content("GetTraceableChain", p_err);
