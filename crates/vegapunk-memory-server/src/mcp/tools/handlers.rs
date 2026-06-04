@@ -706,9 +706,14 @@ pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Val
         // で、`null` / 空文字を含めて `"{type}:null"` という同一 key にまとめて
         // しまうと、id 無しの結果が 2 件目以降ごっそり落ちる事故になる。
         // id が無いものは dedup の対象外 (= 全部素通し) にする。
+        // `type` も文字列として取り出してから key を組む。serde_json::Value の
+        // Display 経由だと `"Project"` のように引用符付きの形になり、
+        // (a) key の semantics が読みにくくなる、(b) Value の表現が
+        // 将来変わると key が黙って変わる、という不安定さが残る。
+        let type_str = v["type"].as_str().unwrap_or("");
         let should_keep = match v["id"].as_str() {
             Some(id) if !id.is_empty() => {
-                let key = format!("{}:{}", v["type"], id);
+                let key = format!("{type_str}:{id}");
                 seen.insert(key)
             }
             _ => true,
@@ -1223,23 +1228,37 @@ pub(super) async fn list_schemas(state: &AppState, user: &AuthenticatedUser) -> 
 /// `ListSchemas` レスポンスから、own personal と shared の 2 件だけを通す。
 /// それ以外は全 drop。filter は exact match (= 部分一致は不可) で、別 tenant
 /// の `user-` prefix schema や偶然似た名前の schema が leak しないようにする。
+///
+/// 順序は **personal → shared** で固定する。`schemas` (= backend の
+/// `ListSchemas` レスポンス) の列挙順は backend 実装依存で安定保証が無く、
+/// 他の handler (search / query_nodes 等) では personal を先に merge する
+/// 慣習があるので、ここも同じ並びにしてクライアント側で「`schemas[0]` が
+/// 自分の personal schema」と仮定しても安全にしておく。
+/// 万一 `user_schema == shared_schema` のときは 1 件しか返さない
+/// (= cross-tenant guard の通常パスでは起き得ないが、念のため)。
 fn filter_schemas_for_user_and_shared(
     schemas: &[SchemaListItem],
     user_schema: &str,
     shared_schema: &str,
 ) -> Vec<Value> {
-    schemas
-        .iter()
-        .filter(|s| s.name == user_schema || s.name == shared_schema)
-        .map(|s| {
-            json!({
-                "name": s.name,
-                "version": s.version,
-                "description": s.description,
-                "schema_yaml": s.schema_yaml,
-            })
+    let to_json = |s: &SchemaListItem| {
+        json!({
+            "name": s.name,
+            "version": s.version,
+            "description": s.description,
+            "schema_yaml": s.schema_yaml,
         })
-        .collect()
+    };
+    let mut out = Vec::with_capacity(2);
+    if let Some(p) = schemas.iter().find(|s| s.name == user_schema) {
+        out.push(to_json(p));
+    }
+    if user_schema != shared_schema {
+        if let Some(s) = schemas.iter().find(|s| s.name == shared_schema) {
+            out.push(to_json(s));
+        }
+    }
+    out
 }
 
 pub(super) async fn stats(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
