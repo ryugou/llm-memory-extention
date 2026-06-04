@@ -227,6 +227,417 @@ pub(super) fn invalid_args_content(method: &str, reason: &str) -> Value {
     })
 }
 
+/// vegapunk が定義する schema YAML のうち、wrapper が「同名重複」の
+/// 検出対象にする node_type 群。Project / Person / Specification / Topic は
+/// 「概念として 1 つしか存在しないべき」固有名詞性の高い node。Decision /
+/// Message / Thread のような事実イベント系は除外する (= 同名でも別 entity)。
+const DEDUP_SCAN_NODE_TYPES: &[&str] = &["Project", "Person", "Specification", "Topic"];
+
+/// 1 schema あたり最大 fetch する entity 件数。多いと query_nodes が重く
+/// なるが、4 種 × 2 schema = 8 query なので合計上限は 8000 件。これを超える
+/// 規模になったら別 PR で paging / 増分 fetch を入れる。
+const DEDUP_FETCH_LIMIT_PER_TYPE: i32 = 1000;
+
+/// 表記揺れ判定のための正規化キー。Case-insensitive + 前後空白除去のみ。
+/// Unicode NFKC (全角半角統一) は次フェーズ。
+fn normalize_entity_key(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+/// `text.to_lowercase()` の各 char が **元 char と 1 対 1 + byte 長一致** で
+/// 対応しているかを確認する strict alignment guard。
+///
+/// 「`text_lc.len() == text.len()`」だけでは不十分: 例えば KELVIN SIGN
+/// (U+212A, 3 bytes) は `k` (1 byte) に shrink し、Turkish dotted I
+/// (U+0130, 2 bytes) は `i\u{0307}` (3 bytes) に expand する。両者が混在
+/// すれば total byte 長が偶然一致しても per-char offset がずれ、
+/// `text_lc` 上で得た byte offset で `text` を slice すると **char 境界外
+/// で panic** する可能性がある (= UTF-8 char boundary 違反)。
+///
+/// この関数が `true` を返す場合に限り、`text_lc` 上の byte offset を
+/// `text` に直接マップして slice しても安全と見做せる。それ以外
+/// (= 1 char が複数 lowercase char にマップされる / 長さが変わる) は
+/// conservative に scan / rewrite を no-op に倒す。
+fn is_lowercase_byte_aligned(text: &str) -> bool {
+    text.chars().all(|c| {
+        let mut iter = c.to_lowercase();
+        match (iter.next(), iter.next()) {
+            (Some(lc), None) => lc.len_utf8() == c.len_utf8(),
+            _ => false,
+        }
+    })
+}
+
+/// `is_word_char` 風の判定。alphanumeric + underscore に CJK (= 連続した
+/// 日本語名で word boundary を区切りたくないため) を含める粗い定義。
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// 既に lowercased な `text_lc` 上で word boundary scan を行う。
+/// catalogue scan のホットパスで `text.to_lowercase()` を per-entity に
+/// allocate しないよう、scan 本体はこの関数に切り出して、1 回作った
+/// `text_lc` を呼び出し側が使い回せるようにする。
+///
+/// **呼び出し側の責任**: `is_lowercase_byte_aligned(text)` が true な
+/// `text` から作った `text_lc` を渡すこと。`text_lc.len() == text.len()`
+/// だけでは不十分 — shrink + expand 打ち消し (KELVIN SIGN + Turkish
+/// dotted I の混在等) で per-char offset がずれているケースを通してしまい、
+/// `text_lc` 上で得た byte offset で `text` を slice すると char-boundary
+/// 違反で panic し得るため。strict guard が false のときは呼び出し側で
+/// no-match に倒すこと。non-ASCII の真の case 比較は NFC normalize 込み
+/// の別フェーズで扱う。
+fn word_boundary_contains_in_lowercased(text_lc: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0usize;
+    while let Some(rel) = text_lc[start..].find(needle) {
+        let abs = start + rel;
+        let end = abs + needle.len();
+        let before_ok = match text_lc[..abs].chars().next_back() {
+            None => true,
+            Some(c) => !is_word_char(c),
+        };
+        let after_ok = match text_lc[end..].chars().next() {
+            None => true,
+            Some(c) => !is_word_char(c),
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        // 1 byte 進めるのではなく、ASCII safe な char-boundary 上で進める
+        start = abs
+            + text_lc[abs..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+    }
+    false
+}
+
+/// `text` の中に `needle_normalized` (= 正規化済キー) が word boundary で
+/// 出現する箇所を、すべて `canonical` 文字列に置換した結果を返す。
+/// マッチ箇所の元のケースは失われ、`canonical` のケースに統一される
+/// (= case-preserving ではなく、case-normalizing な置換)。
+/// 出現がなければ `None`。複数出現は全置換。
+///
+/// 制約: `word_boundary_contains_in_lowercased` と同じく、`to_lowercase()`
+/// で byte length が変わるケースでは元 text に offset を反映できないため
+/// no-op (= `None`) を返す。NFC 正規化込みの真の対応は別フェーズ。
+/// `replace_word_case_insensitive_with_lc` の薄い stand-alone wrapper。
+/// 現状は tests からのみ呼ばれる (= production の hot-path は直接
+/// `_with_lc` 版を使い、`text_lc` を catalogue 全体で再利用するため)。
+#[cfg(test)]
+fn replace_word_case_insensitive(
+    text: &str,
+    needle_normalized: &str,
+    canonical: &str,
+) -> Option<String> {
+    if !is_lowercase_byte_aligned(text) {
+        return None;
+    }
+    let text_lc = text.to_lowercase();
+    replace_word_case_insensitive_with_lc(text, &text_lc, needle_normalized, canonical)
+}
+
+/// `text` の中に `needle_normalized` (= 正規化済キー) が word boundary で
+/// 出現する箇所を、すべて `canonical` 文字列に置換した結果を返す。
+/// 既に作ってある `text_lc` を渡すことで、ホットパス (= catalogue を回す
+/// per-entity ループ) で `text.to_lowercase()` を allocate しなくて済む。
+///
+/// **呼び出し側の責任**:
+/// - `text_lc == text.to_lowercase()` であること。
+/// - `is_lowercase_byte_aligned(text)` が true であること
+///   (= `text_lc` の byte offset を `text` の slice に直接マップしても
+///   char-boundary を踏まない前提)。
+///
+/// 戻り値は実際に書き換えが起きたときだけ `Some(updated)`。全 match が
+/// canonical と一致するなら `None`。
+fn replace_word_case_insensitive_with_lc(
+    text: &str,
+    text_lc: &str,
+    needle_normalized: &str,
+    canonical: &str,
+) -> Option<String> {
+    if needle_normalized.is_empty() {
+        return None;
+    }
+    // lazy alloc: 「実際に書き換わる match (= 元 span が canonical と異なる)」を
+    // 初めて見つけるまで `out` を allocate しない。全 match が既に canonical
+    // と一致する text (例: 元から正しい表記の "Vegapunk" を含む文章) では、
+    // String::with_capacity も実 copy も発生せず `None` を返せる。これにより
+    // scan_text_with_catalogue 内で personal catalogue × messages を回す
+    // ホットパスの per-entity alloc が消える。
+    let mut out: Option<String> = None;
+    let mut cursor = 0usize;
+    let mut search_from = 0usize;
+    while let Some(rel) = text_lc[search_from..].find(needle_normalized) {
+        let abs = search_from + rel;
+        let end = abs + needle_normalized.len();
+        let before_ok = match text_lc[..abs].chars().next_back() {
+            None => true,
+            Some(c) => !is_word_char(c),
+        };
+        let after_ok = match text_lc[end..].chars().next() {
+            None => true,
+            Some(c) => !is_word_char(c),
+        };
+        if before_ok && after_ok {
+            let span = &text[abs..end];
+            if span != canonical {
+                // 初めての実書き換え match: ここで初めて alloc する。
+                let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
+                buf.push_str(&text[cursor..abs]);
+                buf.push_str(canonical);
+                cursor = end;
+            } else if let Some(buf) = out.as_mut() {
+                // 既に build 中なら、canonical と同一 match の区間も
+                // そのまま out にコピーして cursor を進める。
+                buf.push_str(&text[cursor..end]);
+                cursor = end;
+            }
+            // out が未 alloc かつ span == canonical の場合は何もしない
+            // (= cursor も進めない。後続で実書き換え match を見つけたら
+            //  そこから先頭の prefix としてまとめて copy される)。
+            search_from = end;
+        } else {
+            search_from = abs
+                + text_lc[abs..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1);
+        }
+    }
+    if let Some(mut buf) = out {
+        buf.push_str(&text[cursor..]);
+        Some(buf)
+    } else {
+        None
+    }
+}
+
+/// vegapunk gRPC `query_nodes` を直接叩いて、指定 schema / node_type の
+/// `attributes.name` 一覧を取り出す。失敗時は warn + 空 Vec を返す
+/// (= dedup pre-check は best-effort で、失敗しても ingest を止めない)。
+async fn fetch_entity_names(state: &AppState, schema: &str, node_type: &str) -> Vec<String> {
+    let req = QueryNodesRequest {
+        schema: schema.to_string(),
+        node_type: node_type.to_string(),
+        filters: vec![],
+        sort_by: None,
+        sort_order: None,
+        limit: Some(DEDUP_FETCH_LIMIT_PER_TYPE),
+        offset: Some(0),
+        traverse: None,
+    };
+    let mut client = state.vegapunk.clone();
+    match client.query_nodes(req).await {
+        Ok(resp) => resp
+            .into_inner()
+            .nodes
+            .into_iter()
+            .filter_map(|n| n.attributes.get("name").cloned())
+            .filter(|n| !n.trim().is_empty())
+            .collect(),
+        Err(status) => {
+            tracing::warn!(
+                schema = %schema,
+                node_type = %node_type,
+                code = ?status.code(),
+                message = %status.message(),
+                "dedup pre-check: query_nodes failed (continuing without it)",
+            );
+            Vec::new()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EntityRef {
+    pub name: String,
+    pub node_type: String,
+    pub schema: String,
+    /// `normalize_entity_key(name)` の事前計算結果。catalogue 構築時に
+    /// 一度だけ計算し、scan のホットパスで reuse する。shared catalogue
+    /// 単独で最大 8000 entity 規模 × messages 件数の組み合わせで scan が
+    /// 走るため、per-scan に `trim + to_lowercase` を再計算すると無駄な
+    /// `String` allocate がホットパスを支配する。
+    pub normalized_key: String,
+}
+
+impl EntityRef {
+    fn new(name: String, node_type: String, schema: String) -> Self {
+        let normalized_key = normalize_entity_key(&name);
+        Self {
+            name,
+            node_type,
+            schema,
+            normalized_key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum IngestPreCheck {
+    /// shared (= 共有 schema) に同名 entity が既存するので ingest を抑制する。
+    BlockedByShared { hit: EntityRef },
+    /// personal schema に同名 entity が既存する。`new_text` は表記揺れを
+    /// canonical name に統一した rewrite 後 text。同名一致した entity のリスト
+    /// は `rewrites` に。
+    Rewritten {
+        new_text: String,
+        rewrites: Vec<EntityRef>,
+    },
+    /// 重複なし。そのまま ingest する。
+    Proceed,
+}
+
+/// `collect_dedup_catalogue` の戻り値: 1 リクエストで一度だけ fetch すれば
+/// 良い entity 一覧。`ingest` の batch 内では同一 catalogue を全 message で
+/// 共有して N×fetch を避ける。
+#[derive(Debug, Default, Clone)]
+pub(super) struct DedupCatalogue {
+    pub shared: Vec<EntityRef>,
+    pub personal: Vec<EntityRef>,
+}
+
+/// dedup pre-check 用の entity 一覧を **1 リクエスト 1 回だけ** 取得する。
+/// `DEDUP_SCAN_NODE_TYPES` × {shared, personal} の組み合わせ (= 上限 8) を
+/// query_nodes で集める。fetch 失敗 (個別 node_type / schema 単位) は
+/// `fetch_entity_names` の中で warn + 空 Vec に落とすので、pre-check 全体を
+/// 止めずに済む。
+pub(super) async fn collect_dedup_catalogue(
+    state: &AppState,
+    user: &AuthenticatedUser,
+) -> DedupCatalogue {
+    let shared_schema = state.cfg.shared_schema_name.as_str();
+    let mut shared: Vec<EntityRef> = Vec::new();
+    let mut personal: Vec<EntityRef> = Vec::new();
+    // 各 node_type について shared と personal の fetch は独立なので
+    // `tokio::join!` で並列に走らせ、レイテンシを node_type 数比例から
+    // (node_type 数 × 1 ラウンド) まで圧縮する。
+    for node_type in DEDUP_SCAN_NODE_TYPES {
+        let (shared_names, personal_names) = tokio::join!(
+            fetch_entity_names(state, shared_schema, node_type),
+            fetch_entity_names(state, &user.vegapunk_schema, node_type),
+        );
+        for name in shared_names {
+            shared.push(EntityRef::new(
+                name,
+                (*node_type).to_string(),
+                shared_schema.to_string(),
+            ));
+        }
+        for name in personal_names {
+            personal.push(EntityRef::new(
+                name,
+                (*node_type).to_string(),
+                user.vegapunk_schema.clone(),
+            ));
+        }
+    }
+    DedupCatalogue { shared, personal }
+}
+
+/// `text` に対し catalogue を当てて pre-check 結果を返す **pure な scan**。
+/// I/O 無しなので per-message ループで何度呼んでも safe。
+///
+/// 判定順:
+/// 1. shared にヒット → 抑制 (`BlockedByShared`)。複数ヒットでも 1 件返す。
+/// 2. shared 無し / personal にヒット → 表記揺れと判断、canonical name に rewrite。
+/// 3. いずれも該当無し → `Proceed`。
+pub(super) fn scan_text_with_catalogue(catalogue: &DedupCatalogue, text: &str) -> IngestPreCheck {
+    // alignment guard は `is_lowercase_byte_aligned(text)` を使う。
+    // (`text_lc.len() == text.len()` だけだと shrink + expand 打ち消しの
+    // ケース — KELVIN SIGN U+212A → 'k' と Turkish dotted I U+0130 →
+    // i\u{0307} が混在する text — を検出できず、`text_lc` 上の byte offset
+    // で `text` を slice したときに char-boundary 違反で panic し得る。)
+    //
+    // guard が false な text は shared scan も personal rewrite (=
+    // replace_word_case_insensitive の strict guard) も全部 no-op に倒れる
+    // ので、結果は確実に `Proceed`。`to_lowercase()` (= 大きな String alloc)
+    // と entity loop の両方を skip して early return する。
+    if !is_lowercase_byte_aligned(text) {
+        return IngestPreCheck::Proceed;
+    }
+
+    // shared scan は text を変更しないので `text_lc` を 1 回作って per-entity
+    // で再利用する。catalogue.shared は最大 8000 entity × messages 件数まで
+    // 膨らみ得るため、ここで per-entity に lowercase を allocate すると
+    // ホットパスのコストが O(entity × text_len) になってしまう。
+    let text_lc = text.to_lowercase();
+    for ent in &catalogue.shared {
+        // ent.normalized_key は catalogue 構築時に 1 回だけ作ってあるので
+        // scan のホットパスでは `trim + to_lowercase` を回さず再利用する。
+        if word_boundary_contains_in_lowercased(&text_lc, &ent.normalized_key) {
+            return IngestPreCheck::BlockedByShared { hit: ent.clone() };
+        }
+    }
+
+    // personal scan: text_lc を再利用して per-entity の `to_lowercase()`
+    // を排除する。最大 4000 entity (= 4 node_type × 1000) × messages 件数
+    // を 1 ingest で回す可能性があり、per-entity に text 全体を lowercase
+    // すると O(entities × text_len) の alloc が発生する。
+    //
+    // 戦略:
+    // - rewrite が起きるまでは `text` を借りたまま、`text_lc` も
+    //   shared scan で作ったものをそのまま再利用する (= no-rewrite な
+    //   一般ケースで `text.to_string()` の alloc を完全に省く)。
+    // - rewrite が起きた瞬間に `new_text_owned: String` を持ち始める。
+    //   以降の scan はこの owned 文字列に対して走る。
+    // - rewrite 後の `new_text.to_lowercase()` を作り直すが、その前に
+    //   `is_lowercase_byte_aligned` を再 check する。canonical 名が
+    //   Turkish I 等 alignment を崩す char を含む可能性があり、崩れたら
+    //   後続 scan は safety guard を再保証できないので break する。
+    let mut new_text_owned: Option<String> = None;
+    let mut new_text_lc: String = text_lc;
+    let mut rewrites = Vec::new();
+    for ent in &catalogue.personal {
+        let current_text = new_text_owned.as_deref().unwrap_or(text);
+        let updated = replace_word_case_insensitive_with_lc(
+            current_text,
+            &new_text_lc,
+            &ent.normalized_key,
+            &ent.name,
+        );
+        if let Some(updated) = updated {
+            rewrites.push(ent.clone());
+            let aligned = is_lowercase_byte_aligned(&updated);
+            new_text_owned = Some(updated);
+            if !aligned {
+                break;
+            }
+            // unwrap: Some(updated) を直前で代入したので確実に Some。
+            new_text_lc = new_text_owned.as_deref().unwrap().to_lowercase();
+        }
+    }
+
+    match new_text_owned {
+        Some(new_text) if !rewrites.is_empty() => IngestPreCheck::Rewritten { new_text, rewrites },
+        // rewrite が無い (= alloc も発生していない) 一般ケース。
+        _ => IngestPreCheck::Proceed,
+    }
+}
+
+/// `IngestPreCheck::BlockedByShared` を MCP tool error content に変換する。
+/// `method` は debug 用に "ingest" / "ingest_raw" / "ingest (messages[i])" 等
+/// を渡す (= 抑制対象が確定するためどの handler / どの message が原因か残す)。
+pub(super) fn shared_dedup_block_content(method: &str, hit: &EntityRef) -> Value {
+    // 改行 + インデント混入を避けるため 1 行で組み立てる
+    // (= "Reference the existing" の前に連続スペースが入らない)。
+    let body = format!(
+        "{method} blocked: '{}' ({}) already exists in schema '{}'. Reference the existing entity instead of re-ingesting it; this avoids cross-schema duplication.",
+        hit.name, hit.node_type, hit.schema
+    );
+    json!({
+        "content": [{ "type": "text", "text": body }],
+        "isError": true,
+    })
+}
+
 fn search_result_item_json(item: &SearchResultItem) -> Value {
     json!({
         "type": item.r#type,
@@ -243,56 +654,173 @@ fn search_result_item_json(item: &SearchResultItem) -> Value {
 }
 
 pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
-    let request = match build_search_request(&user.vegapunk_schema, &args) {
+    let personal_req = match build_search_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("search", &e),
     };
-    let mut client = state.vegapunk.clone();
-    match client.search(request).await {
-        Err(status) => tonic_error_content("Search", status),
-        Ok(resp) => {
-            let resp = resp.into_inner();
-            let results: Vec<Value> = resp.results.iter().map(search_result_item_json).collect();
-            // Preserve Phase 3 cross-project similar_patterns from the
-            // backend (proto field 4) — drop nothing the server returns,
-            // even if today's clients ignore it.
-            let similar_patterns: Vec<Value> = resp
-                .similar_patterns
-                .iter()
-                .map(|sp| {
-                    let nodes: Vec<Value> = sp.nodes.iter().map(search_result_item_json).collect();
-                    json!({
-                        "source_project": sp.source_project,
-                        "structural_similarity": sp.structural_similarity,
-                        "nodes": nodes,
-                    })
-                })
-                .collect();
-            success_content(json!({
-                "search_id": resp.search_id,
-                "total_count": resp.total_count,
-                "results": results,
-                "similar_patterns": similar_patterns,
-            }))
+    let mut shared_req = personal_req.clone();
+    shared_req.schema = state.cfg.shared_schema_name.clone();
+    // limit を merge 後 truncate に使うため、shared に投げる前に控える。
+    let merged_limit = personal_req.top_k;
+
+    // own personal + shared の 2 schema を並行で叩いて merge する。
+    // cross-tenant guard: wrapper が呼ぶ schema は user.vegapunk_schema と
+    // state.cfg.shared_schema_name の 2 つだけで、client 由来の値は使わない。
+    let mut client_p = state.vegapunk.clone();
+    let mut client_s = state.vegapunk.clone();
+    let (personal, shared) =
+        tokio::join!(client_p.search(personal_req), client_s.search(shared_req));
+    let personal = match personal {
+        Ok(r) => r.into_inner(),
+        Err(s) => return tonic_error_content("Search (personal)", s),
+    };
+    // shared は best-effort: 初回ユーザ deployment では未作成 (= NotFound) の
+    // ことがあり、その場合 personal の検索結果まで巻き込んで全体エラーに
+    // するべきではない。warn だけ残して空の結果として扱う。
+    let shared = match shared {
+        Ok(r) => Some(r.into_inner()),
+        Err(s) => {
+            tracing::warn!(
+                schema = %state.cfg.shared_schema_name,
+                code = ?s.code(),
+                "shared Search failed (continuing with personal only)",
+            );
+            None
+        }
+    };
+
+    // results を merge。両 schema は別 graph で node id 衝突は無いはずだが、
+    // safety net として (type, id) で dedup する。score 降順で sort 後、
+    // client が要求した limit (= top_k) で truncate して fan-out で 2 倍に
+    // なるのを防ぐ。
+    let mut seen = std::collections::HashSet::new();
+    let mut all_results: Vec<(f32, Value)> = Vec::new();
+    let empty_results = Vec::new();
+    let shared_results = shared
+        .as_ref()
+        .map(|s| &s.results)
+        .unwrap_or(&empty_results);
+    for item in personal.results.iter().chain(shared_results.iter()) {
+        let v = search_result_item_json(item);
+        // id が文字列で非空のときだけ dedup する。proto 的に `id` は optional
+        // で、`null` / 空文字を含めて `"{type}:null"` という同一 key にまとめて
+        // しまうと、id 無しの結果が 2 件目以降ごっそり落ちる事故になる。
+        // id が無いものは dedup の対象外 (= 全部素通し) にする。
+        // `type` も文字列として取り出してから key を組む。serde_json::Value の
+        // Display 経由だと `"Project"` のように引用符付きの形になり、
+        // (a) key の semantics が読みにくくなる、(b) Value の表現が
+        // 将来変わると key が黙って変わる、という不安定さが残る。
+        let type_str = v["type"].as_str().unwrap_or("");
+        let should_keep = match v["id"].as_str() {
+            Some(id) if !id.is_empty() => {
+                let key = format!("{type_str}:{id}");
+                seen.insert(key)
+            }
+            _ => true,
+        };
+        if should_keep {
+            // None / NaN は両方 NEG_INFINITY に正規化して必ず最下位に落とす。
+            // (total_cmp の全順序では負の NaN が NEG_INFINITY より下に来る
+            //  ので、生 NaN を素通しすると top_k truncate が不安定になる。)
+            let raw = item.score.unwrap_or(f32::NEG_INFINITY);
+            let score = if raw.is_nan() { f32::NEG_INFINITY } else { raw };
+            all_results.push((score, v));
         }
     }
+    // 降順 sort。NaN は上の正規化で除いてあるので total_cmp の挙動は安全。
+    all_results.sort_by(|a, b| b.0.total_cmp(&a.0));
+    if let Some(limit) = merged_limit {
+        let limit = limit.max(0) as usize;
+        all_results.truncate(limit);
+    }
+    let merged_results: Vec<Value> = all_results.into_iter().map(|(_, v)| v).collect();
+
+    let empty_sp = Vec::new();
+    let shared_sp = shared
+        .as_ref()
+        .map(|s| &s.similar_patterns)
+        .unwrap_or(&empty_sp);
+    let similar_patterns: Vec<Value> = personal
+        .similar_patterns
+        .iter()
+        .chain(shared_sp.iter())
+        .map(|sp| {
+            let nodes: Vec<Value> = sp.nodes.iter().map(search_result_item_json).collect();
+            json!({
+                "source_project": sp.source_project,
+                "structural_similarity": sp.structural_similarity,
+                "nodes": nodes,
+            })
+        })
+        .collect();
+
+    // backward compat: 既存 client は top-level `search_id` (= personal の id)
+    // を `feedback` tool に渡す前提なのでそのまま残す。新規 client は
+    // `search_ids.{personal,shared}` で両方の id を取得できる。
+    let personal_search_id = personal.search_id;
+    let shared_search_id = shared.as_ref().map(|s| s.search_id.clone());
+    success_content(json!({
+        "search_id": personal_search_id.clone(),
+        "search_ids": {
+            "personal": personal_search_id,
+            "shared": shared_search_id,
+        },
+        "total_count": personal.total_count + shared.as_ref().map(|s| s.total_count).unwrap_or(0),
+        "results": merged_results,
+        "similar_patterns": similar_patterns,
+    }))
 }
 
 pub(super) async fn get_schema(state: &AppState, user: &AuthenticatedUser) -> Value {
-    let request = build_get_schema_request(&user.vegapunk_schema);
-    let mut client = state.vegapunk.clone();
-    match client.get_schema(request).await {
-        Err(status) => tonic_error_content("GetSchema", status),
-        Ok(resp) => {
-            let resp = resp.into_inner();
-            success_content(json!({
-                "name": resp.name,
-                "schema_yaml": resp.schema_yaml,
-                "version": resp.version,
-                "description": resp.description,
+    let personal_req = build_get_schema_request(&user.vegapunk_schema);
+    let shared_req = GetSchemaRequest {
+        name: state.cfg.shared_schema_name.clone(),
+    };
+
+    let mut client_p = state.vegapunk.clone();
+    let mut client_s = state.vegapunk.clone();
+    let (personal, shared) = tokio::join!(
+        client_p.get_schema(personal_req),
+        client_s.get_schema(shared_req),
+    );
+    // personal は必須、shared は best-effort (= 初回ユーザが居ない時点で shared
+    // schema が未作成のままだと NotFound になる、その場合は null を返して
+    // クライアントに「shared は無いよ」と伝える)。
+    let personal = match personal {
+        Ok(r) => r.into_inner(),
+        Err(s) => return tonic_error_content("GetSchema (personal)", s),
+    };
+    let shared_json = match shared {
+        Ok(r) => {
+            let r = r.into_inner();
+            Some(json!({
+                "name": r.name,
+                "schema_yaml": r.schema_yaml,
+                "version": r.version,
+                "description": r.description,
             }))
         }
-    }
+        Err(s) => {
+            tracing::warn!(
+                schema = %state.cfg.shared_schema_name,
+                code = ?s.code(),
+                "shared schema GetSchema failed (continuing with personal-only)",
+            );
+            None
+        }
+    };
+
+    // backward compat: 既存 client は top-level の name / schema_yaml /
+    // version / description を読む前提で書かれているので、personal schema の
+    // 値をそのまま top-level に残す。`shared` は新規 field として optional に
+    // 併設する (shared schema 未作成時は null)。
+    success_content(json!({
+        "name": personal.name,
+        "schema_yaml": personal.schema_yaml,
+        "version": personal.version,
+        "description": personal.description,
+        "shared": shared_json,
+    }))
 }
 
 /// `ingest` argument を `IngestRequest` に詰める。`schema` は `user_schema` で
@@ -381,10 +909,32 @@ pub(super) fn build_ingest_raw_request(
 }
 
 pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
-    let request = match build_ingest_request(&user.vegapunk_schema, &args) {
+    let mut request = match build_ingest_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("ingest", &e),
     };
+    // dedup pre-check: entity 一覧の fetch を **batch 全体で 1 回**
+    // (= 8 query_nodes 上限) に抑え、scan は pure 関数で per-message に
+    // 適用する。N messages × 8 fetch の問題を回避する。
+    let catalogue = collect_dedup_catalogue(state, user).await;
+    for (i, msg) in request.messages.iter_mut().enumerate() {
+        match scan_text_with_catalogue(&catalogue, &msg.text) {
+            IngestPreCheck::BlockedByShared { hit } => {
+                return shared_dedup_block_content(&format!("ingest (messages[{i}])"), &hit);
+            }
+            IngestPreCheck::Rewritten { new_text, rewrites } => {
+                // entity 名 (Person 等) を default 出力する INFO に載せると
+                // 個人情報の漏えいリスクがあるので DEBUG に下げ、本数のみ出す。
+                tracing::debug!(
+                    message_index = i,
+                    rewrite_count = rewrites.len(),
+                    "ingest text normalized to existing canonical names",
+                );
+                msg.text = new_text;
+            }
+            IngestPreCheck::Proceed => {}
+        }
+    }
     let mut client = state.vegapunk.clone();
     match client.ingest(request).await {
         Err(status) => tonic_error_content("Ingest", status),
@@ -399,10 +949,27 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
 }
 
 pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
-    let request = match build_ingest_raw_request(&user.vegapunk_schema, &args) {
+    let mut request = match build_ingest_raw_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("ingest_raw", &e),
     };
+    // dedup pre-check。shared 既存は抑制、personal 表記揺れは canonical 化。
+    // catalogue 取得は ingest_raw 1 件あたり 1 回。
+    let catalogue = collect_dedup_catalogue(state, user).await;
+    match scan_text_with_catalogue(&catalogue, &request.text) {
+        IngestPreCheck::BlockedByShared { hit } => {
+            return shared_dedup_block_content("ingest_raw", &hit);
+        }
+        IngestPreCheck::Rewritten { new_text, rewrites } => {
+            // ingest と同じく entity 名は default log に載せず、本数のみ DEBUG。
+            tracing::debug!(
+                rewrite_count = rewrites.len(),
+                "ingest_raw text normalized to existing canonical names",
+            );
+            request.text = new_text;
+        }
+        IngestPreCheck::Proceed => {}
+    }
     let mut client = state.vegapunk.clone();
     match client.ingest_raw(request).await {
         Err(status) => tonic_error_content("IngestRaw", status),
@@ -553,90 +1120,195 @@ pub(super) fn build_get_stats_request(
 }
 
 pub(super) async fn query_nodes(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
-    let request = match build_query_nodes_request(&user.vegapunk_schema, &args) {
+    let personal_req = match build_query_nodes_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("query_nodes", &e),
     };
-    let mut client = state.vegapunk.clone();
-    match client.query_nodes(request).await {
-        Err(status) => tonic_error_content("QueryNodes", status),
-        Ok(resp) => {
-            let resp = resp.into_inner();
-            let nodes: Vec<Value> = resp
-                .nodes
-                .iter()
-                .map(|n| {
-                    json!({
-                        "node_id": n.node_id,
-                        "node_type": n.node_type,
-                        "attributes": n.attributes,
-                    })
-                })
-                .collect();
-            success_content(json!({
-                "nodes": nodes,
-                "total_count": resp.total_count,
-            }))
+    // fan-out 用に request を組み直す。client が指定した `offset` / `limit` は
+    // **union (personal + shared) に対する意味** として解釈し直し、各 schema
+    // には `offset=0`, `limit=client_offset+client_limit` を投げる。これにより
+    //   - client の `offset` が片方の集合だけにかかってしまう問題を回避
+    //   - merge 後に正しく `[offset, offset+limit)` の range を slice できる
+    // sort_by / sort_order は **per-schema 適用** で、cross-schema 全体 sort
+    // は wrapper では再現しない (= proto の sort は backend 側の属性順序を
+    // 使うため、クライアント側で再ソートすると属性の型推測が必要になる)。
+    // personal を先・shared を後ろの安定 order で merge することで「自分の
+    // データが優先表示」という直感的な挙動を担保する。
+    let client_offset = personal_req.offset.unwrap_or(0).max(0);
+    let client_limit = personal_req.limit;
+    // fetch_limit = `offset + limit` を投げて merge 後に slice したいが、
+    // `client_offset + client_limit` が proto/wrapper の上限 (= QUERY_NODES_LIMIT_MAX)
+    // を超えると vegapunk が invalid_argument を返してしまう。client が validate
+    // 範囲内の値を渡しても fan-out で上限超過になり得るので、ここで上限へ
+    // clamp する。トレードオフ: `offset + limit > LIMIT_MAX` の領域では片方の
+    // schema からの fetch 量が LIMIT_MAX に頭打ちになり、結果 page から欠落
+    // しうる (= deep pagination は backend 仕様で制約される)。
+    let fetch_limit = client_limit.map(|l| {
+        client_offset
+            .saturating_add(l.max(0))
+            .min(QUERY_NODES_LIMIT_MAX as i32)
+    });
+    let mut personal_req = personal_req;
+    personal_req.offset = Some(0);
+    personal_req.limit = fetch_limit;
+    let mut shared_req = personal_req.clone();
+    shared_req.schema = state.cfg.shared_schema_name.clone();
+
+    let mut client_p = state.vegapunk.clone();
+    let mut client_s = state.vegapunk.clone();
+    let (personal, shared) = tokio::join!(
+        client_p.query_nodes(personal_req),
+        client_s.query_nodes(shared_req),
+    );
+    let personal = match personal {
+        Ok(r) => r.into_inner(),
+        Err(s) => return tonic_error_content("QueryNodes (personal)", s),
+    };
+    // shared best-effort: 未作成・空でも personal の結果は返す。
+    let shared = match shared {
+        Ok(r) => Some(r.into_inner()),
+        Err(s) => {
+            tracing::warn!(
+                schema = %state.cfg.shared_schema_name,
+                code = ?s.code(),
+                "shared QueryNodes failed (continuing with personal only)",
+            );
+            None
+        }
+    };
+    // node_id は schema を prefix に持つ ULID なので両 schema 跨ぎで衝突
+    // しないはず。safety net として dedup を入れる (先勝ち = personal 優先)。
+    let mut seen = std::collections::HashSet::new();
+    let mut nodes: Vec<Value> = Vec::new();
+    let empty_nodes = Vec::new();
+    let shared_nodes = shared.as_ref().map(|s| &s.nodes).unwrap_or(&empty_nodes);
+    for n in personal.nodes.iter().chain(shared_nodes.iter()) {
+        if seen.insert(n.node_id.clone()) {
+            nodes.push(json!({
+                "node_id": n.node_id,
+                "node_type": n.node_type,
+                "attributes": n.attributes,
+            }));
         }
     }
+    // union 全体に対して [client_offset, client_offset + client_limit) で slice。
+    let start = (client_offset as usize).min(nodes.len());
+    nodes.drain(..start);
+    if let Some(limit) = client_limit {
+        let limit = limit.max(0) as usize;
+        nodes.truncate(limit);
+    }
+    success_content(json!({
+        "nodes": nodes,
+        "total_count": personal.total_count + shared.as_ref().map(|s| s.total_count).unwrap_or(0),
+    }))
 }
 
-/// vegapunk の `ListSchemas` は全 schema を返す admin-ish RPC だが、wrapper
-/// 単位では user 1 人につき 1 schema (= `user.vegapunk_schema`) しか紐付かない
-/// 設計なので、結果を user の schema 名に厳格に filter する。これがないと、
-/// 他 tenant の schema 名と yaml が caller に丸見えになる (情報漏洩)。
-///
-/// filter 実装は cross-tenant 防止の要なので、pure な
-/// [`filter_schemas_for_user`] に切り出して unit test で pin する。
+/// vegapunk の `ListSchemas` は全 schema を返す admin RPC。wrapper では呼び出し
+/// user 視点で意味のある **own personal + shared** の 2 件だけを通す
+/// (= 他テナントの schema 名 / yaml は絶対に出さない)。filter 実装は
+/// security-critical なので pure な [`filter_schemas_for_user_and_shared`]
+/// に切り出して unit test で pin する。
 pub(super) async fn list_schemas(state: &AppState, user: &AuthenticatedUser) -> Value {
     let mut client = state.vegapunk.clone();
     match client.list_schemas(ListSchemasRequest {}).await {
         Err(status) => tonic_error_content("ListSchemas", status),
         Ok(resp) => {
             let resp = resp.into_inner();
-            let schemas = filter_schemas_for_user(&resp.schemas, &user.vegapunk_schema);
+            let schemas = filter_schemas_for_user_and_shared(
+                &resp.schemas,
+                &user.vegapunk_schema,
+                &state.cfg.shared_schema_name,
+            );
             success_content(json!({ "schemas": schemas }))
         }
     }
 }
 
-/// `ListSchemas` レスポンスから、要求 user の vegapunk_schema に **完全一致**
-/// する entry のみを抜き出して JSON に整形する。`list_schemas` ハンドラの
-/// security-critical な部分なので、handler 自体を gRPC 込みで mock しなくても
-/// この pure function だけで cross-tenant filter の挙動を試験できる。
-fn filter_schemas_for_user(schemas: &[SchemaListItem], user_schema: &str) -> Vec<Value> {
-    schemas
-        .iter()
-        .filter(|s| s.name == user_schema)
-        .map(|s| {
-            json!({
-                "name": s.name,
-                "version": s.version,
-                "description": s.description,
-                "schema_yaml": s.schema_yaml,
-            })
+/// `ListSchemas` レスポンスから、own personal と shared の 2 件だけを通す。
+/// それ以外は全 drop。filter は exact match (= 部分一致は不可) で、別 tenant
+/// の `user-` prefix schema や偶然似た名前の schema が leak しないようにする。
+///
+/// 順序は **personal → shared** で固定する。`schemas` (= backend の
+/// `ListSchemas` レスポンス) の列挙順は backend 実装依存で安定保証が無く、
+/// 他の handler (search / query_nodes 等) では personal を先に merge する
+/// 慣習があるので、ここも同じ並びにしてクライアント側で「`schemas[0]` が
+/// 自分の personal schema」と仮定しても安全にしておく。
+/// 万一 `user_schema == shared_schema` のときは 1 件しか返さない
+/// (= cross-tenant guard の通常パスでは起き得ないが、念のため)。
+fn filter_schemas_for_user_and_shared(
+    schemas: &[SchemaListItem],
+    user_schema: &str,
+    shared_schema: &str,
+) -> Vec<Value> {
+    let to_json = |s: &SchemaListItem| {
+        json!({
+            "name": s.name,
+            "version": s.version,
+            "description": s.description,
+            "schema_yaml": s.schema_yaml,
         })
-        .collect()
+    };
+    let mut out = Vec::with_capacity(2);
+    if let Some(p) = schemas.iter().find(|s| s.name == user_schema) {
+        out.push(to_json(p));
+    }
+    if user_schema != shared_schema {
+        if let Some(s) = schemas.iter().find(|s| s.name == shared_schema) {
+            out.push(to_json(s));
+        }
+    }
+    out
 }
 
 pub(super) async fn stats(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
-    let request = match build_get_stats_request(&user.vegapunk_schema, &args) {
+    let personal_req = match build_get_stats_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("stats", &e),
     };
-    let mut client = state.vegapunk.clone();
-    match client.get_stats(request).await {
-        Err(status) => tonic_error_content("GetStats", status),
-        Ok(resp) => {
-            let resp = resp.into_inner();
-            success_content(json!({
-                "node_count": resp.node_count,
-                "edge_count": resp.edge_count,
-                "vector_count": resp.vector_count,
-                "community_count": resp.community_count,
-            }))
+    let mut shared_req = personal_req.clone();
+    shared_req.schema = Some(state.cfg.shared_schema_name.clone());
+
+    let mut client_p = state.vegapunk.clone();
+    let mut client_s = state.vegapunk.clone();
+    let (personal, shared) = tokio::join!(
+        client_p.get_stats(personal_req),
+        client_s.get_stats(shared_req),
+    );
+    let personal = match personal {
+        Ok(r) => r.into_inner(),
+        Err(s) => return tonic_error_content("GetStats (personal)", s),
+    };
+    // shared が無い deployment (= 初回 user 来訪前) を考慮して best-effort。
+    let shared_json = match shared {
+        Ok(r) => {
+            let r = r.into_inner();
+            json!({
+                "node_count": r.node_count,
+                "edge_count": r.edge_count,
+                "vector_count": r.vector_count,
+                "community_count": r.community_count,
+            })
         }
-    }
+        Err(s) => {
+            tracing::warn!(
+                schema = %state.cfg.shared_schema_name,
+                code = ?s.code(),
+                "shared GetStats failed (returning null for shared)",
+            );
+            Value::Null
+        }
+    };
+    // backward compat: 既存 client は top-level の counter を読む前提なので
+    // personal の値を top-level に残し、`shared` は新規 field として併設する
+    // (shared 取得失敗時は null)。
+    success_content(json!({
+        "node_count": personal.node_count,
+        "edge_count": personal.edge_count,
+        "vector_count": personal.vector_count,
+        "community_count": personal.community_count,
+        "shared": shared_json,
+    }))
 }
 
 // `feedback` / `get_job_status` handlers are intentionally absent in this PR.
@@ -677,32 +1349,87 @@ pub(super) async fn get_traceable_chain(
     user: &AuthenticatedUser,
     args: Value,
 ) -> Value {
-    let request = match build_get_traceable_chain_request(&user.vegapunk_schema, &args) {
+    // node_id がどちらの schema にあるかは呼び出し側からは分からないので、
+    // 両 schema で並行に試行する。エラーの扱いは他 read handler と揃える:
+    //
+    // - **shared** 側の Err は **best-effort warn + 続行** (= 他 read と同じ
+    //   方針)。shared は誰でも触れる共有 schema で、未作成 / Unavailable /
+    //   PermissionDenied などの状態でも personal が answer を持ち得るので、
+    //   片側で完結できる限り処理を止めない。
+    // - **personal** 側の Err は **NotFound のみ非致命** で、それ以外
+    //   (Unauthenticated / PermissionDenied / Unavailable など) は致命扱い。
+    //   personal の本物の障害を shared が Ok だからと黙らせると、cross-tenant
+    //   guard や authz が壊れていても気付けない。
+    // - 両方 Err は personal の Err を tonic_error_content で返す。
+    // - 両方 Ok で両方 links 空のときは personal 側の空 chain を success と
+    //   して返す (= "no chain found" を呼び出し側に伝える)。
+    let personal_req = match build_get_traceable_chain_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("get_traceable_chain", &e),
     };
-    let mut client = state.vegapunk.clone();
-    match client.get_traceable_chain(request).await {
-        Err(status) => tonic_error_content("GetTraceableChain", status),
-        Ok(resp) => {
-            let resp = resp.into_inner();
-            let links: Vec<Value> = resp
-                .links
-                .iter()
-                .map(|l| {
-                    json!({
-                        "node_id": l.node_id,
-                        "node_type": l.node_type,
-                        "display_text": l.display_text,
-                        "edge_type": l.edge_type,
-                        "depth": l.depth,
-                        "timestamp": l.timestamp,
-                    })
-                })
-                .collect();
-            success_content(json!({ "links": links }))
+    let mut shared_req = personal_req.clone();
+    shared_req.schema = Some(state.cfg.shared_schema_name.clone());
+
+    let mut client_p = state.vegapunk.clone();
+    let mut client_s = state.vegapunk.clone();
+    let (personal, shared) = tokio::join!(
+        client_p.get_traceable_chain(personal_req),
+        client_s.get_traceable_chain(shared_req),
+    );
+
+    let (found_in, resp) = match (personal, shared) {
+        (Ok(p), Ok(s)) => {
+            let p = p.into_inner();
+            let s = s.into_inner();
+            if !p.links.is_empty() {
+                ("personal", p)
+            } else if !s.links.is_empty() {
+                ("shared", s)
+            } else {
+                ("personal", p)
+            }
         }
-    }
+        (Ok(p), Err(s_err)) => {
+            tracing::warn!(
+                code = ?s_err.code(),
+                "shared get_traceable_chain failed (continuing with personal)",
+            );
+            ("personal", p.into_inner())
+        }
+        (Err(p_err), Ok(s)) => {
+            if p_err.code() == tonic::Code::NotFound {
+                tracing::warn!(
+                    code = ?p_err.code(),
+                    "personal get_traceable_chain NotFound (continuing with shared)",
+                );
+                ("shared", s.into_inner())
+            } else {
+                return tonic_error_content("GetTraceableChain (personal)", p_err);
+            }
+        }
+        (Err(p_err), Err(_)) => {
+            return tonic_error_content("GetTraceableChain", p_err);
+        }
+    };
+
+    let links: Vec<Value> = resp
+        .links
+        .iter()
+        .map(|l| {
+            json!({
+                "node_id": l.node_id,
+                "node_type": l.node_type,
+                "display_text": l.display_text,
+                "edge_type": l.edge_type,
+                "depth": l.depth,
+                "timestamp": l.timestamp,
+            })
+        })
+        .collect();
+    success_content(json!({
+        "found_in": found_in,
+        "links": links,
+    }))
 }
 
 #[cfg(test)]
@@ -1309,6 +2036,141 @@ mod tests {
         assert_eq!(req.filters.len(), 1);
     }
 
+    // ── ingest pre-check helpers (dedup normalization) ─────────────────
+
+    #[test]
+    fn normalize_entity_key_lowercases_and_trims() {
+        assert_eq!(normalize_entity_key("  Vegapunk  "), "vegapunk");
+        assert_eq!(normalize_entity_key("SIVIRA"), "sivira");
+        assert_eq!(normalize_entity_key("\tfoo BAR\n"), "foo bar");
+    }
+
+    // test helper: 旧 `word_boundary_contains_normalized` 相当の薄い wrapper。
+    // production は lowercased text を再利用するホットパスで直接 helper を
+    // 呼ぶ (= scan_text_with_catalogue 参照)、test はこの簡便版を使う。
+    // alignment guard は production と同じ `is_lowercase_byte_aligned` を使い、
+    // 挙動の差が出ないようにする。
+    fn wb_contains_for_test(text: &str, needle: &str) -> bool {
+        if needle.is_empty() {
+            return false;
+        }
+        if !is_lowercase_byte_aligned(text) {
+            return false;
+        }
+        let text_lc = text.to_lowercase();
+        word_boundary_contains_in_lowercased(&text_lc, needle)
+    }
+
+    #[test]
+    fn word_boundary_contains_matches_isolated_words() {
+        assert!(wb_contains_for_test("hello vegapunk world", "vegapunk"));
+        assert!(wb_contains_for_test("Vegapunk launched", "vegapunk"));
+        assert!(wb_contains_for_test("VEGAPUNK ROCKS", "vegapunk"));
+    }
+
+    #[test]
+    fn word_boundary_contains_rejects_substring_inside_word() {
+        // "Vegapunker" inside should NOT match "vegapunk" alone.
+        assert!(!wb_contains_for_test("Vegapunker rocks", "vegapunk"));
+        assert!(!wb_contains_for_test("XVegapunkX", "vegapunk"));
+    }
+
+    #[test]
+    fn word_boundary_contains_handles_punctuation_boundaries() {
+        // 句読点や括弧は word boundary として扱う。
+        assert!(wb_contains_for_test("Vegapunk.", "vegapunk"));
+        assert!(wb_contains_for_test("(Vegapunk)", "vegapunk"));
+        assert!(wb_contains_for_test("see: vegapunk!", "vegapunk"));
+    }
+
+    #[test]
+    fn word_boundary_contains_returns_false_for_empty_needle() {
+        assert!(!wb_contains_for_test("anything", ""));
+    }
+
+    #[test]
+    fn replace_word_case_insensitive_returns_none_on_misaligned_lowercase() {
+        // U+212A KELVIN SIGN (3 bytes) → 'k' (1 byte) = shrink -2
+        // U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE (2 bytes) →
+        //   "i\u{0307}" (3 bytes) = expand +1
+        // 全体長は (3 + 2 + 2) → (1 + 3 + 3) = 7 で同じだが、per-char で
+        // byte offset がずれているため `text_lc` の byte index を `text` に
+        // 直接マップすると char-boundary 違反で panic する。
+        // strict guard 経由で no-op (None) を返すこと。
+        let text = "\u{212A}\u{0130}\u{0130}";
+        assert_eq!(text.to_lowercase().len(), text.len());
+        assert!(!is_lowercase_byte_aligned(text));
+        let out = replace_word_case_insensitive(text, "kii", "Foo");
+        assert!(
+            out.is_none(),
+            "strict guard must drop misaligned lowercase to avoid panic"
+        );
+        // wb_contains_for_test も同じ guard で false に倒す。
+        assert!(!wb_contains_for_test(text, "kii"));
+    }
+
+    #[test]
+    fn replace_word_case_insensitive_rewrites_to_canonical() {
+        // text が既に canonical 表記なら None (= 実書き換え無し)。
+        let out = replace_word_case_insensitive("we use Vegapunk daily", "vegapunk", "Vegapunk");
+        assert_eq!(
+            out, None,
+            "no rewrite expected when match already equals canonical"
+        );
+        // 大文字 / 小文字違いは canonical へ書き換え。
+        let out = replace_word_case_insensitive("we use VEGAPUNK daily", "vegapunk", "Vegapunk");
+        assert_eq!(out.as_deref(), Some("we use Vegapunk daily"));
+        let out = replace_word_case_insensitive("we use vegapunk daily", "vegapunk", "Vegapunk");
+        assert_eq!(out.as_deref(), Some("we use Vegapunk daily"));
+    }
+
+    #[test]
+    fn replace_word_case_insensitive_mixed_canonical_and_off_case() {
+        // 1 文中で「既に canonical な match」と「書き換え対象 match」が
+        // 混在するケース: alloc は遅延だが、書き換え後の出力は両方の match
+        // を含む完全な文字列であること。
+        let out =
+            replace_word_case_insensitive("Vegapunk and VEGAPUNK rocks", "vegapunk", "Vegapunk");
+        assert_eq!(out.as_deref(), Some("Vegapunk and Vegapunk rocks"));
+        // 逆順 (= off-case が先、canonical が後) も同様に正しく結合される。
+        let out =
+            replace_word_case_insensitive("VEGAPUNK and Vegapunk rocks", "vegapunk", "Vegapunk");
+        assert_eq!(out.as_deref(), Some("Vegapunk and Vegapunk rocks"));
+    }
+
+    #[test]
+    fn replace_word_case_insensitive_replaces_all_occurrences() {
+        let out = replace_word_case_insensitive("vegapunk vs VEGAPUNK", "vegapunk", "Vegapunk");
+        assert_eq!(out.as_deref(), Some("Vegapunk vs Vegapunk"));
+    }
+
+    #[test]
+    fn replace_word_case_insensitive_skips_substring_within_word() {
+        // "Vegapunker" inside "Vegapunkers" should NOT be touched.
+        let out = replace_word_case_insensitive("Vegapunker is a fan", "vegapunk", "Vegapunk");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn replace_word_case_insensitive_returns_none_when_no_match() {
+        let out = replace_word_case_insensitive("hello world", "vegapunk", "Vegapunk");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn shared_dedup_block_content_marks_iserror_and_names_entity() {
+        let v = shared_dedup_block_content(
+            "ingest_raw",
+            &EntityRef::new("Vegapunk".into(), "Project".into(), "sivira-shared".into()),
+        );
+        assert_eq!(v["isError"], true);
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ingest_raw"));
+        assert!(text.contains("Vegapunk"));
+        assert!(text.contains("Project"));
+        assert!(text.contains("sivira-shared"));
+    }
+
     // ── list_schemas filter (cross-tenant guard) ────────────────────────
 
     fn schema_item(name: &str) -> SchemaListItem {
@@ -1321,44 +2183,57 @@ mod tests {
     }
 
     #[test]
-    fn filter_schemas_returns_only_matching_user_schema() {
+    fn filter_schemas_returns_user_and_shared_only() {
         let schemas = vec![
             schema_item("alice-tenant"),
             schema_item("bob-tenant"),
             schema_item("eve-tenant"),
+            schema_item("sivira-shared"),
         ];
-        let out = filter_schemas_for_user(&schemas, "bob-tenant");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["name"], "bob-tenant");
-        assert_eq!(out[0]["schema_yaml"], "name: bob-tenant\n");
+        let out = filter_schemas_for_user_and_shared(&schemas, "bob-tenant", "sivira-shared");
+        let names: Vec<&str> = out.iter().map(|v| v["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"bob-tenant"));
+        assert!(names.contains(&"sivira-shared"));
+        assert_eq!(out.len(), 2, "expected own+shared only, got: {names:?}");
     }
 
     #[test]
     fn filter_schemas_drops_other_tenants_completely() {
         // alice / eve は出力に絶対に含まれない (cross-tenant guard の核)。
-        let schemas = vec![schema_item("alice-tenant"), schema_item("eve-tenant")];
-        let out = filter_schemas_for_user(&schemas, "bob-tenant");
-        assert!(out.is_empty(), "got: {out:?}");
+        let schemas = vec![
+            schema_item("alice-tenant"),
+            schema_item("eve-tenant"),
+            schema_item("sivira-shared"),
+        ];
+        let out = filter_schemas_for_user_and_shared(&schemas, "bob-tenant", "sivira-shared");
+        // bob-tenant 自身は schemas に居ないので、出力は shared のみ。
+        let names: Vec<&str> = out.iter().map(|v| v["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["sivira-shared"], "got: {names:?}");
     }
 
     #[test]
     fn filter_schemas_uses_exact_match_not_substring() {
         // "bob-tenant" を要求した時に "bob-tenant-v2" のような prefix-match が
-        // 入らないこと (substring leak の典型パターンを潰す)。
+        // 入らないこと (substring leak の典型パターンを潰す)。shared 名も
+        // exact match で判定される。
         let schemas = vec![
             schema_item("bob-tenant"),
             schema_item("bob-tenant-v2"),
             schema_item("bob"),
+            schema_item("sivira-shared"),
+            schema_item("sivira-shared-v2"),
         ];
-        let out = filter_schemas_for_user(&schemas, "bob-tenant");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["name"], "bob-tenant");
+        let out = filter_schemas_for_user_and_shared(&schemas, "bob-tenant", "sivira-shared");
+        let names: Vec<&str> = out.iter().map(|v| v["name"].as_str().unwrap()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["bob-tenant", "sivira-shared"]);
     }
 
     #[test]
-    fn filter_schemas_returns_empty_when_user_has_no_match() {
+    fn filter_schemas_returns_empty_when_user_and_shared_both_absent() {
         let schemas = vec![schema_item("alice-tenant")];
-        let out = filter_schemas_for_user(&schemas, "bob-tenant");
+        let out = filter_schemas_for_user_and_shared(&schemas, "bob-tenant", "sivira-shared");
         assert!(out.is_empty());
     }
 
