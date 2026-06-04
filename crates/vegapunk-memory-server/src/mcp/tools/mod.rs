@@ -286,13 +286,14 @@ fn tool_descriptor(name: &str) -> Value {
         }),
         "upsert_nodes" => json!({
             "name": "upsert_nodes",
-            "description": "Upsert nodes by deterministic id (vegapunk UpsertNodes RPC). Unlike `ingest`/`ingest_raw` (which rely on vegapunk's async LLM extraction and can split the same entity into multiple nodes on rapid-fire ingest), this tool lets the caller assign stable ids — re-upserting the same id updates the existing node instead of creating a duplicate. Each `id` must start with the authenticated user's schema prefix (e.g. `user-<sub>:proj-vegapunk`); the server rejects cross-tenant ids.",
+            "description": "Upsert nodes by deterministic id (vegapunk UpsertNodes RPC). Unlike `ingest`/`ingest_raw` (which rely on vegapunk's async LLM extraction and can split the same entity into multiple nodes on rapid-fire ingest), this tool lets the caller assign stable ids — re-upserting the same id updates the existing node instead of creating a duplicate. ID convention: first call `list_schemas` to obtain the authenticated user's personal schema name (the entry with `name` starting with `user-`), then build each id as `{personal_schema_name}:{local-id}` (e.g. `user-<sub>:proj-vegapunk`). The server rejects any id that does not start with the caller's personal schema prefix, and writes to the shared schema are not allowed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "nodes": {
                         "type": "array",
                         "minItems": 1,
+                        "maxItems": 256,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -300,7 +301,7 @@ fn tool_descriptor(name: &str) -> Value {
                                     "type": "string",
                                     "minLength": 1,
                                     "pattern": "\\S",
-                                    "description": "Stable node id. Must start with the authenticated user's schema prefix followed by ':'. Re-upserting the same id updates the existing node."
+                                    "description": "Stable node id formatted as `{personal_schema_name}:{local-id}`. Re-upserting the same id updates the existing node. Use `list_schemas` to discover the personal schema name; do not guess it."
                                 },
                                 "type": {
                                     "type": "string",
@@ -330,13 +331,14 @@ fn tool_descriptor(name: &str) -> Value {
         }),
         "upsert_edges" => json!({
             "name": "upsert_edges",
-            "description": "Upsert edges between previously-known nodes (vegapunk UpsertEdges RPC). Both `from_id` and `to_id` must start with the authenticated user's schema prefix. Re-upserting the same (from_id, to_id, type) triple updates the existing edge in place.",
+            "description": "Upsert edges between previously-known nodes (vegapunk UpsertEdges RPC). Both `from_id` and `to_id` must start with the authenticated user's personal schema prefix (use `list_schemas` to discover it; same convention as `upsert_nodes`). Re-upserting the same (from_id, to_id, type) triple updates the existing edge in place.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "edges": {
                         "type": "array",
                         "minItems": 1,
+                        "maxItems": 256,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -344,13 +346,13 @@ fn tool_descriptor(name: &str) -> Value {
                                     "type": "string",
                                     "minLength": 1,
                                     "pattern": "\\S",
-                                    "description": "Source node id. Must start with the authenticated user's schema prefix."
+                                    "description": "Source node id formatted as `{personal_schema_name}:{local-id}`. Use `list_schemas` to discover the personal schema name."
                                 },
                                 "to_id": {
                                     "type": "string",
                                     "minLength": 1,
                                     "pattern": "\\S",
-                                    "description": "Target node id. Must start with the authenticated user's schema prefix."
+                                    "description": "Target node id formatted as `{personal_schema_name}:{local-id}`."
                                 },
                                 "type": {
                                     "type": "string",
@@ -379,13 +381,14 @@ fn tool_descriptor(name: &str) -> Value {
         }),
         "upsert_vectors" => json!({
             "name": "upsert_vectors",
-            "description": "Upsert embedding vectors keyed by node id (vegapunk UpsertVectors RPC). Use vegapunk's `embed` tool (or any embedder aligned to vegapunk's dimension) to produce the float array. `id` must start with the authenticated user's schema prefix.",
+            "description": "Upsert embedding vectors keyed by node id (vegapunk UpsertVectors RPC). Use vegapunk's `embed` tool (or any embedder aligned to vegapunk's dimension) to produce the float array. `id` must start with the authenticated user's personal schema prefix (use `list_schemas` to discover it; same convention as `upsert_nodes`). All vector elements must be finite (NaN / ±Inf and values outside f32 range are rejected).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "vectors": {
                         "type": "array",
                         "minItems": 1,
+                        "maxItems": 256,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -393,13 +396,14 @@ fn tool_descriptor(name: &str) -> Value {
                                     "type": "string",
                                     "minLength": 1,
                                     "pattern": "\\S",
-                                    "description": "Vector id (typically the node id it embeds). Must start with the authenticated user's schema prefix."
+                                    "description": "Vector id (typically the node id it embeds), formatted as `{personal_schema_name}:{local-id}`."
                                 },
                                 "vector": {
                                     "type": "array",
                                     "minItems": 1,
+                                    "maxItems": 8192,
                                     "items": {"type": "number"},
-                                    "description": "Embedding float array. Must match vegapunk's configured embedder dimension."
+                                    "description": "Embedding float array. Must match vegapunk's configured embedder dimension. All elements must be finite numbers."
                                 },
                                 "metadata": {
                                     "type": "object",

@@ -1373,9 +1373,18 @@ fn build_node_attributes_from(
     Ok(out)
 }
 
-/// `field` の値が `{user_schema}:` で始まる string であることを保証する。
-/// `Node` / `Edge` / `VectorEntry` に schema field が無い vegapunk の id 規約
-/// で、他 tenant の id を upsert しないための cross-tenant guard。
+/// `field` の値が `{user_schema}:` で始まり、prefix 後に **非空白の local 部**
+/// を持つ string であることを保証する。`Node` / `Edge` / `VectorEntry` に
+/// schema field が無い vegapunk の id 規約で、他 tenant の id を upsert しない
+/// ための cross-tenant guard。
+///
+/// 注意:
+/// - `starts_with(format!("{user_schema}:"))` を使うので `user-alice` user が
+///   `user-alicemore:x` のような **prefix-shadow** で他 tenant を狙う攻撃は
+///   `:` 必須により遮断される (= "user-alice:" が "user-alicemore:" の頭に
+///   一致しない)。回帰テスト参照。
+/// - prefix だけで local 部が空 (`user-alice:` や `user-alice:   `) も拒否。
+///   そうしないと vegapunk 側で id 衝突を引き起こす危険な空 id が通る。
 fn require_tenant_scoped_id(
     obj: &Map<String, Value>,
     field: &str,
@@ -1384,12 +1393,34 @@ fn require_tenant_scoped_id(
 ) -> Result<String, String> {
     let id = require_str_field(obj, field, owner)?;
     let prefix = format!("{user_schema}:");
-    if !id.starts_with(&prefix) {
+    let suffix = match id.strip_prefix(&prefix) {
+        Some(s) => s,
+        None => {
+            return Err(format!(
+                "'{owner}.{field}' must start with '{prefix}' (cross-tenant guard)"
+            ));
+        }
+    };
+    if suffix.trim().is_empty() {
         return Err(format!(
-            "'{owner}.{field}' must start with '{prefix}' (cross-tenant guard)"
+            "'{owner}.{field}' must have a non-empty local id after the schema prefix"
         ));
     }
     Ok(id)
+}
+
+/// 安全検算: 認証 user の vegapunk_schema が **shared schema と一致しない** こと。
+/// 通常 OAuth callback で personal `user-{sub}` 形に設定されるので発火しないが、
+/// 設定ミス / 将来の経路追加で `user.vegapunk_schema == shared_schema_name` が
+/// 起きると、prefix guard を踏んでも `sivira-shared:...` 配下に書けてしまう。
+/// PR #21 までの user 方針「shared への書き込みは禁止」を多重防御として強制する。
+fn ensure_personal_schema(user_schema: &str, shared_schema: &str) -> Result<(), String> {
+    if user_schema == shared_schema {
+        return Err(format!(
+            "wrapper cross-tenant guard: upsert from shared schema '{shared_schema}' is not allowed (personal schema only)"
+        ));
+    }
+    Ok(())
 }
 
 /// `upsert_nodes` arguments を `UpsertNodesRequest` に詰める。
@@ -1427,6 +1458,9 @@ pub(super) fn build_upsert_nodes_request(
 }
 
 pub(super) async fn upsert_nodes(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
+    if let Err(e) = ensure_personal_schema(&user.vegapunk_schema, &state.cfg.shared_schema_name) {
+        return invalid_args_content("upsert_nodes", &e);
+    }
     let req = match build_upsert_nodes_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("upsert_nodes", &e),
@@ -1478,6 +1512,9 @@ pub(super) fn build_upsert_edges_request(
 }
 
 pub(super) async fn upsert_edges(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
+    if let Err(e) = ensure_personal_schema(&user.vegapunk_schema, &state.cfg.shared_schema_name) {
+        return invalid_args_content("upsert_edges", &e);
+    }
     let req = match build_upsert_edges_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("upsert_edges", &e),
@@ -1530,7 +1567,23 @@ pub(super) fn build_upsert_vectors_request(
             let f = fv
                 .as_f64()
                 .ok_or_else(|| format!("'{owner}.vector[{j}]' must be a number"))?;
-            floats.push(f as f32);
+            // NaN / ±Inf を含む非有限値は早期拒否。downstream の vector index
+            // (距離計算 / ANN) に到達するとクエリ品質を壊し、backend が黙って
+            // 受け入れると検出も難しいので invalid_args として弾く。
+            if !f.is_finite() {
+                return Err(format!(
+                    "'{owner}.vector[{j}]' must be a finite number (got {f})"
+                ));
+            }
+            let as_f32 = f as f32;
+            // f64 → f32 でレンジ外 (例: 1e308) は ±Inf に変換される。これも
+            // proto に乗せず invalid_args に倒す。
+            if !as_f32.is_finite() {
+                return Err(format!(
+                    "'{owner}.vector[{j}]' overflows f32 (value {f} maps to non-finite f32)"
+                ));
+            }
+            floats.push(as_f32);
         }
         let metadata = match obj.get("metadata") {
             None | Some(Value::Null) => HashMap::new(),
@@ -1562,6 +1615,9 @@ pub(super) async fn upsert_vectors(
     user: &AuthenticatedUser,
     args: Value,
 ) -> Value {
+    if let Err(e) = ensure_personal_schema(&user.vegapunk_schema, &state.cfg.shared_schema_name) {
+        return invalid_args_content("upsert_vectors", &e);
+    }
     let req = match build_upsert_vectors_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("upsert_vectors", &e),
@@ -2614,6 +2670,74 @@ mod tests {
     }
 
     #[test]
+    fn upsert_nodes_request_rejects_prefix_shadow_attack() {
+        // user-alice が user-alicemore:x のような prefix-shadow を狙うケース。
+        // `{user_schema}:` の `:` 必須により拒否されること。
+        let err = build_upsert_nodes_request(
+            "user-alice",
+            &json!({
+                "nodes": [{
+                    "id": "user-alicemore:proj-x",
+                    "type": "Project"
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("nodes[0].id"), "got: {err}");
+        assert!(err.contains("user-alice:"), "guard prefix in error: {err}");
+    }
+
+    #[test]
+    fn upsert_nodes_request_rejects_short_schema_prefix_shadow() {
+        // 極端に短い schema 名 "u" でも colon 区切りが効くこと
+        // (= "u:" が "user-..." の頭に偶然マッチしないことの保証)。
+        let err = build_upsert_nodes_request(
+            "u",
+            &json!({
+                "nodes": [{
+                    "id": "user-alice:proj-x",
+                    "type": "Project"
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("'u:'"), "guard prefix in error: {err}");
+    }
+
+    #[test]
+    fn upsert_nodes_request_rejects_empty_local_id_after_prefix() {
+        // 'user-alice:' は prefix だけで local id が空。proto に空 id を
+        // 流すと vegapunk 側で予期せぬ衝突 / panic を招く危険があるので拒否。
+        let err = build_upsert_nodes_request(
+            "user-alice",
+            &json!({
+                "nodes": [{
+                    "id": "user-alice:",
+                    "type": "Project"
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("non-empty local id"), "got: {err}");
+    }
+
+    #[test]
+    fn upsert_nodes_request_rejects_whitespace_only_local_id() {
+        // local 部が空白のみ (` `) も上と同様に拒否。
+        let err = build_upsert_nodes_request(
+            "user-alice",
+            &json!({
+                "nodes": [{
+                    "id": "user-alice:   ",
+                    "type": "Project"
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("non-empty local id"), "got: {err}");
+    }
+
+    #[test]
     fn upsert_nodes_request_rejects_empty_array() {
         let err = build_upsert_nodes_request("user-alice", &json!({ "nodes": [] })).unwrap_err();
         assert!(err.contains("at least one"), "got: {err}");
@@ -2722,6 +2846,33 @@ mod tests {
         assert!((v.vector[0] - 0.1).abs() < 1e-6);
         assert!((v.vector[2] - (-0.3)).abs() < 1e-6);
         assert_eq!(v.metadata.get("model").map(String::as_str), Some("ada-002"));
+    }
+
+    // NaN / Inf は serde_json が `Value::Null` に変換する仕様 (JSON spec で
+    // 非有限値が表現できないため `Number::from_f64` が None を返す) なので、
+    // build_upsert_vectors_request が null を見て `must be a number` で弾く
+    // パスで間接的に弾かれる (= 既存テスト upsert_vectors_request_rejects_*
+    // が null 経路をカバー)。production code 側の `f.is_finite()` 検査は、
+    // 将来 JSON parser が `Infinity` / `NaN` を許容するよう非標準拡張された
+    // ケースに備えた防御的 guard として残してある。
+    //
+    // f32 overflow (= 有限 f64 1e308 が f32 で +Inf に化ける) は JSON で
+    // 表現可能なので、ここで明示的に拒否を pin する。
+
+    #[test]
+    fn upsert_vectors_request_rejects_value_that_overflows_f32() {
+        // 1e308 (有限 f64) は f32 範囲外で +Inf に化ける。
+        let err = build_upsert_vectors_request(
+            "user-alice",
+            &json!({
+                "vectors": [{
+                    "id": "user-alice:x",
+                    "vector": [1e308f64]
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("overflows f32"), "got: {err}");
     }
 
     #[test]
