@@ -38,6 +38,12 @@ pub(super) const TRACEABLE_CHAIN_MAX_DEPTH_MIN: i64 = 1;
 pub(super) const TRACEABLE_CHAIN_MAX_DEPTH_MAX: i64 = 10;
 pub(super) const TRACEABLE_CHAIN_MAX_DEPTH_DEFAULT: i32 = 5;
 
+// upsert_* tool の上限。client 向け契約 (`maxItems`) と server-side runtime
+// 検証 (= `build_*_request` で `arr.len()` を上回ったら invalid_args) の
+// single source of truth として使う。
+pub(super) const UPSERT_BATCH_MAX_ITEMS: usize = 256;
+pub(super) const UPSERT_VECTOR_DIM_MAX: usize = 8192;
+
 /// vegapunk wrapper として公開する tool 名の集合。
 /// 「公開しない vegapunk RPC」(= UpsertNodes / Reingest / Rebuild / Migrate /
 /// PurgeRawMessages / SetMaintenanceMode 等の admin) は意図的に外す。
@@ -293,7 +299,7 @@ fn tool_descriptor(name: &str) -> Value {
                     "nodes": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 256,
+                        "maxItems": UPSERT_BATCH_MAX_ITEMS,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -338,7 +344,7 @@ fn tool_descriptor(name: &str) -> Value {
                     "edges": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 256,
+                        "maxItems": UPSERT_BATCH_MAX_ITEMS,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -388,7 +394,7 @@ fn tool_descriptor(name: &str) -> Value {
                     "vectors": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 256,
+                        "maxItems": UPSERT_BATCH_MAX_ITEMS,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -401,7 +407,7 @@ fn tool_descriptor(name: &str) -> Value {
                                 "vector": {
                                     "type": "array",
                                     "minItems": 1,
-                                    "maxItems": 8192,
+                                    "maxItems": UPSERT_VECTOR_DIM_MAX,
                                     "items": {"type": "number"},
                                     "description": "Embedding float array. Must match vegapunk's configured embedder dimension. All elements must be finite numbers."
                                 },

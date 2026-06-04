@@ -31,7 +31,7 @@ use super::{
     QUERY_NODES_LIMIT_MIN, QUERY_NODES_SORT_ORDER_DEFAULT, QUERY_NODES_VALID_SORT_ORDERS,
     SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN, SEARCH_MODE_DEFAULT,
     SEARCH_VALID_MODES, TRACEABLE_CHAIN_MAX_DEPTH_DEFAULT, TRACEABLE_CHAIN_MAX_DEPTH_MAX,
-    TRACEABLE_CHAIN_MAX_DEPTH_MIN,
+    TRACEABLE_CHAIN_MAX_DEPTH_MIN, UPSERT_BATCH_MAX_ITEMS, UPSERT_VECTOR_DIM_MAX,
 };
 
 /// MCP `tools/call.arguments` を共通の作法で object に降ろす。
@@ -1439,6 +1439,12 @@ pub(super) fn build_upsert_nodes_request(
     if nodes_arr.is_empty() {
         return Err("'nodes' must contain at least one entry".to_string());
     }
+    if nodes_arr.len() > UPSERT_BATCH_MAX_ITEMS {
+        return Err(format!(
+            "'nodes' length {} exceeds maximum {UPSERT_BATCH_MAX_ITEMS}",
+            nodes_arr.len()
+        ));
+    }
     let mut nodes = Vec::with_capacity(nodes_arr.len());
     for (i, item) in nodes_arr.iter().enumerate() {
         let owner = format!("nodes[{i}]");
@@ -1490,6 +1496,12 @@ pub(super) fn build_upsert_edges_request(
         .ok_or_else(|| "'edges' must be an array".to_string())?;
     if edges_arr.is_empty() {
         return Err("'edges' must contain at least one entry".to_string());
+    }
+    if edges_arr.len() > UPSERT_BATCH_MAX_ITEMS {
+        return Err(format!(
+            "'edges' length {} exceeds maximum {UPSERT_BATCH_MAX_ITEMS}",
+            edges_arr.len()
+        ));
     }
     let mut edges = Vec::with_capacity(edges_arr.len());
     for (i, item) in edges_arr.iter().enumerate() {
@@ -1546,6 +1558,12 @@ pub(super) fn build_upsert_vectors_request(
     if vecs_arr.is_empty() {
         return Err("'vectors' must contain at least one entry".to_string());
     }
+    if vecs_arr.len() > UPSERT_BATCH_MAX_ITEMS {
+        return Err(format!(
+            "'vectors' length {} exceeds maximum {UPSERT_BATCH_MAX_ITEMS}",
+            vecs_arr.len()
+        ));
+    }
     let mut vectors = Vec::with_capacity(vecs_arr.len());
     for (i, item) in vecs_arr.iter().enumerate() {
         let owner = format!("vectors[{i}]");
@@ -1561,6 +1579,12 @@ pub(super) fn build_upsert_vectors_request(
             .ok_or_else(|| format!("'{owner}.vector' must be an array of numbers"))?;
         if vec_arr.is_empty() {
             return Err(format!("'{owner}.vector' must contain at least one number"));
+        }
+        if vec_arr.len() > UPSERT_VECTOR_DIM_MAX {
+            return Err(format!(
+                "'{owner}.vector' length {} exceeds maximum {UPSERT_VECTOR_DIM_MAX}",
+                vec_arr.len()
+            ));
         }
         let mut floats = Vec::with_capacity(vec_arr.len());
         for (j, fv) in vec_arr.iter().enumerate() {
