@@ -45,8 +45,11 @@ pub(super) const UPSERT_BATCH_MAX_ITEMS: usize = 256;
 pub(super) const UPSERT_VECTOR_DIM_MAX: usize = 8192;
 
 /// vegapunk wrapper として公開する tool 名の集合。
-/// 「公開しない vegapunk RPC」(= UpsertNodes / Reingest / Rebuild / Migrate /
+/// 「公開しない vegapunk RPC」(= Reingest / Rebuild / Migrate /
 /// PurgeRawMessages / SetMaintenanceMode 等の admin) は意図的に外す。
+/// `UpsertNodes` / `UpsertEdges` / `UpsertVectors` は PR #22 から
+/// `upsert_nodes` / `upsert_edges` / `upsert_vectors` として公開している
+/// (cross-tenant guard と shared 書き込み禁止は handler 側で強制)。
 // NOTE: `feedback` と `get_job_status` は意図的に外している。proto 上、
 // `FeedbackRequest` / `GetJobStatusRequest` には schema フィールドが無く、
 // 識別子 (`search_id` / `msg_id`) だけで vegapunk に投げる API。wrapper 側で

@@ -1324,7 +1324,7 @@ pub(super) async fn stats(state: &AppState, user: &AuthenticatedUser, args: Valu
 //
 // 低レベル upsert は **client が決定論的に組み立てた node_id** で投入する
 // ため、同じ id を再 upsert すれば update 扱い = entity の重複が原理的に
-//発生しない。Claude.ai / ChatGPT 側で entity を抽出して `{schema}:proj-vegapunk`
+// 発生しない。Claude.ai / ChatGPT 側で entity を抽出して `{schema}:proj-vegapunk`
 // のような stable id を渡せば、ingest を何度連投しても node 数は変動しない。
 //
 // cross-tenant guard:
