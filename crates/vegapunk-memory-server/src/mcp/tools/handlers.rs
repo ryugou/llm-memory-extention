@@ -936,6 +936,11 @@ const SINCE_MS_SKEW_MARGIN: i64 = 5_000;
 /// `ListJobs` の 1 ページ最大件数 (proto 上の上限と整合)。
 const LIST_JOBS_PAGE_SIZE: i32 = 500;
 
+/// `await_msg_ids_complete` の 1 round で同時に投げる `GetJobStatus` の
+/// 上限。chunk 数が多い `ingest_raw` (= 巨大 text) で task が爆発し
+/// wrapper / vegapunk を圧迫しないよう Semaphore で絞る。
+const JOB_POLL_PARALLELISM: usize = 32;
+
 /// ingest / ingest_raw が wrapper 内で job polling した結果を、client に
 /// machine-readable に返すための status enum 的 string。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -999,7 +1004,7 @@ fn count_terminal_jobs_for_schema(
 ///   - `Partial`: 一部 / 全部が `failed` or `dead_letter` で terminal
 ///   - `Timeout`: deadline 経過、まだ pending あり
 ///
-/// 各 round は `try_join_all` で **並列に** `GetJobStatus` を投げる
+/// 各 round は `tokio::task::JoinSet` で **並列に** `GetJobStatus` を投げる
 /// (= chunk 数が多い ingest_raw で逐次 polling だと 1 round が `N * RTT`
 /// になり、deadline を polling だけで消費する Codex P1 を回避)。
 async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: Vec<String>) -> AwaitStatus {
@@ -1014,15 +1019,26 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: Vec<String
     let mut saw_non_ok_terminal = false;
     while !pending.is_empty() && Instant::now() < deadline {
         let ids_snapshot: Vec<String> = pending.iter().cloned().collect();
-        // 並列に GetJobStatus を投げる。client は Channel 上の multiplex を
-        // するので clone してそれぞれ別 await でも安全。`tokio::task::JoinSet`
+        // 並列に GetJobStatus を投げる。client は Channel 上で multiplex 可能
+        // なので clone してそれぞれ別 await でも安全。`tokio::task::JoinSet`
         // を使うことで `futures` crate 追加不要 + Send+'static の制約も
         // clone で満たす。
+        //
+        // 並列度は `JOB_POLL_PARALLELISM` (= 32) を上限に Semaphore で絞る。
+        // ingest_raw は client text を server-side で chunk 化するため
+        // msg_ids が数百規模になり得る。無制限に task を spawn すると
+        // wrapper の tokio runtime や vegapunk gRPC を圧迫する (Copilot C2)。
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(JOB_POLL_PARALLELISM));
         let mut set = tokio::task::JoinSet::new();
         for msg_id in &ids_snapshot {
             let mut c = client.clone();
             let id = msg_id.clone();
+            let sem = semaphore.clone();
             set.spawn(async move {
+                // Semaphore は drop されると自動で release。acquire の
+                // Err は close 時のみ起こり、本コードでは close しないので
+                // expect で十分。
+                let _permit = sem.acquire().await.expect("semaphore not closed");
                 let res = c
                     .get_job_status(GetJobStatusRequest { msg_id: id.clone() })
                     .await;
@@ -1093,7 +1109,12 @@ async fn list_extraction_jobs_paged(
     client: &mut GraphRagClient,
     since_ms: i64,
 ) -> Result<Vec<vegapunk_client::graphrag::JobInfo>, tonic::Status> {
+    use std::collections::HashSet;
     let mut all = Vec::new();
+    // `ListJobs` は `created_at DESC` で並ぶ。ページング中に新規 job が
+    // 挿入されると page が後方にシフトして同じ job が複数 page に現れる
+    // 可能性 (Copilot C1)。`job_id` で dedup して取りこぼし / 重複を防ぐ。
+    let mut seen: HashSet<String> = HashSet::new();
     let mut offset: i32 = 0;
     loop {
         let req = ListJobsRequest {
@@ -1107,12 +1128,16 @@ async fn list_extraction_jobs_paged(
         let resp = client.list_jobs(req).await?;
         let page = resp.into_inner().jobs;
         let page_len = page.len() as i32;
-        all.extend(page);
+        for j in page {
+            if seen.insert(j.job_id.clone()) {
+                all.push(j);
+            }
+        }
         if page_len < LIST_JOBS_PAGE_SIZE {
             break;
         }
         offset += LIST_JOBS_PAGE_SIZE;
-        // 無限ループ防御: vegapunk 上の totalentries が極端に多い場合は
+        // 無限ループ防御: vegapunk 上の total entries が極端に多い場合は
         // 10k 件で打ち切る (= 通常 batch では絶対に到達しない)。
         if offset >= 10_000 {
             tracing::warn!(
