@@ -14,10 +14,12 @@
 
 use serde_json::{Map, Value, json};
 
+use vegapunk_client::GraphRagClient;
 use vegapunk_client::graphrag::{
-    AttributeFilter, GetSchemaRequest, GetStatsRequest, GetTraceableChainRequest, IngestMessage,
-    IngestRawMetadata, IngestRawRequest, IngestRequest, ListSchemasRequest, MessageMetadata,
-    QueryNodesRequest, SchemaListItem, SearchRequest, SearchResultItem,
+    AttributeFilter, GetJobStatusRequest, GetSchemaRequest, GetStatsRequest,
+    GetTraceableChainRequest, IngestMessage, IngestRawMetadata, IngestRawRequest, IngestRequest,
+    ListJobsRequest, ListSchemasRequest, MessageMetadata, QueryNodesRequest, SchemaListItem,
+    SearchRequest, SearchResultItem,
 };
 use vegapunk_memory_auth::middleware::AuthenticatedUser;
 
@@ -908,6 +910,143 @@ pub(super) fn build_ingest_raw_request(
     })
 }
 
+/// entity_extraction job が **terminal status** (= completed / failed /
+/// dead_letter) に達したと見做すラベル。`pending` / `running` 以外を最終扱い。
+const TERMINAL_JOB_STATUSES: &[&str] = &["completed", "failed", "dead_letter"];
+
+/// `await_*` の最大待ち時間 (秒)。vegapunk の entity_extraction は通常
+/// 5〜30 秒で完了するが、LLM 側 rate limit / リトライで伸びることもある。
+/// timeout に達しても本処理はエラーにせず、warn log + そのまま return する。
+/// (= dedup catalogue が一部古い entity を含む可能性は許容する。完全保証より
+/// レスポンス可用性を優先。)
+const JOB_AWAIT_TIMEOUT_SECS: u64 = 120;
+const JOB_POLL_INTERVAL_MS: u64 = 500;
+
+/// `IngestRaw` で返ってきた `msg_ids` の entity_extraction が完了するまで
+/// `GetJobStatus` で polling する。`msg_ids` の **全件** が terminal に
+/// なるか、timeout に達するまでループする。
+///
+/// 失敗時 (一過性の gRPC エラー / timeout) はエラーを返さず warn ログのみ。
+/// 完全な完了保証より、Claude.ai 等 client への応答 deadline を守ることを
+/// 優先する設計。
+async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: Vec<String>) {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    if msg_ids.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(JOB_AWAIT_TIMEOUT_SECS);
+    let mut pending: HashSet<String> = msg_ids.into_iter().collect();
+    while !pending.is_empty() && Instant::now() < deadline {
+        let mut done = Vec::new();
+        for msg_id in pending.iter() {
+            match client
+                .get_job_status(GetJobStatusRequest {
+                    msg_id: msg_id.clone(),
+                })
+                .await
+            {
+                Ok(resp) => {
+                    let s = resp.into_inner();
+                    if TERMINAL_JOB_STATUSES.contains(&s.overall_status.as_str()) {
+                        done.push(msg_id.clone());
+                    }
+                }
+                Err(e) => {
+                    // 一過性 gRPC エラーは continue (= 次の round で retry)。
+                    // 何度も失敗するなら timeout に達して loop が抜ける。
+                    tracing::warn!(
+                        msg_id = %msg_id,
+                        code = ?e.code(),
+                        "get_job_status failed during ingest_raw await; retrying"
+                    );
+                }
+            }
+        }
+        for d in done {
+            pending.remove(&d);
+        }
+        if pending.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
+    }
+    if !pending.is_empty() {
+        tracing::warn!(
+            pending_count = pending.len(),
+            timeout_secs = JOB_AWAIT_TIMEOUT_SECS,
+            "ingest_raw entity_extraction did not complete within timeout; proceeding"
+        );
+    }
+}
+
+/// `Ingest` (structured) の場合、proto レスポンスに `msg_ids` が乗らない
+/// (= `IngestResponse { ingested_count, job_id }`、job_id は将来用で現状 None)。
+/// よって `since_ms` を ingest 直前にキャプチャしてから `ListJobs` で
+/// entity_extraction job を polling し、user の schema prefix で始まる msg_id
+/// を持つ job のうち terminal になった数が `ingested_count` 以上になるまで待つ。
+///
+/// 並列 ingest を考慮: 同じ schema に対して別 client が同時に ingest した
+/// 場合、`since_ms` window 内に混ざる可能性がある。expected_count は **下限**
+/// として扱い、超過しても問題にしない (= terminal 数 >= expected_count で OK)。
+async fn await_extraction_jobs_for_schema(
+    client: &mut GraphRagClient,
+    user_schema: &str,
+    since_ms: i64,
+    expected_count: i32,
+) {
+    use std::time::{Duration, Instant};
+
+    if expected_count <= 0 {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(JOB_AWAIT_TIMEOUT_SECS);
+    let schema_prefix = format!("{user_schema}:");
+    while Instant::now() < deadline {
+        let req = ListJobsRequest {
+            status: None,
+            since_ms: Some(since_ms),
+            until_ms: None,
+            offset: Some(0),
+            limit: Some(500),
+            job_type: Some("entity_extraction".to_string()),
+        };
+        let terminal_count: i32 = match client.list_jobs(req).await {
+            Ok(resp) => {
+                let jobs = resp.into_inner().jobs;
+                jobs.into_iter()
+                    .filter(|j| {
+                        j.msg_id
+                            .as_deref()
+                            .map(|m| m.starts_with(&schema_prefix))
+                            .unwrap_or(false)
+                            && TERMINAL_JOB_STATUSES.contains(&j.status.as_str())
+                    })
+                    .count() as i32
+            }
+            Err(e) => {
+                tracing::warn!(
+                    code = ?e.code(),
+                    "list_jobs failed during ingest await; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
+                continue;
+            }
+        };
+        if terminal_count >= expected_count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
+    }
+    tracing::warn!(
+        schema = %user_schema,
+        expected_count,
+        timeout_secs = JOB_AWAIT_TIMEOUT_SECS,
+        "ingest entity_extraction did not reach expected_count within timeout; proceeding"
+    );
+}
+
 pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
     let mut request = match build_ingest_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
@@ -936,10 +1075,26 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
         }
     }
     let mut client = state.vegapunk.clone();
+    // entity_extraction job を後で `ListJobs(since_ms=...)` で拾うため、
+    // ingest を叩く **直前** に timestamp を取る (= ingest 後に取ると、jobs
+    // の created_at よりも since_ms が後ろになって 0 件返る race を防ぐ)。
+    let since_ms = llm_memory_core::time::now_ms();
     match client.ingest(request).await {
         Err(status) => tonic_error_content("Ingest", status),
         Ok(resp) => {
             let resp = resp.into_inner();
+            // PR #21 の dedup pre-check は前回 ingest で作られた entity を
+            // catalogue 経由で見るが、vegapunk の LLM 抽出は async で 5〜30s
+            // かかる。client が連投すると catalogue が空振りして同名重複が
+            // 生まれるため、本 ingest の extraction が落ち着くまで待つ。
+            // timeout は best-effort (= warn のみで return)。
+            await_extraction_jobs_for_schema(
+                &mut client,
+                &user.vegapunk_schema,
+                since_ms,
+                resp.ingested_count,
+            )
+            .await;
             success_content(json!({
                 "ingested_count": resp.ingested_count,
                 "job_id": resp.job_id,
@@ -975,6 +1130,10 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
         Err(status) => tonic_error_content("IngestRaw", status),
         Ok(resp) => {
             let resp = resp.into_inner();
+            // ingest_raw は IngestRawResponse.msg_ids を返すので、各 msg_id を
+            // 直接 GetJobStatus で polling できる (= list_jobs ベースの ingest
+            // 経路よりピンポイント)。詳細は `await_msg_ids_complete` 参照。
+            await_msg_ids_complete(&mut client, resp.msg_ids.clone()).await;
             success_content(json!({
                 "chunk_count": resp.chunk_count,
                 "msg_ids": resp.msg_ids,
