@@ -935,6 +935,10 @@ const SINCE_MS_SKEW_MARGIN: i64 = 5_000;
 
 /// `ListJobs` の 1 ページ最大件数 (proto 上の上限と整合)。
 const LIST_JOBS_PAGE_SIZE: i32 = 500;
+/// `list_extraction_jobs_paged` の **最終的な無限ループ防御**。`total_count`
+/// が信頼できない (= 異常に大きい) 場合のセーフティネット。通常 batch では
+/// 到達しない値に設定。
+const LIST_JOBS_HARD_CAP: i32 = 50_000;
 
 /// `await_msg_ids_complete` の 1 round で同時に投げる `GetJobStatus` の
 /// 上限。chunk 数が多い `ingest_raw` (= 巨大 text) で task が爆発し
@@ -1016,7 +1020,7 @@ fn count_terminal_jobs_for_schema(
 /// 各 round は `tokio::task::JoinSet` で **並列に** `GetJobStatus` を投げる
 /// (= chunk 数が多い ingest_raw で逐次 polling だと 1 round が `N * RTT`
 /// になり、deadline を polling だけで消費する Codex P1 を回避)。
-async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: Vec<String>) -> AwaitStatus {
+async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: &[String]) -> AwaitStatus {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
@@ -1024,7 +1028,10 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: Vec<String
         return AwaitStatus::Ok;
     }
     let deadline = Instant::now() + Duration::from_secs(JOB_AWAIT_TIMEOUT_SECS);
-    let mut pending: HashSet<String> = msg_ids.into_iter().collect();
+    // 呼び出し側は `&resp.msg_ids` を渡せばよく、ここで初めて `HashSet`
+    // の中身として 1 回 clone する (Copilot P1 round 4 = 呼び出し側の余計な
+    // `.clone()` を削減)。
+    let mut pending: HashSet<String> = msg_ids.iter().cloned().collect();
     let mut saw_non_ok_terminal = false;
     while !pending.is_empty() && Instant::now() < deadline {
         let ids_snapshot: Vec<String> = pending.iter().cloned().collect();
@@ -1134,6 +1141,10 @@ async fn list_extraction_jobs_paged(
     // 易くなる (Copilot R3 round 3)。
     let mut by_id: HashMap<String, vegapunk_client::graphrag::JobInfo> = HashMap::new();
     let mut offset: i32 = 0;
+    // 最初のページから `total_count` を取って打ち切り offset を決める。
+    // 並列挿入で増える可能性があるが、次回 polling round で再取得するので
+    // **本 round のスナップショット** を取り切れれば十分。
+    let mut effective_cap: Option<i32> = None;
     loop {
         let req = ListJobsRequest {
             status: None,
@@ -1156,7 +1167,12 @@ async fn list_extraction_jobs_paged(
                 return Err(tonic::Status::deadline_exceeded("list_jobs rpc timed out"));
             }
         };
-        let page = resp.into_inner().jobs;
+        let inner = resp.into_inner();
+        if effective_cap.is_none() {
+            // total_count を hard cap で頭打ちにして本 round の終了 offset とする。
+            effective_cap = Some(inner.total_count.min(LIST_JOBS_HARD_CAP));
+        }
+        let page = inner.jobs;
         let page_len = page.len() as i32;
         for j in page {
             // `insert` で既存 entry を上書き = 後で観測した status を採用。
@@ -1166,13 +1182,13 @@ async fn list_extraction_jobs_paged(
             break;
         }
         offset += LIST_JOBS_PAGE_SIZE;
-        // 無限ループ防御: vegapunk 上の total entries が極端に多い場合は
-        // 10k 件で打ち切る (= 通常 batch では絶対に到達しない)。
-        if offset >= 10_000 {
-            tracing::warn!(
-                offset,
-                "list_extraction_jobs_paged hit safety cap; truncating"
-            );
+        // total_count ベースで打ち切り (= 取りこぼし回避)。total_count が
+        // hard cap に張り付いている場合は警告も残す。
+        let cap = effective_cap.unwrap_or(LIST_JOBS_HARD_CAP);
+        if offset >= cap {
+            if cap >= LIST_JOBS_HARD_CAP {
+                tracing::warn!(cap, "list_extraction_jobs_paged hit hard cap; truncating");
+            }
             break;
         }
     }
@@ -1343,7 +1359,7 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
             // 直接 GetJobStatus で polling できる (= list_jobs ベースの ingest
             // 経路よりピンポイント)。詳細は `await_msg_ids_complete` 参照。
             // 結果は `await_status` で client に返す。
-            let await_status = await_msg_ids_complete(&mut client, resp.msg_ids.clone()).await;
+            let await_status = await_msg_ids_complete(&mut client, &resp.msg_ids).await;
             success_content(json!({
                 "chunk_count": resp.chunk_count,
                 "msg_ids": resp.msg_ids,
