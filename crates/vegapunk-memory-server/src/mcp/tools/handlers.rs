@@ -1045,7 +1045,7 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: &[String])
     let mut pending: HashSet<String> = msg_ids.iter().cloned().collect();
     let mut saw_non_ok_terminal = false;
     while !pending.is_empty() && Instant::now() < deadline {
-        let ids_snapshot: Vec<String> = pending.iter().cloned().collect();
+        let mut ids_snapshot: Vec<String> = pending.iter().cloned().collect();
         // 並列に GetJobStatus を投げる。Semaphore で permit 待ちさせる構造
         // だと N task が常に runtime に常駐 (= memory/scheduler overhead)
         // するため、**chunk 単位で batch spawn → join_all → 次 chunk** に
@@ -1058,7 +1058,12 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: &[String])
         // 残り時間が無い場合は spawn せず外側 while を抜ける。
         let mut results: Vec<(String, Result<tonic::Response<_>, tonic::Status>)> =
             Vec::with_capacity(ids_snapshot.len());
-        for chunk in ids_snapshot.chunks(JOB_POLL_PARALLELISM) {
+        // chunks_mut + mem::take で「外側 clone」を消す: snapshot から
+        // 1 個ずつ owning String を取り出して直接 spawn の closure に
+        // move する。これで per-round の clone 回数を半減できる
+        // (Copilot P1 round 8)。内側の `id.clone()` (= req 構築用) は
+        // 戻り値で `(id, res)` を返す必要があるため残す。
+        for chunk in ids_snapshot.chunks_mut(JOB_POLL_PARALLELISM) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -1066,9 +1071,9 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: &[String])
             let per_call_timeout =
                 Duration::from_secs(GET_JOB_STATUS_RPC_TIMEOUT_SECS).min(remaining);
             let mut set = tokio::task::JoinSet::new();
-            for msg_id in chunk {
+            for slot in chunk {
+                let id = std::mem::take(slot);
                 let mut c = client.clone();
-                let id = msg_id.clone();
                 let to = per_call_timeout;
                 set.spawn(async move {
                     let fut = c.get_job_status(GetJobStatusRequest { msg_id: id.clone() });
@@ -1245,7 +1250,16 @@ async fn await_extraction_jobs_for_schema(
     let deadline = Instant::now() + Duration::from_secs(JOB_AWAIT_TIMEOUT_SECS);
     let schema_prefix = format!("{user_schema}:");
     let skewed_since_ms = since_ms.saturating_sub(SINCE_MS_SKEW_MARGIN);
-    let mut last_failed = 0i32;
+    let mut last_failed_delta = 0i32;
+    // baseline: 最初の polling round で観測した (ok, failed) の合計値。
+    // skew window 内 (= 過去 SINCE_MS_SKEW_MARGIN ミリ秒) に他 ingest の
+    // 完了 job が既に含まれていることがあり、それを count せずに
+    // **delta** で判定することで、本 ingest の job だけを実質追跡する。
+    // baseline 取得時点で本 ingest の job がまだ terminal でない前提は
+    // 通常成立する (= entity_extraction は 5〜30s かかる)。極端に速い
+    // ケースで自分の job が baseline に含まれてしまうと delta が不足し
+    // timeout する余地はあるが、catalogue 上は更新済みなので致命ではない。
+    let mut baseline: Option<(i32, i32)> = None;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1259,15 +1273,24 @@ async fn await_extraction_jobs_for_schema(
         match tokio::time::timeout(remaining, polling_fut).await {
             Ok(Ok(jobs)) => {
                 let (ok, failed) = count_terminal_jobs_for_schema(&jobs, &schema_prefix);
-                last_failed = failed;
-                if ok + failed >= expected_count {
-                    if failed > 0 {
+                let (b_ok, b_failed) = match baseline {
+                    Some(b) => b,
+                    None => {
+                        baseline = Some((ok, failed));
+                        (ok, failed)
+                    }
+                };
+                let delta_ok = ok.saturating_sub(b_ok);
+                let delta_failed = failed.saturating_sub(b_failed);
+                last_failed_delta = delta_failed;
+                if delta_ok + delta_failed >= expected_count {
+                    if delta_failed > 0 {
                         tracing::warn!(
                             schema = %user_schema,
-                            failed,
-                            ok,
+                            delta_failed,
+                            delta_ok,
                             expected_count,
-                            "ingest entity_extraction reached expected count but had failed/dead_letter jobs"
+                            "ingest entity_extraction reached expected delta but had failed/dead_letter jobs"
                         );
                         return AwaitStatus::Partial;
                     }
@@ -1291,7 +1314,7 @@ async fn await_extraction_jobs_for_schema(
         schema = %user_schema,
         expected_count,
         timeout_secs = JOB_AWAIT_TIMEOUT_SECS,
-        last_failed_seen = last_failed,
+        last_failed_seen = last_failed_delta,
         "ingest entity_extraction did not reach expected_count within timeout"
     );
     AwaitStatus::Timeout
