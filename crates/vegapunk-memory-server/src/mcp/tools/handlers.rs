@@ -1123,13 +1123,16 @@ async fn list_extraction_jobs_paged(
     client: &mut GraphRagClient,
     since_ms: i64,
 ) -> Result<Vec<vegapunk_client::graphrag::JobInfo>, tonic::Status> {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::time::Duration;
-    let mut all = Vec::new();
     // `ListJobs` は `created_at DESC` で並ぶ。ページング中に新規 job が
-    // 挿入されると page が後方にシフトして同じ job が複数 page に現れる
-    // 可能性 (Copilot C1)。`job_id` で dedup して取りこぼし / 重複を防ぐ。
-    let mut seen: HashSet<String> = HashSet::new();
+    // 挿入されると page が後方にシフトして同じ job が複数 page に現れ得る。
+    // dedup の際、**後から取得した entry で上書きする** ことで status の
+    // 鮮度を確保する (例: page 0 では running, シフト後 page 1 で completed と
+    // 観測 → 古い running を捨てて最新 completed を採用)。前者を保持すると
+    // `await_extraction_jobs_for_schema` が完了判定を遅延して timeout し
+    // 易くなる (Copilot R3 round 3)。
+    let mut by_id: HashMap<String, vegapunk_client::graphrag::JobInfo> = HashMap::new();
     let mut offset: i32 = 0;
     loop {
         let req = ListJobsRequest {
@@ -1156,9 +1159,8 @@ async fn list_extraction_jobs_paged(
         let page = resp.into_inner().jobs;
         let page_len = page.len() as i32;
         for j in page {
-            if seen.insert(j.job_id.clone()) {
-                all.push(j);
-            }
+            // `insert` で既存 entry を上書き = 後で観測した status を採用。
+            by_id.insert(j.job_id.clone(), j);
         }
         if page_len < LIST_JOBS_PAGE_SIZE {
             break;
@@ -1174,7 +1176,7 @@ async fn list_extraction_jobs_paged(
             break;
         }
     }
-    Ok(all)
+    Ok(by_id.into_values().collect())
 }
 
 /// `Ingest` (structured) は proto レスポンスに `msg_ids` を含まない
