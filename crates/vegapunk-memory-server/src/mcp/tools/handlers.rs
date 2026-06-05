@@ -938,8 +938,17 @@ const LIST_JOBS_PAGE_SIZE: i32 = 500;
 
 /// `await_msg_ids_complete` の 1 round で同時に投げる `GetJobStatus` の
 /// 上限。chunk 数が多い `ingest_raw` (= 巨大 text) で task が爆発し
-/// wrapper / vegapunk を圧迫しないよう Semaphore で絞る。
+/// wrapper / vegapunk を圧迫しないよう **chunk 単位で batch spawn** して
+/// 任意時点に存在する tokio task 数を `JOB_POLL_PARALLELISM` 以下に保つ
+/// (Semaphore で permit 待ちさせる構造だと N task が常駐するので NG)。
 const JOB_POLL_PARALLELISM: usize = 32;
+
+/// 1 個の `GetJobStatus` RPC の per-call timeout。stuck な call が
+/// `join_next()` を無限ブロックして全体 deadline を bypass しないよう、
+/// 短めの 10 秒で deadline_exceeded を返して次の round に切り替える。
+const GET_JOB_STATUS_RPC_TIMEOUT_SECS: u64 = 10;
+/// 1 個の `ListJobs` RPC の per-call timeout。同上。
+const LIST_JOBS_RPC_TIMEOUT_SECS: u64 = 15;
 
 /// ingest / ingest_raw が wrapper 内で job polling した結果を、client に
 /// machine-readable に返すための status enum 的 string。
@@ -1019,37 +1028,42 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: Vec<String
     let mut saw_non_ok_terminal = false;
     while !pending.is_empty() && Instant::now() < deadline {
         let ids_snapshot: Vec<String> = pending.iter().cloned().collect();
-        // 並列に GetJobStatus を投げる。client は Channel 上で multiplex 可能
-        // なので clone してそれぞれ別 await でも安全。`tokio::task::JoinSet`
-        // を使うことで `futures` crate 追加不要 + Send+'static の制約も
-        // clone で満たす。
-        //
-        // 並列度は `JOB_POLL_PARALLELISM` (= 32) を上限に Semaphore で絞る。
-        // ingest_raw は client text を server-side で chunk 化するため
-        // msg_ids が数百規模になり得る。無制限に task を spawn すると
-        // wrapper の tokio runtime や vegapunk gRPC を圧迫する (Copilot C2)。
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(JOB_POLL_PARALLELISM));
-        let mut set = tokio::task::JoinSet::new();
-        for msg_id in &ids_snapshot {
-            let mut c = client.clone();
-            let id = msg_id.clone();
-            let sem = semaphore.clone();
-            set.spawn(async move {
-                // Semaphore は drop されると自動で release。acquire の
-                // Err は close 時のみ起こり、本コードでは close しないので
-                // expect で十分。
-                let _permit = sem.acquire().await.expect("semaphore not closed");
-                let res = c
-                    .get_job_status(GetJobStatusRequest { msg_id: id.clone() })
-                    .await;
-                (id, res)
-            });
-        }
-        let mut results = Vec::with_capacity(ids_snapshot.len());
-        while let Some(join) = set.join_next().await {
-            match join {
-                Ok(pair) => results.push(pair),
-                Err(e) => tracing::warn!(error = %e, "join_next failed in ingest_raw await"),
+        // 並列に GetJobStatus を投げる。Semaphore で permit 待ちさせる構造
+        // だと N task が常に runtime に常駐 (= memory/scheduler overhead)
+        // するため、**chunk 単位で batch spawn → join_all → 次 chunk** に
+        // 切り替え (Copilot P1)。任意時点の同時 task 数は
+        // `JOB_POLL_PARALLELISM` 以下に保たれる。
+        // 各 RPC には per-call timeout を被せ、stuck な call が
+        // `join_next()` を無限ブロックして全体 deadline を bypass しないよう
+        // にする (Copilot P1)。
+        let mut results: Vec<(String, Result<tonic::Response<_>, tonic::Status>)> =
+            Vec::with_capacity(ids_snapshot.len());
+        for chunk in ids_snapshot.chunks(JOB_POLL_PARALLELISM) {
+            let mut set = tokio::task::JoinSet::new();
+            for msg_id in chunk {
+                let mut c = client.clone();
+                let id = msg_id.clone();
+                set.spawn(async move {
+                    let fut = c.get_job_status(GetJobStatusRequest { msg_id: id.clone() });
+                    let res = match tokio::time::timeout(
+                        Duration::from_secs(GET_JOB_STATUS_RPC_TIMEOUT_SECS),
+                        fut,
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err(tonic::Status::deadline_exceeded(
+                            "get_job_status rpc timed out",
+                        )),
+                    };
+                    (id, res)
+                });
+            }
+            while let Some(join) = set.join_next().await {
+                match join {
+                    Ok(pair) => results.push(pair),
+                    Err(e) => tracing::warn!(error = %e, "join_next failed in ingest_raw await"),
+                }
             }
         }
         for (msg_id, res) in results {
@@ -1110,6 +1124,7 @@ async fn list_extraction_jobs_paged(
     since_ms: i64,
 ) -> Result<Vec<vegapunk_client::graphrag::JobInfo>, tonic::Status> {
     use std::collections::HashSet;
+    use std::time::Duration;
     let mut all = Vec::new();
     // `ListJobs` は `created_at DESC` で並ぶ。ページング中に新規 job が
     // 挿入されると page が後方にシフトして同じ job が複数 page に現れる
@@ -1125,7 +1140,19 @@ async fn list_extraction_jobs_paged(
             limit: Some(LIST_JOBS_PAGE_SIZE),
             job_type: Some("entity_extraction".to_string()),
         };
-        let resp = client.list_jobs(req).await?;
+        // per-RPC timeout を被せて、stuck な list_jobs が全体 deadline を
+        // bypass しないようにする (Copilot P2)。
+        let resp = match tokio::time::timeout(
+            Duration::from_secs(LIST_JOBS_RPC_TIMEOUT_SECS),
+            client.list_jobs(req),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(tonic::Status::deadline_exceeded("list_jobs rpc timed out"));
+            }
+        };
         let page = resp.into_inner().jobs;
         let page_len = page.len() as i32;
         for j in page {
@@ -1271,6 +1298,13 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
                 "ingested_count": resp.ingested_count,
                 "job_id": resp.job_id,
                 "await_status": await_status.as_str(),
+                // structured `ingest` は proto レスポンスに msg_ids も batch
+                // job_id も含まないため、wrapper は `ListJobs(since_ms,
+                // schema prefix)` から **下限保証** で待機している。同 schema
+                // への並列 ingest が混ざると自分の job が pending のまま
+                // early return する余地が残るため、それを client に明示する。
+                // ingest_raw は msg_ids ベースで exact tracking している。
+                "await_semantics": "lower-bound",
             }))
         }
     }
@@ -1312,6 +1346,9 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
                 "chunk_count": resp.chunk_count,
                 "msg_ids": resp.msg_ids,
                 "await_status": await_status.as_str(),
+                // ingest_raw は msg_ids 個別追跡で **正確に** 待機できる。
+                // structured ingest との対比で client が判断できるよう明示。
+                "await_semantics": "exact",
             }))
         }
     }
