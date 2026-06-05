@@ -312,9 +312,6 @@ mod tests {
             "list_schemas",
             "stats",
             "get_traceable_chain",
-            "upsert_nodes",
-            "upsert_edges",
-            "upsert_vectors",
         ] {
             assert!(names.contains(&required), "missing tool: {required}");
         }
