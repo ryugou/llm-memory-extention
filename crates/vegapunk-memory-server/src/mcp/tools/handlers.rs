@@ -911,14 +911,20 @@ pub(super) fn build_ingest_raw_request(
 }
 
 /// entity_extraction job が **catalogue を更新する形で正常終了** したと
-/// 見做せる唯一の status。`failed` / `dead_letter` は terminal だが entity
+/// 見做せる唯一の status。`failed` (or `dead_letter`) は terminal だが entity
 /// は graph に書かれていないので、dedup catalogue 観点では「未更新」扱い。
 const JOB_STATUS_OK: &str = "completed";
-/// terminal status (= 以後 status が変わらない) として待機ループから外す
-/// 値。`failed` / `dead_letter` も含むが、catalogue 観点では失敗扱いになる。
-const TERMINAL_JOB_STATUSES: &[&str] = &[JOB_STATUS_OK, JOB_STATUS_FAILED, JOB_STATUS_DEAD_LETTER];
 const JOB_STATUS_FAILED: &str = "failed";
+/// `ListJobs.JobInfo.status` のみで観測される dead-letter 状態。
+/// `GetJobStatus.overall_status` の取りうる値 (= "pending" | "processing" |
+/// "completed" | "failed") には現状含まれない。
 const JOB_STATUS_DEAD_LETTER: &str = "dead_letter";
+
+/// `GetJobStatus.overall_status` の terminal 値。proto コメント
+/// (`graphrag.proto:292`) に従い `completed` / `failed` のみ。
+/// `dead_letter` は GetJobStatus の overall_status には現れないため
+/// この slice には含めない。
+const GET_JOB_STATUS_TERMINAL: &[&str] = &[JOB_STATUS_OK, JOB_STATUS_FAILED];
 
 /// `await_*` の最大待ち時間 (秒)。vegapunk の entity_extraction は通常
 /// 5〜30 秒で完了するが、LLM 側 rate limit / リトライで伸びることもある。
@@ -960,8 +966,9 @@ const LIST_JOBS_RPC_TIMEOUT_SECS: u64 = 15;
 enum AwaitStatus {
     /// 全 job が `completed` で終わった = catalogue が更新済み。
     Ok,
-    /// 一部 / 全 job が `failed` or `dead_letter` で terminal。catalogue が
-    /// 期待通り更新されていない可能性がある。
+    /// 一部 / 全 job が non-OK terminal (= GetJobStatus 経路では `failed`、
+    /// ListJobs 経路ではさらに `dead_letter` も含む)。catalogue が期待通り
+    /// 更新されていない可能性がある。
     Partial,
     /// timeout に達した = まだ pending が残っている。
     Timeout,
@@ -1009,12 +1016,16 @@ fn count_terminal_jobs_for_schema(
 
 /// `IngestRaw` で返ってきた `msg_ids` の entity_extraction が完了するまで
 /// `GetJobStatus` で polling する。`msg_ids` の全件が **terminal** (=
-/// `completed` / `failed` / `dead_letter`) になるか timeout に達するまでループ。
+/// `GetJobStatusResponse.overall_status` で `completed` または `failed`)
+/// になるか、timeout に達するまでループする。
+/// proto コメント (graphrag.proto:292) で overall_status の取りうる値は
+/// `"pending" | "processing" | "completed" | "failed"` の 4 種で、
+/// `dead_letter` は GetJobStatus には含まれない。
 ///
 /// 戻り値 `AwaitStatus` は client への response に machine-readable に
 /// 露出する (= warn だけだと「catalogue が更新済み」と誤認されるため)。
 ///   - `Ok`     : 全 msg_id が `completed` 終了
-///   - `Partial`: 一部 / 全部が `failed` or `dead_letter` で terminal
+///   - `Partial`: 一部 / 全部が `failed` で terminal
 ///   - `Timeout`: deadline 経過、まだ pending あり
 ///
 /// 各 round は `tokio::task::JoinSet` で **並列に** `GetJobStatus` を投げる
@@ -1082,7 +1093,7 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: &[String])
                 Ok(resp) => {
                     let s = resp.into_inner();
                     let status = s.overall_status.as_str();
-                    if TERMINAL_JOB_STATUSES.contains(&status) {
+                    if GET_JOB_STATUS_TERMINAL.contains(&status) {
                         if status != JOB_STATUS_OK {
                             saw_non_ok_terminal = true;
                             tracing::warn!(
