@@ -1040,24 +1040,28 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: &[String])
         // するため、**chunk 単位で batch spawn → join_all → 次 chunk** に
         // 切り替え (Copilot P1)。任意時点の同時 task 数は
         // `JOB_POLL_PARALLELISM` 以下に保たれる。
-        // 各 RPC には per-call timeout を被せ、stuck な call が
-        // `join_next()` を無限ブロックして全体 deadline を bypass しないよう
-        // にする (Copilot P1)。
+        //
+        // 各 RPC には per-call timeout を被せるが、**残り deadline と min を
+        // 取る** ことで全体 timeout が round 内処理で超過しないよう保証する
+        // (Copilot round 5)。chunk 開始前にも deadline check を入れて、
+        // 残り時間が無い場合は spawn せず外側 while を抜ける。
         let mut results: Vec<(String, Result<tonic::Response<_>, tonic::Status>)> =
             Vec::with_capacity(ids_snapshot.len());
         for chunk in ids_snapshot.chunks(JOB_POLL_PARALLELISM) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let per_call_timeout =
+                Duration::from_secs(GET_JOB_STATUS_RPC_TIMEOUT_SECS).min(remaining);
             let mut set = tokio::task::JoinSet::new();
             for msg_id in chunk {
                 let mut c = client.clone();
                 let id = msg_id.clone();
+                let to = per_call_timeout;
                 set.spawn(async move {
                     let fut = c.get_job_status(GetJobStatusRequest { msg_id: id.clone() });
-                    let res = match tokio::time::timeout(
-                        Duration::from_secs(GET_JOB_STATUS_RPC_TIMEOUT_SECS),
-                        fut,
-                    )
-                    .await
-                    {
+                    let res = match tokio::time::timeout(to, fut).await {
                         Ok(r) => r,
                         Err(_) => Err(tonic::Status::deadline_exceeded(
                             "get_job_status rpc timed out",
@@ -1226,8 +1230,17 @@ async fn await_extraction_jobs_for_schema(
     let skewed_since_ms = since_ms.saturating_sub(SINCE_MS_SKEW_MARGIN);
     let mut last_failed = 0i32;
     while Instant::now() < deadline {
-        match list_extraction_jobs_paged(client, skewed_since_ms).await {
-            Ok(jobs) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // multi-page polling は per-RPC timeout を持つが、N ページが
+        // 直列に並ぶと残り deadline を簡単に超過し得る。**1 round 全体を
+        // 残り deadline で wrap** して、advertised 120s を守る
+        // (Copilot round 5)。
+        let polling_fut = list_extraction_jobs_paged(client, skewed_since_ms);
+        match tokio::time::timeout(remaining, polling_fut).await {
+            Ok(Ok(jobs)) => {
                 let (ok, failed) = count_terminal_jobs_for_schema(&jobs, &schema_prefix);
                 last_failed = failed;
                 if ok + failed >= expected_count {
@@ -1244,11 +1257,15 @@ async fn await_extraction_jobs_for_schema(
                     return AwaitStatus::Ok;
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     code = ?e.code(),
                     "list_jobs failed during ingest await; retrying"
                 );
+            }
+            Err(_) => {
+                // overall deadline 経過 → 外側 loop 条件で抜ける
+                break;
             }
         }
         tokio::time::sleep(Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
