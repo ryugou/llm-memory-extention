@@ -1156,9 +1156,10 @@ async fn list_extraction_jobs_paged(
     // 易くなる (Copilot R3 round 3)。
     let mut by_id: HashMap<String, vegapunk_client::graphrag::JobInfo> = HashMap::new();
     let mut offset: i32 = 0;
-    // 最初のページから `total_count` を取って打ち切り offset を決める。
-    // 並列挿入で増える可能性があるが、次回 polling round で再取得するので
-    // **本 round のスナップショット** を取り切れれば十分。
+    // 各ページで観測した `total_count` の **最大値** を保持し、ページング
+    // 中に新規 job が挿入されて total_count が伸びても後半ページを取り切る
+    // ようにする (Copilot round 7)。固定値ではなく観測最大値を使うことで
+    // 早期 break → 取りこぼし → 不要 timeout を防ぐ。
     let mut effective_cap: Option<i32> = None;
     loop {
         let req = ListJobsRequest {
@@ -1183,10 +1184,15 @@ async fn list_extraction_jobs_paged(
             }
         };
         let inner = resp.into_inner();
-        if effective_cap.is_none() {
-            // total_count を hard cap で頭打ちにして本 round の終了 offset とする。
-            effective_cap = Some(inner.total_count.min(LIST_JOBS_HARD_CAP));
-        }
+        // 本 page の `total_count` を hard cap で頭打ちした値と、これまでに
+        // 観測した最大 cap を比較し、大きい方を採用する。これにより並列
+        // 挿入で total_count が伸びても後半ページを取り切れる。
+        let observed_cap = inner.total_count.min(LIST_JOBS_HARD_CAP);
+        effective_cap = Some(
+            effective_cap
+                .map(|c| c.max(observed_cap))
+                .unwrap_or(observed_cap),
+        );
         let page = inner.jobs;
         let page_len = page.len() as i32;
         for j in page {
