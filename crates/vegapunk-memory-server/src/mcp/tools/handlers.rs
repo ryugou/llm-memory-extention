@@ -1124,7 +1124,14 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: &[String])
         if pending.is_empty() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
+        // sleep が固定 interval だと deadline 残り時間 < interval のときに
+        // wall-clock 超過する (Copilot round 9)。残り時間と min を取り、
+        // ゼロなら sleep せずに次 iteration の deadline check で抜ける。
+        let remaining_for_sleep = deadline.saturating_duration_since(Instant::now());
+        let sleep_for = Duration::from_millis(JOB_POLL_INTERVAL_MS).min(remaining_for_sleep);
+        if !sleep_for.is_zero() {
+            tokio::time::sleep(sleep_for).await;
+        }
     }
     if !pending.is_empty() {
         tracing::warn!(
@@ -1308,7 +1315,12 @@ async fn await_extraction_jobs_for_schema(
                 break;
             }
         }
-        tokio::time::sleep(Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
+        // sleep の wall-clock 超過防止 (Copilot round 9)。
+        let remaining_for_sleep = deadline.saturating_duration_since(Instant::now());
+        let sleep_for = Duration::from_millis(JOB_POLL_INTERVAL_MS).min(remaining_for_sleep);
+        if !sleep_for.is_zero() {
+            tokio::time::sleep(sleep_for).await;
+        }
     }
     tracing::warn!(
         schema = %user_schema,
