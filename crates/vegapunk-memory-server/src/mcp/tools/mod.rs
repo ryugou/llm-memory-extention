@@ -38,18 +38,9 @@ pub(super) const TRACEABLE_CHAIN_MAX_DEPTH_MIN: i64 = 1;
 pub(super) const TRACEABLE_CHAIN_MAX_DEPTH_MAX: i64 = 10;
 pub(super) const TRACEABLE_CHAIN_MAX_DEPTH_DEFAULT: i32 = 5;
 
-// upsert_* tool の上限。client 向け契約 (`maxItems`) と server-side runtime
-// 検証 (= `build_*_request` で `arr.len()` を上回ったら invalid_args) の
-// single source of truth として使う。
-pub(super) const UPSERT_BATCH_MAX_ITEMS: usize = 256;
-pub(super) const UPSERT_VECTOR_DIM_MAX: usize = 8192;
-
 /// vegapunk wrapper として公開する tool 名の集合。
-/// 「公開しない vegapunk RPC」(= Reingest / Rebuild / Migrate /
+/// 「公開しない vegapunk RPC」(= UpsertNodes / Reingest / Rebuild / Migrate /
 /// PurgeRawMessages / SetMaintenanceMode 等の admin) は意図的に外す。
-/// `UpsertNodes` / `UpsertEdges` / `UpsertVectors` は PR #22 から
-/// `upsert_nodes` / `upsert_edges` / `upsert_vectors` として公開している
-/// (cross-tenant guard と shared 書き込み禁止は handler 側で強制)。
 // NOTE: `feedback` と `get_job_status` は意図的に外している。proto 上、
 // `FeedbackRequest` / `GetJobStatusRequest` には schema フィールドが無く、
 // 識別子 (`search_id` / `msg_id`) だけで vegapunk に投げる API。wrapper 側で
@@ -66,11 +57,6 @@ const TOOL_NAMES: &[&str] = &[
     "list_schemas",
     "stats",
     "get_traceable_chain",
-    // 低レベル決定論的 upsert。LLM 抽出に頼らず client が stable id で
-    // entity を挿入/更新できる経路 (= ingest_raw が抱える重複問題の代替)。
-    "upsert_nodes",
-    "upsert_edges",
-    "upsert_vectors",
 ];
 
 /// `tools/list` の戻り値を組み立てる。
@@ -293,140 +279,6 @@ fn tool_descriptor(name: &str) -> Value {
                 "required": ["node_id"]
             }
         }),
-        "upsert_nodes" => json!({
-            "name": "upsert_nodes",
-            "description": "Upsert nodes by deterministic id (vegapunk UpsertNodes RPC). Unlike `ingest`/`ingest_raw` (which rely on vegapunk's async LLM extraction and can split the same entity into multiple nodes on rapid-fire ingest), this tool lets the caller assign stable ids — re-upserting the same id updates the existing node instead of creating a duplicate. ID convention: first call `list_schemas` to obtain the authenticated user's personal schema name (the entry with `name` starting with `user-`), then build each id as `{personal_schema_name}:{local-id}` (e.g. `user-<sub>:proj-vegapunk`). The server rejects any id that does not start with the caller's personal schema prefix, and writes to the shared schema are not allowed.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "nodes": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": UPSERT_BATCH_MAX_ITEMS,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "pattern": "\\S",
-                                    "description": "Stable node id formatted as `{personal_schema_name}:{local-id}`. Re-upserting the same id updates the existing node. Use `list_schemas` to discover the personal schema name; do not guess it."
-                                },
-                                "type": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "pattern": "\\S",
-                                    "description": "Node type (e.g. 'Project', 'Person', 'Topic')."
-                                },
-                                "attributes": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "key": {"type": "string", "minLength": 1, "pattern": "\\S"},
-                                            "value": {"type": "string"}
-                                        },
-                                        "required": ["key", "value"]
-                                    },
-                                    "description": "List of {key, value} attribute pairs. Both must be strings (proto constraint)."
-                                }
-                            },
-                            "required": ["id", "type"]
-                        }
-                    }
-                },
-                "required": ["nodes"]
-            }
-        }),
-        "upsert_edges" => json!({
-            "name": "upsert_edges",
-            "description": "Upsert edges between previously-known nodes (vegapunk UpsertEdges RPC). Both `from_id` and `to_id` must start with the authenticated user's personal schema prefix (use `list_schemas` to discover it; same convention as `upsert_nodes`). Re-upserting the same (from_id, to_id, type) triple updates the existing edge in place.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "edges": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": UPSERT_BATCH_MAX_ITEMS,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "from_id": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "pattern": "\\S",
-                                    "description": "Source node id formatted as `{personal_schema_name}:{local-id}`. Use `list_schemas` to discover the personal schema name."
-                                },
-                                "to_id": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "pattern": "\\S",
-                                    "description": "Target node id formatted as `{personal_schema_name}:{local-id}`."
-                                },
-                                "type": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "pattern": "\\S",
-                                    "description": "Edge type (e.g. 'related_to', 'authored_by')."
-                                },
-                                "attributes": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "key": {"type": "string", "minLength": 1, "pattern": "\\S"},
-                                            "value": {"type": "string"}
-                                        },
-                                        "required": ["key", "value"]
-                                    }
-                                }
-                            },
-                            "required": ["from_id", "to_id", "type"]
-                        }
-                    }
-                },
-                "required": ["edges"]
-            }
-        }),
-        "upsert_vectors" => json!({
-            "name": "upsert_vectors",
-            "description": "Upsert embedding vectors keyed by node id (vegapunk UpsertVectors RPC). Use vegapunk's `embed` tool (or any embedder aligned to vegapunk's dimension) to produce the float array. `id` must start with the authenticated user's personal schema prefix (use `list_schemas` to discover it; same convention as `upsert_nodes`). All vector elements must be finite (NaN / ±Inf and values outside f32 range are rejected).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "vectors": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": UPSERT_BATCH_MAX_ITEMS,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "pattern": "\\S",
-                                    "description": "Vector id (typically the node id it embeds), formatted as `{personal_schema_name}:{local-id}`."
-                                },
-                                "vector": {
-                                    "type": "array",
-                                    "minItems": 1,
-                                    "maxItems": UPSERT_VECTOR_DIM_MAX,
-                                    "items": {"type": "number"},
-                                    "description": "Embedding float array. Must match vegapunk's configured embedder dimension. All elements must be finite numbers."
-                                },
-                                "metadata": {
-                                    "type": "object",
-                                    "additionalProperties": {"type": "string"},
-                                    "description": "Optional string→string metadata map (proto constraint)."
-                                }
-                            },
-                            "required": ["id", "vector"]
-                        }
-                    }
-                },
-                "required": ["vectors"]
-            }
-        }),
         _ => json!({
             "name": name,
             "description": "(unknown tool)",
@@ -488,9 +340,6 @@ pub async fn call(
         "list_schemas" => handlers::list_schemas(&state, &user).await,
         "stats" => handlers::stats(&state, &user, args).await,
         "get_traceable_chain" => handlers::get_traceable_chain(&state, &user, args).await,
-        "upsert_nodes" => handlers::upsert_nodes(&state, &user, args).await,
-        "upsert_edges" => handlers::upsert_edges(&state, &user, args).await,
-        "upsert_vectors" => handlers::upsert_vectors(&state, &user, args).await,
         other if TOOL_NAMES.contains(&other) => not_implemented_content(other),
         _ => {
             return JsonRpcResponse::error(
