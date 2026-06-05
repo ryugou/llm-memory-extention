@@ -910,52 +910,152 @@ pub(super) fn build_ingest_raw_request(
     })
 }
 
-/// entity_extraction job が **terminal status** (= completed / failed /
-/// dead_letter) に達したと見做すラベル。`pending` / `running` 以外を最終扱い。
-const TERMINAL_JOB_STATUSES: &[&str] = &["completed", "failed", "dead_letter"];
+/// entity_extraction job が **catalogue を更新する形で正常終了** したと
+/// 見做せる唯一の status。`failed` / `dead_letter` は terminal だが entity
+/// は graph に書かれていないので、dedup catalogue 観点では「未更新」扱い。
+const JOB_STATUS_OK: &str = "completed";
+/// terminal status (= 以後 status が変わらない) として待機ループから外す
+/// 値。`failed` / `dead_letter` も含むが、catalogue 観点では失敗扱いになる。
+const TERMINAL_JOB_STATUSES: &[&str] = &[JOB_STATUS_OK, JOB_STATUS_FAILED, JOB_STATUS_DEAD_LETTER];
+const JOB_STATUS_FAILED: &str = "failed";
+const JOB_STATUS_DEAD_LETTER: &str = "dead_letter";
 
 /// `await_*` の最大待ち時間 (秒)。vegapunk の entity_extraction は通常
 /// 5〜30 秒で完了するが、LLM 側 rate limit / リトライで伸びることもある。
-/// timeout に達しても本処理はエラーにせず、warn log + そのまま return する。
-/// (= dedup catalogue が一部古い entity を含む可能性は許容する。完全保証より
-/// レスポンス可用性を優先。)
+/// timeout に達しても本処理はエラーにせず、`await_status` を response に
+/// 含めて client に状態を返す (= "ok" / "timeout" / "partial") ことで
+/// transparent に伝える設計。
 const JOB_AWAIT_TIMEOUT_SECS: u64 = 120;
 const JOB_POLL_INTERVAL_MS: u64 = 500;
 
-/// `IngestRaw` で返ってきた `msg_ids` の entity_extraction が完了するまで
-/// `GetJobStatus` で polling する。`msg_ids` の **全件** が terminal に
-/// なるか、timeout に達するまでループする。
+/// `since_ms` を ingest RPC 直前に wrapper 時計で取るが、vegapunk server 時計
+/// との skew で job の `created_at < since_ms` になり取りこぼす可能性がある。
+/// 5 秒 margin で巻き戻して取りこぼしを軽減 (= clock skew 5 秒以内なら拾う)。
+const SINCE_MS_SKEW_MARGIN: i64 = 5_000;
+
+/// `ListJobs` の 1 ページ最大件数 (proto 上の上限と整合)。
+const LIST_JOBS_PAGE_SIZE: i32 = 500;
+
+/// ingest / ingest_raw が wrapper 内で job polling した結果を、client に
+/// machine-readable に返すための status enum 的 string。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AwaitStatus {
+    /// 全 job が `completed` で終わった = catalogue が更新済み。
+    Ok,
+    /// 一部 / 全 job が `failed` or `dead_letter` で terminal。catalogue が
+    /// 期待通り更新されていない可能性がある。
+    Partial,
+    /// timeout に達した = まだ pending が残っている。
+    Timeout,
+}
+
+impl AwaitStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            AwaitStatus::Ok => "ok",
+            AwaitStatus::Partial => "partial",
+            AwaitStatus::Timeout => "timeout",
+        }
+    }
+}
+
+/// `ListJobs` の戻り `JobInfo` 集合に対し、`{user_schema}:` prefix を持つ
+/// msg_id のもののうち **status が terminal** なもののカウントを返す pure
+/// helper。Codex review M1 / R3 / R6 をテスト可能にする。
 ///
-/// 失敗時 (一過性の gRPC エラー / timeout) はエラーを返さず warn ログのみ。
-/// 完全な完了保証より、Claude.ai 等 client への応答 deadline を守ることを
-/// 優先する設計。
-async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: Vec<String>) {
+/// 戻り値 `.0` = `completed` 数 (= catalogue 更新済み)
+/// 戻り値 `.1` = `failed` + `dead_letter` 数 (= terminal だが catalogue 未更新)
+fn count_terminal_jobs_for_schema(
+    jobs: &[vegapunk_client::graphrag::JobInfo],
+    schema_prefix: &str,
+) -> (i32, i32) {
+    let mut ok = 0i32;
+    let mut failed = 0i32;
+    for j in jobs {
+        let in_schema = j
+            .msg_id
+            .as_deref()
+            .map(|m| m.starts_with(schema_prefix))
+            .unwrap_or(false);
+        if !in_schema {
+            continue;
+        }
+        match j.status.as_str() {
+            JOB_STATUS_OK => ok += 1,
+            JOB_STATUS_FAILED | JOB_STATUS_DEAD_LETTER => failed += 1,
+            _ => {}
+        }
+    }
+    (ok, failed)
+}
+
+/// `IngestRaw` で返ってきた `msg_ids` の entity_extraction が完了するまで
+/// `GetJobStatus` で polling する。`msg_ids` の全件が **terminal** (=
+/// `completed` / `failed` / `dead_letter`) になるか timeout に達するまでループ。
+///
+/// 戻り値 `AwaitStatus` は client への response に machine-readable に
+/// 露出する (= warn だけだと「catalogue が更新済み」と誤認されるため)。
+///   - `Ok`     : 全 msg_id が `completed` 終了
+///   - `Partial`: 一部 / 全部が `failed` or `dead_letter` で terminal
+///   - `Timeout`: deadline 経過、まだ pending あり
+///
+/// 各 round は `try_join_all` で **並列に** `GetJobStatus` を投げる
+/// (= chunk 数が多い ingest_raw で逐次 polling だと 1 round が `N * RTT`
+/// になり、deadline を polling だけで消費する Codex P1 を回避)。
+async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: Vec<String>) -> AwaitStatus {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
     if msg_ids.is_empty() {
-        return;
+        return AwaitStatus::Ok;
     }
     let deadline = Instant::now() + Duration::from_secs(JOB_AWAIT_TIMEOUT_SECS);
     let mut pending: HashSet<String> = msg_ids.into_iter().collect();
+    let mut saw_non_ok_terminal = false;
     while !pending.is_empty() && Instant::now() < deadline {
-        let mut done = Vec::new();
-        for msg_id in pending.iter() {
-            match client
-                .get_job_status(GetJobStatusRequest {
-                    msg_id: msg_id.clone(),
-                })
-                .await
-            {
+        let ids_snapshot: Vec<String> = pending.iter().cloned().collect();
+        // 並列に GetJobStatus を投げる。client は Channel 上の multiplex を
+        // するので clone してそれぞれ別 await でも安全。`tokio::task::JoinSet`
+        // を使うことで `futures` crate 追加不要 + Send+'static の制約も
+        // clone で満たす。
+        let mut set = tokio::task::JoinSet::new();
+        for msg_id in &ids_snapshot {
+            let mut c = client.clone();
+            let id = msg_id.clone();
+            set.spawn(async move {
+                let res = c
+                    .get_job_status(GetJobStatusRequest { msg_id: id.clone() })
+                    .await;
+                (id, res)
+            });
+        }
+        let mut results = Vec::with_capacity(ids_snapshot.len());
+        while let Some(join) = set.join_next().await {
+            match join {
+                Ok(pair) => results.push(pair),
+                Err(e) => tracing::warn!(error = %e, "join_next failed in ingest_raw await"),
+            }
+        }
+        for (msg_id, res) in results {
+            match res {
                 Ok(resp) => {
                     let s = resp.into_inner();
-                    if TERMINAL_JOB_STATUSES.contains(&s.overall_status.as_str()) {
-                        done.push(msg_id.clone());
+                    let status = s.overall_status.as_str();
+                    if TERMINAL_JOB_STATUSES.contains(&status) {
+                        if status != JOB_STATUS_OK {
+                            saw_non_ok_terminal = true;
+                            tracing::warn!(
+                                msg_id = %msg_id,
+                                status = status,
+                                "ingest_raw entity_extraction terminal but not completed"
+                            );
+                        }
+                        pending.remove(&msg_id);
                     }
                 }
                 Err(e) => {
-                    // 一過性 gRPC エラーは continue (= 次の round で retry)。
-                    // 何度も失敗するなら timeout に達して loop が抜ける。
+                    // 一過性 gRPC エラーは pending に残し、次の round で retry。
+                    // 何度も失敗するなら deadline に達して抜ける。
                     tracing::warn!(
                         msg_id = %msg_id,
                         code = ?e.code(),
@@ -963,9 +1063,6 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: Vec<String
                     );
                 }
             }
-        }
-        for d in done {
-            pending.remove(&d);
         }
         if pending.is_empty() {
             break;
@@ -976,66 +1073,113 @@ async fn await_msg_ids_complete(client: &mut GraphRagClient, msg_ids: Vec<String
         tracing::warn!(
             pending_count = pending.len(),
             timeout_secs = JOB_AWAIT_TIMEOUT_SECS,
-            "ingest_raw entity_extraction did not complete within timeout; proceeding"
+            "ingest_raw entity_extraction did not complete within timeout"
         );
+        AwaitStatus::Timeout
+    } else if saw_non_ok_terminal {
+        AwaitStatus::Partial
+    } else {
+        AwaitStatus::Ok
     }
 }
 
-/// `Ingest` (structured) の場合、proto レスポンスに `msg_ids` が乗らない
-/// (= `IngestResponse { ingested_count, job_id }`、job_id は将来用で現状 None)。
-/// よって `since_ms` を ingest 直前にキャプチャしてから `ListJobs` で
-/// entity_extraction job を polling し、user の schema prefix で始まる msg_id
-/// を持つ job のうち terminal になった数が `ingested_count` 以上になるまで待つ。
+/// `since_ms` 以降に作られた `entity_extraction` job を **全ページ** 取り、
+/// 該当ページの `JobInfo` を返す pure-ish async helper。`ListJobs` 1 ページ
+/// 上限 `LIST_JOBS_PAGE_SIZE` = 500 (proto 上の上限) で大 batch / 並列環境
+/// では足りないので offset を進めて巡回する (Codex R3 対応)。
 ///
-/// 並列 ingest を考慮: 同じ schema に対して別 client が同時に ingest した
-/// 場合、`since_ms` window 内に混ざる可能性がある。expected_count は **下限**
-/// として扱い、超過しても問題にしない (= terminal 数 >= expected_count で OK)。
+/// `list_jobs` の一過性エラーは bubble する (= caller が retry を判断)。
+async fn list_extraction_jobs_paged(
+    client: &mut GraphRagClient,
+    since_ms: i64,
+) -> Result<Vec<vegapunk_client::graphrag::JobInfo>, tonic::Status> {
+    let mut all = Vec::new();
+    let mut offset: i32 = 0;
+    loop {
+        let req = ListJobsRequest {
+            status: None,
+            since_ms: Some(since_ms),
+            until_ms: None,
+            offset: Some(offset),
+            limit: Some(LIST_JOBS_PAGE_SIZE),
+            job_type: Some("entity_extraction".to_string()),
+        };
+        let resp = client.list_jobs(req).await?;
+        let page = resp.into_inner().jobs;
+        let page_len = page.len() as i32;
+        all.extend(page);
+        if page_len < LIST_JOBS_PAGE_SIZE {
+            break;
+        }
+        offset += LIST_JOBS_PAGE_SIZE;
+        // 無限ループ防御: vegapunk 上の totalentries が極端に多い場合は
+        // 10k 件で打ち切る (= 通常 batch では絶対に到達しない)。
+        if offset >= 10_000 {
+            tracing::warn!(
+                offset,
+                "list_extraction_jobs_paged hit safety cap; truncating"
+            );
+            break;
+        }
+    }
+    Ok(all)
+}
+
+/// `Ingest` (structured) は proto レスポンスに `msg_ids` を含まない
+/// (`IngestResponse { ingested_count, job_id: Option<String> }`, `job_id` は
+/// 将来用で常に None)。よって `since_ms` を ingest 直前にキャプチャしてから
+/// `ListJobs(job_type=entity_extraction, since_ms=...)` を polling し、
+/// `{user_schema}:` prefix の msg_id を持つ job のうち
+/// `completed` 数が `expected_count` 以上になるまで待つ。
+///
+/// 制約 (Codex R1 / R2 を transparent に伝える):
+/// - **clock skew**: `since_ms` は wrapper 時計、`JobInfo.created_at` は
+///   vegapunk server 時計。`SINCE_MS_SKEW_MARGIN` (5s) 巻き戻して取りこぼし軽減。
+/// - **並列混入**: 同 schema に対する別 client の並列 ingest で job 数が
+///   膨らむ可能性。本実装は「自分の job だけ」を厳密に追跡する手段が無いため
+///   (= proto に msg_ids も batch job_id も無い)、`completed` 件数が expected
+///   に達した時点で return する **下限保証** モデル。早期完了の余地は
+///   `AwaitStatus` の返り値で client に開示する。
 async fn await_extraction_jobs_for_schema(
     client: &mut GraphRagClient,
     user_schema: &str,
     since_ms: i64,
     expected_count: i32,
-) {
+) -> AwaitStatus {
     use std::time::{Duration, Instant};
 
     if expected_count <= 0 {
-        return;
+        return AwaitStatus::Ok;
     }
     let deadline = Instant::now() + Duration::from_secs(JOB_AWAIT_TIMEOUT_SECS);
     let schema_prefix = format!("{user_schema}:");
+    let skewed_since_ms = since_ms.saturating_sub(SINCE_MS_SKEW_MARGIN);
+    let mut last_failed = 0i32;
     while Instant::now() < deadline {
-        let req = ListJobsRequest {
-            status: None,
-            since_ms: Some(since_ms),
-            until_ms: None,
-            offset: Some(0),
-            limit: Some(500),
-            job_type: Some("entity_extraction".to_string()),
-        };
-        let terminal_count: i32 = match client.list_jobs(req).await {
-            Ok(resp) => {
-                let jobs = resp.into_inner().jobs;
-                jobs.into_iter()
-                    .filter(|j| {
-                        j.msg_id
-                            .as_deref()
-                            .map(|m| m.starts_with(&schema_prefix))
-                            .unwrap_or(false)
-                            && TERMINAL_JOB_STATUSES.contains(&j.status.as_str())
-                    })
-                    .count() as i32
+        match list_extraction_jobs_paged(client, skewed_since_ms).await {
+            Ok(jobs) => {
+                let (ok, failed) = count_terminal_jobs_for_schema(&jobs, &schema_prefix);
+                last_failed = failed;
+                if ok + failed >= expected_count {
+                    if failed > 0 {
+                        tracing::warn!(
+                            schema = %user_schema,
+                            failed,
+                            ok,
+                            expected_count,
+                            "ingest entity_extraction reached expected count but had failed/dead_letter jobs"
+                        );
+                        return AwaitStatus::Partial;
+                    }
+                    return AwaitStatus::Ok;
+                }
             }
             Err(e) => {
                 tracing::warn!(
                     code = ?e.code(),
                     "list_jobs failed during ingest await; retrying"
                 );
-                tokio::time::sleep(Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
-                continue;
             }
-        };
-        if terminal_count >= expected_count {
-            return;
         }
         tokio::time::sleep(Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
     }
@@ -1043,8 +1187,10 @@ async fn await_extraction_jobs_for_schema(
         schema = %user_schema,
         expected_count,
         timeout_secs = JOB_AWAIT_TIMEOUT_SECS,
-        "ingest entity_extraction did not reach expected_count within timeout; proceeding"
+        last_failed_seen = last_failed,
+        "ingest entity_extraction did not reach expected_count within timeout"
     );
+    AwaitStatus::Timeout
 }
 
 pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
@@ -1087,8 +1233,9 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
             // catalogue 経由で見るが、vegapunk の LLM 抽出は async で 5〜30s
             // かかる。client が連投すると catalogue が空振りして同名重複が
             // 生まれるため、本 ingest の extraction が落ち着くまで待つ。
-            // timeout は best-effort (= warn のみで return)。
-            await_extraction_jobs_for_schema(
+            // 結果は `await_status` で client に返す (= "ok" / "partial" /
+            //  "timeout")、catalogue が確実に更新されたかを呼び出し側が判断可能。
+            let await_status = await_extraction_jobs_for_schema(
                 &mut client,
                 &user.vegapunk_schema,
                 since_ms,
@@ -1098,6 +1245,7 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
             success_content(json!({
                 "ingested_count": resp.ingested_count,
                 "job_id": resp.job_id,
+                "await_status": await_status.as_str(),
             }))
         }
     }
@@ -1133,10 +1281,12 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
             // ingest_raw は IngestRawResponse.msg_ids を返すので、各 msg_id を
             // 直接 GetJobStatus で polling できる (= list_jobs ベースの ingest
             // 経路よりピンポイント)。詳細は `await_msg_ids_complete` 参照。
-            await_msg_ids_complete(&mut client, resp.msg_ids.clone()).await;
+            // 結果は `await_status` で client に返す。
+            let await_status = await_msg_ids_complete(&mut client, resp.msg_ids.clone()).await;
             success_content(json!({
                 "chunk_count": resp.chunk_count,
                 "msg_ids": resp.msg_ids,
+                "await_status": await_status.as_str(),
             }))
         }
     }
@@ -2442,6 +2592,82 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("filters[0].op"), "got: {err}");
+    }
+
+    // ── count_terminal_jobs_for_schema (= ingest sync-wait helper) ─────
+
+    fn job_info(msg_id: Option<&str>, status: &str) -> vegapunk_client::graphrag::JobInfo {
+        vegapunk_client::graphrag::JobInfo {
+            job_id: "job-x".into(),
+            job_type: "entity_extraction".into(),
+            status: status.into(),
+            error: None,
+            created_at: 0,
+            completed_at: None,
+            msg_id: msg_id.map(|s| s.to_string()),
+            retry_count: 0,
+        }
+    }
+
+    #[test]
+    fn count_terminal_filters_by_schema_prefix_and_counts_ok_vs_failed() {
+        let jobs = vec![
+            // 自分の schema、completed → ok
+            job_info(Some("user-alice:gen1:msg-a"), "completed"),
+            // 自分の schema、failed → failed
+            job_info(Some("user-alice:gen1:msg-b"), "failed"),
+            // 自分の schema、dead_letter → failed
+            job_info(Some("user-alice:gen1:msg-c"), "dead_letter"),
+            // 自分の schema、まだ pending → どちらにも入らない
+            job_info(Some("user-alice:gen1:msg-d"), "pending"),
+            // 自分の schema、running → 同上
+            job_info(Some("user-alice:gen1:msg-e"), "running"),
+            // 他テナント → 除外
+            job_info(Some("user-bob:gen1:msg-x"), "completed"),
+            // msg_id None → 除外
+            job_info(None, "completed"),
+        ];
+        let (ok, failed) = count_terminal_jobs_for_schema(&jobs, "user-alice:");
+        assert_eq!(ok, 1, "completed for user-alice");
+        assert_eq!(failed, 2, "failed + dead_letter for user-alice");
+    }
+
+    #[test]
+    fn count_terminal_rejects_prefix_shadow_user() {
+        // user-alice が prefix の場合、user-alicemore は前方一致しない。
+        // PR #22 の prefix-shadow と同じ落とし穴を回避できているか。
+        let jobs = vec![
+            job_info(Some("user-alice:gen1:msg-1"), "completed"),
+            job_info(Some("user-alicemore:gen1:msg-2"), "completed"),
+        ];
+        let (ok, _) = count_terminal_jobs_for_schema(&jobs, "user-alice:");
+        assert_eq!(ok, 1, "user-alicemore must NOT be counted");
+    }
+
+    #[test]
+    fn count_terminal_treats_unknown_status_as_not_terminal() {
+        // 仕様外の status は terminal 扱いしない (= 安全側に倒す)。
+        let jobs = vec![
+            job_info(Some("user-alice:gen1:msg-1"), "weird-future-status"),
+            job_info(Some("user-alice:gen1:msg-2"), ""),
+        ];
+        let (ok, failed) = count_terminal_jobs_for_schema(&jobs, "user-alice:");
+        assert_eq!(ok, 0);
+        assert_eq!(failed, 0);
+    }
+
+    #[test]
+    fn count_terminal_returns_zero_when_no_jobs() {
+        let jobs: Vec<vegapunk_client::graphrag::JobInfo> = vec![];
+        let (ok, failed) = count_terminal_jobs_for_schema(&jobs, "user-alice:");
+        assert_eq!((ok, failed), (0, 0));
+    }
+
+    #[test]
+    fn await_status_to_str_is_machine_readable() {
+        assert_eq!(AwaitStatus::Ok.as_str(), "ok");
+        assert_eq!(AwaitStatus::Partial.as_str(), "partial");
+        assert_eq!(AwaitStatus::Timeout.as_str(), "timeout");
     }
 
     #[test]
