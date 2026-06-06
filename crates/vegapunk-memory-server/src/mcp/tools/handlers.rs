@@ -1356,11 +1356,14 @@ async fn acquire_ingest_serializer(
     let waited = wait_start.elapsed();
     let wait_ms = waited.as_millis();
     if wait_ms >= INGEST_LOCK_WAIT_NOTABLE_MS {
+        // 待機要因は通常 (1) 同一 schema の前 ingest が serializer を保持中、
+        // または (2) HashMap mutex 取得時の cross-schema 競合。多くは (1) だが
+        // (2) も含まれる可能性があるので「同 schema 連投」と断定しない文言。
         tracing::info!(
             method,
             schema = %schema,
             wait_ms = wait_ms as u64,
-            "ingest serializer lock acquired after wait (concurrent ingest on same schema)"
+            "ingest serializer lock acquired after notable wait"
         );
     } else {
         tracing::debug!(

@@ -77,38 +77,42 @@ mod tests {
         // **critical-section 内の同時在席数の peak が 1** であることで
         // 確認する (= wall-clock time 比較は CI の jitter で flaky になる
         // ため、in-section カウンタの peak 観測に振っている)。
+        //
+        // 2 つの task の lock 取得を **タイミング sleep に頼らず** 同時に
+        // 競争させるため `tokio::sync::Barrier` を使う (= Copilot review:
+        // 5ms sleep だと spawn 直後の race が決定的でなく、片方が先に取り
+        // 終えてから片方が始まる "事実上 sequential" になり得て検知力が
+        // 弱まる)。両 task は barrier wait を抜けた瞬間に同時に lock を狙う。
+        use tokio::sync::Barrier;
+
         let ser = Arc::new(IngestSerializer::new());
-        // critical-section 内で見える同時在席数を計測する。
         let in_section = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
 
         let lock_a = ser.lock_for("alice").await;
         let lock_b = ser.lock_for("alice").await;
-        // 同じ schema は同じ Arc<Mutex<()>> を返すこと。
         assert!(Arc::ptr_eq(&lock_a, &lock_b));
 
-        let spawn_critical = |lock: Arc<Mutex<()>>| {
+        let spawn_critical = |lock: Arc<Mutex<()>>, barrier: Arc<Barrier>| {
             let inside = in_section.clone();
             let peak = max_seen.clone();
             tokio::spawn(async move {
+                barrier.wait().await;
                 let _g = lock.lock().await;
                 let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
-                // max を逐次更新。
                 peak.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 inside.fetch_sub(1, Ordering::SeqCst);
             })
         };
 
-        let h1 = spawn_critical(lock_a.clone());
-        // h1 を確実に lock させてから h2 を spawn (= 直列化を意図して観測)。
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let h2 = spawn_critical(lock_b.clone());
+        let h1 = spawn_critical(lock_a.clone(), barrier.clone());
+        let h2 = spawn_critical(lock_b.clone(), barrier.clone());
         let (r1, r2) = tokio::join!(h1, h2);
         r1.unwrap();
         r2.unwrap();
 
-        // 直列化されているなら critical-section 内同時在席数の peak は 1。
         assert_eq!(
             max_seen.load(Ordering::SeqCst),
             1,
