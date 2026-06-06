@@ -73,10 +73,10 @@ mod tests {
     #[tokio::test]
     async fn same_schema_serializes_concurrent_callers() {
         // 同じ schema に対して 2 つの task が `lock_for("alice")` を取り、
-        // guard 内で 100ms sleep する。直列化されているなら end-to-end の
-        // 観測時間は 200ms 程度 (= 直列)、並列実行されているなら 100ms 程度
-        // (= overlap) になるはず。directly に critical-section 内の入退場
-        // 順を AtomicUsize で確認する。
+        // 各 task が critical-section 内で 50ms sleep する。直列化保証は
+        // **critical-section 内の同時在席数の peak が 1** であることで
+        // 確認する (= wall-clock time 比較は CI の jitter で flaky になる
+        // ため、in-section カウンタの peak 観測に振っている)。
         let ser = Arc::new(IngestSerializer::new());
         // critical-section 内で見える同時在席数を計測する。
         let in_section = Arc::new(AtomicUsize::new(0));
