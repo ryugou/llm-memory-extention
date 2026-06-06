@@ -1347,8 +1347,11 @@ async fn acquire_ingest_serializer(
     schema: &str,
     method: &'static str,
 ) -> tokio::sync::OwnedMutexGuard<()> {
-    let schema_lock = state.ingest_serializer.lock_for(schema).await;
+    // 計測開始は **serializer 取得の前** に置く。`lock_for` は内部の
+    // HashMap mutex で他の caller と競合する可能性があり、その待ち時間も
+    // head-of-line blocking 指標に含めるため (Copilot review)。
     let wait_start = std::time::Instant::now();
+    let schema_lock = state.ingest_serializer.lock_for(schema).await;
     let guard = schema_lock.lock_owned().await;
     let waited = wait_start.elapsed();
     let wait_ms = waited.as_millis();
