@@ -1,5 +1,12 @@
 //! Per-schema ingest 直列化 (= mutex pool)。
 //!
+//! **Scope 制限**: 本実装は **単一 process (= 単一 wrapper replica)** 前提で
+//! 動く in-process mutex pool。複数 replica で wrapper を horizontal scale-out
+//! した場合、replica を跨いだ並列 ingest は直列化されない (= 各 replica が
+//! 別個の HashMap を持つため)。Phase 1 の運用形態 (= 1 VM 1 replica) 前提で
+//! 設計しており、scale-out が必要になったら distributed lock (Redis 等) か
+//! sticky routing で同 schema を同 replica に固定する設計が必要になる。
+//!
 //! PR #21 の dedup pre-check は `collect_dedup_catalogue` で
 //! `query_nodes` を撃ち、`{user.vegapunk_schema}:` prefix の entity 一覧を
 //! 取得する。同じ schema へ並列に `ingest` / `ingest_raw` が来ると、両者が
