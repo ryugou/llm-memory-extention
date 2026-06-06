@@ -11,6 +11,7 @@
 
 pub mod app;
 pub mod config;
+pub mod ingest_serializer;
 pub mod mcp;
 pub mod schema_provisioner;
 pub mod state;

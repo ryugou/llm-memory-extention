@@ -16,6 +16,7 @@ use vegapunk_client::GraphRagClient;
 use vegapunk_memory_auth::jwt::JwtKeys;
 
 use crate::config::ServerConfig;
+use crate::ingest_serializer::IngestSerializer;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -23,4 +24,9 @@ pub struct AppState {
     pub vegapunk: GraphRagClient,
     pub jwt_keys: JwtKeys,
     pub cfg: Arc<ServerConfig>,
+    /// 同一 schema に対する `ingest` / `ingest_raw` を直列化する mutex pool。
+    /// PR #21 dedup catalogue + PR #24 sync-wait は **逐次 ingest 前提** で
+    /// 設計されており、並列 ingest が race で互いの entity を見逃して dedup
+    /// が空振りする問題がある。本 lock で同 schema 内の ingest を順番に並べる。
+    pub ingest_serializer: Arc<IngestSerializer>,
 }

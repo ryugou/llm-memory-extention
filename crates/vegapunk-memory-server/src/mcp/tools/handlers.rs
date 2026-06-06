@@ -1332,11 +1332,56 @@ async fn await_extraction_jobs_for_schema(
     AwaitStatus::Timeout
 }
 
+/// `state.ingest_serializer` から user の vegapunk_schema 用 per-schema lock
+/// を取得し、待機時間を tracing に出してから guard を返す共通 helper。
+///
+/// 並列 ingest が同 schema に来ると本関数で直列化されるため、その待機時間は
+/// 運用上の **head-of-line blocking 指標** として可視化したい (Codex
+/// review)。待機が `INGEST_LOCK_WAIT_NOTABLE_MS` 以上なら INFO、それ未満は
+/// 低 noise で DEBUG。`OwnedMutexGuard<()>` を返すので呼び出し側は
+/// `let _guard = ...;` で関数 return まで保持すれば自動 release される。
+const INGEST_LOCK_WAIT_NOTABLE_MS: u128 = 100;
+
+async fn acquire_ingest_serializer(
+    state: &AppState,
+    schema: &str,
+    method: &'static str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    // 計測開始は **serializer 取得の前** に置く。`lock_for` は内部の
+    // HashMap mutex で他の caller と競合する可能性があり、その待ち時間も
+    // head-of-line blocking 指標に含めるため (Copilot review)。
+    let wait_start = std::time::Instant::now();
+    let schema_lock = state.ingest_serializer.lock_for(schema).await;
+    let guard = schema_lock.lock_owned().await;
+    let waited = wait_start.elapsed();
+    let wait_ms = waited.as_millis();
+    if wait_ms >= INGEST_LOCK_WAIT_NOTABLE_MS {
+        // 待機要因は通常 (1) 同一 schema の前 ingest が serializer を保持中、
+        // または (2) HashMap mutex 取得時の cross-schema 競合。多くは (1) だが
+        // (2) も含まれる可能性があるので「同 schema 連投」と断定しない文言。
+        tracing::info!(
+            method,
+            schema = %schema,
+            wait_ms = wait_ms as u64,
+            "ingest serializer lock acquired after notable wait"
+        );
+    } else {
+        tracing::debug!(
+            method,
+            schema = %schema,
+            wait_ms = wait_ms as u64,
+            "ingest serializer lock acquired"
+        );
+    }
+    guard
+}
+
 pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
     let mut request = match build_ingest_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("ingest", &e),
     };
+    let _ingest_guard = acquire_ingest_serializer(state, &user.vegapunk_schema, "ingest").await;
     // dedup pre-check: entity 一覧の fetch を **batch 全体で 1 回**
     // (= 8 query_nodes 上限) に抑え、scan は pure 関数で per-message に
     // 適用する。N messages × 8 fetch の問題を回避する。
@@ -1402,6 +1447,7 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
         Ok(r) => r,
         Err(e) => return invalid_args_content("ingest_raw", &e),
     };
+    let _ingest_guard = acquire_ingest_serializer(state, &user.vegapunk_schema, "ingest_raw").await;
     // dedup pre-check。shared 既存は抑制、personal 表記揺れは canonical 化。
     // catalogue 取得は ingest_raw 1 件あたり 1 回。
     let catalogue = collect_dedup_catalogue(state, user).await;
