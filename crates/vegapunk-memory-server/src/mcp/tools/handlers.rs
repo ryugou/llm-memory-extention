@@ -1337,6 +1337,15 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
         Ok(r) => r,
         Err(e) => return invalid_args_content("ingest", &e),
     };
+    // 同 schema の ingest を直列化する mutex を握る。並列 ingest が来ても
+    // 前段の dedup catalogue 取得 + extraction await が完了してから次が
+    // 進むため、PR #21 dedup と PR #24 sync-wait が期待通り効く
+    // (= 同名 entity 重複の race を消す)。drop は handler 末尾 = return 時。
+    let schema_lock = state
+        .ingest_serializer
+        .lock_for(&user.vegapunk_schema)
+        .await;
+    let _ingest_guard = schema_lock.lock().await;
     // dedup pre-check: entity 一覧の fetch を **batch 全体で 1 回**
     // (= 8 query_nodes 上限) に抑え、scan は pure 関数で per-message に
     // 適用する。N messages × 8 fetch の問題を回避する。
@@ -1398,6 +1407,14 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
 }
 
 pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
+    // ingest と同じく schema 単位 mutex を握ってから処理を進める。
+    // 同 schema の並列 `ingest_raw` を直列化することで、PR #21 dedup
+    // catalogue が前 ingest の entity を確実に拾えるようにする。
+    let schema_lock = state
+        .ingest_serializer
+        .lock_for(&user.vegapunk_schema)
+        .await;
+    let _ingest_guard = schema_lock.lock().await;
     let mut request = match build_ingest_raw_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
         Err(e) => return invalid_args_content("ingest_raw", &e),

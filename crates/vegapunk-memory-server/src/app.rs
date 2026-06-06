@@ -35,6 +35,7 @@ pub async fn build_state(cfg: ServerConfig, jwt_keys: JwtKeys) -> Result<AppStat
         vegapunk,
         jwt_keys,
         cfg: Arc::new(cfg),
+        ingest_serializer: Arc::new(crate::ingest_serializer::IngestSerializer::new()),
     })
 }
 

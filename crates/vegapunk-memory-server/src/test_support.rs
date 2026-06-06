@@ -43,6 +43,7 @@ pub(crate) async fn test_state() -> AppState {
         vegapunk,
         jwt_keys: JwtKeys::for_tests(),
         cfg: Arc::new(cfg),
+        ingest_serializer: Arc::new(crate::ingest_serializer::IngestSerializer::new()),
     }
 }
 
