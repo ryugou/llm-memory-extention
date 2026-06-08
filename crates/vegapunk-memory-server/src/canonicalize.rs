@@ -62,7 +62,11 @@ pub enum CanonicalizeError {
 }
 
 /// Gemini API client。`AppState` から `Arc<GeminiCanonicalizer>` で共有。
-#[derive(Debug, Clone)]
+///
+/// `Debug` は **手書きで実装** して `api_key` を `<redacted>` に置き換える。
+/// derive(Debug) を残すと `{:?}` で出力した瞬間に API key が log に流出する
+/// 危険があるため、struct field 直アクセス以外では key 値が表に出ないようにする。
+#[derive(Clone)]
 pub struct GeminiCanonicalizer {
     client: Client,
     api_key: String,
@@ -71,6 +75,17 @@ pub struct GeminiCanonicalizer {
     /// `https://generativelanguage.googleapis.com/v1beta`、テストでは
     /// wiremock のホスト URL を注入する。
     endpoint_base: String,
+}
+
+impl std::fmt::Debug for GeminiCanonicalizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeminiCanonicalizer")
+            .field("client", &"<reqwest::Client>")
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("endpoint_base", &self.endpoint_base)
+            .finish()
+    }
 }
 
 impl GeminiCanonicalizer {
@@ -126,6 +141,16 @@ impl GeminiCanonicalizer {
             "{}/models/{}:generateContent",
             self.endpoint_base, self.model
         );
+        // `validate_output_size` の cap から逆算した安全マージン込みの token 数。
+        // どうせ受け取った後に拒否するので、provider 側で巨大生成させて cost /
+        // latency を浪費しないよう、上限を request 時点で絞る (Codex round 2)。
+        // 入力 byte ≈ 入力 token と仮定し (= 英数主体で 1 byte ≈ 1 char ≈ 0.25
+        // token は誇張気味だが安全側)、output cap byte を 1 byte = 1 token と
+        // 同等扱いに +256 余白で換算。短い入力でも下限 256 + 1.5x で min 384 を
+        // 確保し、最大は 32768 token 程度 (Gemini Flash 上限内)。
+        let output_cap_bytes = output_cap_for(text);
+        // i32 saturating で安全に。Gemini API は max 32k 程度なので 32k clamp。
+        let max_output_tokens: u32 = (output_cap_bytes.min(32_768)).try_into().unwrap_or(8_192);
         let body = serde_json::json!({
             "contents": [{
                 "role": "user",
@@ -134,10 +159,7 @@ impl GeminiCanonicalizer {
             "generationConfig": {
                 // 決定論的に動かしたい (= 同じ入力 → 同じ rewrite)。
                 "temperature": 0.0,
-                // 出力は text とほぼ同じか少し短くなる前提。catalogue + text の
-                // 合計 byte 数より小さく setしておく。安全マージンで 32k tokens
-                // (= Gemini Flash の MaxOutputTokens 上限内)。
-                "maxOutputTokens": 32768,
+                "maxOutputTokens": max_output_tokens,
             }
         });
 
@@ -172,19 +194,27 @@ impl GeminiCanonicalizer {
     }
 }
 
-/// LLM 出力サイズの post-validation。入力 text の `MAX_OUTPUT_RATIO` 倍 +
-/// `OUTPUT_ABSOLUTE_MIN_BYTES` を上限にして、それを超えたら拒否する。
-/// 規約上は「rewrite した text のみを返す」想定で長さほぼ等倍 (typo を
-/// canonical に変える程度で多少増減) のはず。極端な肥大は prompt injection
-/// (= LLM が prompt の出力規約を無視して別物を返した) を示唆。
+/// LLM 出力 byte 数の上限。`max(OUTPUT_ABSOLUTE_MIN_BYTES, input * MAX_OUTPUT_RATIO)`
+/// で計算する (= 短い入力は 256 B の絶対 floor、長い入力は 1.5x で許容)。
+/// `validate_output_size` の判定軸であると同時に、API 呼び出し時の
+/// `maxOutputTokens` の計算根拠でもある (= 受け取り後拒否されるサイズを
+/// provider 側で生成させない)。
+fn output_cap_for(input: &str) -> usize {
+    OUTPUT_ABSOLUTE_MIN_BYTES.max(((input.len() as f32) * MAX_OUTPUT_RATIO).ceil() as usize)
+}
+
+/// LLM 出力サイズの post-validation。`output_cap_for(input)` を上限にして、
+/// それを超えたら拒否する。規約上は「rewrite した text のみを返す」想定で
+/// 長さほぼ等倍 (typo を canonical に変える程度で多少増減) のはず。極端な
+/// 肥大は prompt injection (= LLM が prompt の出力規約を無視して別物を返した)
+/// を示唆。
 fn validate_output_size(input: &str, output: &str) -> Result<(), CanonicalizeError> {
-    let absolute_cap =
-        OUTPUT_ABSOLUTE_MIN_BYTES.max(((input.len() as f32) * MAX_OUTPUT_RATIO).ceil() as usize);
-    if output.len() > absolute_cap {
+    let cap = output_cap_for(input);
+    if output.len() > cap {
         return Err(CanonicalizeError::OutputRejected(format!(
             "output bytes {} exceed cap {} (input bytes {})",
             output.len(),
-            absolute_cap,
+            cap,
             input.len()
         )));
     }

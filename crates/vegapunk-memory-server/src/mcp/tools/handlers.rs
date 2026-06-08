@@ -1382,6 +1382,14 @@ async fn acquire_ingest_serializer(
 /// latency が線形に伸びるのを防ぐ。
 const INGEST_LLM_CANONICALIZE_MAX_MESSAGES: usize = 16;
 
+/// LLM canonicalize を呼ぶべきかを判定する pure helper。
+/// `n_messages <= INGEST_LLM_CANONICALIZE_MAX_MESSAGES` かつ
+/// `canonicalizer_present == true` のときのみ true。閾値判定の境界
+/// (= 16 = ok / 17 = skip) を unit test で固定するための切り出し。
+fn should_run_llm_canonicalize(canonicalizer_present: bool, n_messages: usize) -> bool {
+    canonicalizer_present && n_messages <= INGEST_LLM_CANONICALIZE_MAX_MESSAGES
+}
+
 /// catalogue (shared + personal) から **canonical name の重複なし list** を
 /// 返す。LLM canonicalize の prompt に渡す前段ヘルパ。shared を personal より
 /// 先に並べることで「shared 既存名 = 正典」というシグナルを prompt 上でも
@@ -1471,7 +1479,7 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
     // 全体は止めない、ただし dedup 品質が下がることを warn ログ + 後で
     // response field で透明に伝えたい)。閾値は実運用で十分余裕のある値。
     let llm_canonicalize_enabled =
-        state.canonicalizer.is_some() && n_messages <= INGEST_LLM_CANONICALIZE_MAX_MESSAGES;
+        should_run_llm_canonicalize(state.canonicalizer.is_some(), n_messages);
     if state.canonicalizer.is_some() && !llm_canonicalize_enabled {
         tracing::warn!(
             method = "ingest",
@@ -2968,6 +2976,32 @@ mod tests {
         assert_eq!(AwaitStatus::Ok.as_str(), "ok");
         assert_eq!(AwaitStatus::Partial.as_str(), "partial");
         assert_eq!(AwaitStatus::Timeout.as_str(), "timeout");
+    }
+
+    // ── should_run_llm_canonicalize gate ───────────────────────────────
+
+    #[test]
+    fn llm_canonicalize_skipped_when_canonicalizer_absent() {
+        // `GEMINI_API_KEY` 未設定 (= canonicalizer = None) なら N によらず false。
+        assert!(!should_run_llm_canonicalize(false, 0));
+        assert!(!should_run_llm_canonicalize(false, 1));
+        assert!(!should_run_llm_canonicalize(false, 16));
+        assert!(!should_run_llm_canonicalize(false, 100));
+    }
+
+    #[test]
+    fn llm_canonicalize_runs_up_to_max_messages() {
+        // 境界の上 (= 16) では呼ぶ、超過 (= 17) では skip する。
+        assert!(should_run_llm_canonicalize(true, 1));
+        assert!(should_run_llm_canonicalize(
+            true,
+            INGEST_LLM_CANONICALIZE_MAX_MESSAGES
+        ));
+        assert!(!should_run_llm_canonicalize(
+            true,
+            INGEST_LLM_CANONICALIZE_MAX_MESSAGES + 1
+        ));
+        assert!(!should_run_llm_canonicalize(true, 1000));
     }
 
     #[test]
