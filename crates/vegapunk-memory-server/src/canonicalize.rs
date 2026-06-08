@@ -141,15 +141,17 @@ impl GeminiCanonicalizer {
             "{}/models/{}:generateContent",
             self.endpoint_base, self.model
         );
-        // `validate_output_size` の cap から逆算した安全マージン込みの token 数。
-        // どうせ受け取った後に拒否するので、provider 側で巨大生成させて cost /
-        // latency を浪費しないよう、上限を request 時点で絞る (Codex round 2)。
-        // 入力 byte ≈ 入力 token と仮定し (= 英数主体で 1 byte ≈ 1 char ≈ 0.25
-        // token は誇張気味だが安全側)、output cap byte を 1 byte = 1 token と
-        // 同等扱いに +256 余白で換算。短い入力でも下限 256 + 1.5x で min 384 を
-        // 確保し、最大は 32768 token 程度 (Gemini Flash 上限内)。
+        // `validate_output_size` の cap から逆算した request 側 token 上限。
+        // どうせ受け取った後に拒否するので、provider 側で巨大生成させて
+        // cost / latency を浪費しないよう、最初から少なく要求する
+        // (Codex round 2)。
+        //
+        // 換算: cap は byte 単位 (`output_cap_for(input)` = `max(256,
+        // input.len() * 1.5)`)。Gemini Flash は 1 token ≈ 数 byte の幅が
+        // あるが、ASCII 主体だと token < byte。よって byte 値を直接 token
+        // 数として渡せば安全側 (= 出る量 < 想定 cap)。さらに Gemini API
+        // 上限の 32_768 token で clamp、try_into 失敗時は 8_192 を fallback。
         let output_cap_bytes = output_cap_for(text);
-        // i32 saturating で安全に。Gemini API は max 32k 程度なので 32k clamp。
         let max_output_tokens: u32 = (output_cap_bytes.min(32_768)).try_into().unwrap_or(8_192);
         let body = serde_json::json!({
             "contents": [{
@@ -332,6 +334,26 @@ mod tests {
         // API key は dummy だが呼び出し前に早期 return するので Ok を返す。
         let out = rt.block_on(canon.canonicalize(&names, &big_text)).unwrap();
         assert_eq!(out, big_text);
+    }
+
+    #[test]
+    fn debug_impl_redacts_api_key() {
+        // `Debug` 手書き実装が `api_key` を `<redacted>` に置換しているかを
+        // regression test で固定。derive(Debug) に戻したり field 追加で漏らした
+        // 場合に catch できる。
+        let canon = test_canon();
+        let dbg = format!("{canon:?}");
+        assert!(
+            !dbg.contains("test-key"),
+            "Debug impl must not leak api_key value: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "expected redaction marker: {dbg}"
+        );
+        // model / endpoint_base は安全に出る想定。
+        assert!(dbg.contains("gemini-3.5-flash"));
+        assert!(dbg.contains("invalid.test"));
     }
 
     #[test]
