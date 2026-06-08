@@ -10,6 +10,7 @@
 //! 本 PR は skeleton のみで、tool handler / HTTP transport は後続 PR で追加する。
 
 pub mod app;
+pub mod canonicalize;
 pub mod config;
 pub mod ingest_serializer;
 pub mod mcp;

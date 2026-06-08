@@ -15,6 +15,7 @@ use sqlx::SqlitePool;
 use vegapunk_client::GraphRagClient;
 use vegapunk_memory_auth::jwt::JwtKeys;
 
+use crate::canonicalize::GeminiCanonicalizer;
 use crate::config::ServerConfig;
 use crate::ingest_serializer::IngestSerializer;
 
@@ -29,4 +30,9 @@ pub struct AppState {
     /// 設計されており、並列 ingest が race で互いの entity を見逃して dedup
     /// が空振りする問題がある。本 lock で同 schema 内の ingest を順番に並べる。
     pub ingest_serializer: Arc<IngestSerializer>,
+    /// LLM (Gemini Flash) ベースの canonicalize クライアント。
+    /// `GEMINI_API_KEY` が env で設定されていない環境では `None` で、
+    /// その場合 ingest handler は PR #21 word-boundary scan 結果をそのまま
+    /// vegapunk に流す (= LLM canonicalize は無効化)。
+    pub canonicalizer: Option<Arc<GeminiCanonicalizer>>,
 }

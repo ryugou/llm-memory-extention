@@ -48,6 +48,16 @@ pub struct ServerConfig {
     /// (例: `discussion`、`review`)。vegapunk の ListSchemaTemplates の
     /// いずれかに一致する必要がある。
     pub default_schema_template: String,
+    /// Gemini API キー (LLM canonicalize 用)。`None` なら LLM
+    /// canonicalize は無効化されて PR #21 word-boundary scan 結果がそのまま
+    /// vegapunk に流れる。
+    pub gemini_api_key: Option<String>,
+    /// LLM canonicalize で使う Gemini model 名。default は最新 Flash 系。
+    pub gemini_model: String,
+    /// Gemini API 呼び出しの per-request timeout (秒)。LLM 応答が遅い時に
+    /// wrapper の deadline 全体を食い潰さないよう、各 LLM 呼び出しは
+    /// この秒数で打ち切る。
+    pub gemini_timeout_secs: u64,
 }
 
 impl ServerConfig {
@@ -81,6 +91,20 @@ impl ServerConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "discussion".to_string()),
+            gemini_api_key: std::env::var("GEMINI_API_KEY")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            gemini_model: std::env::var("GEMINI_MODEL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "gemini-3.5-flash".to_string()),
+            gemini_timeout_secs: std::env::var("GEMINI_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n: &u64| n > 0)
+                .unwrap_or(30),
         })
     }
 }

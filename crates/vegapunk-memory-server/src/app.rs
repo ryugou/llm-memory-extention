@@ -30,12 +30,30 @@ pub async fn build_state(cfg: ServerConfig, jwt_keys: JwtKeys) -> Result<AppStat
         vegapunk_client::connect(&cfg.vegapunk_grpc_endpoint, &cfg.vegapunk_bearer_token)
             .await
             .map_err(|e| anyhow::anyhow!("vegapunk gRPC connect failed: {e}"))?;
+    let canonicalizer = match cfg.gemini_api_key.clone() {
+        Some(key) => {
+            let timeout = std::time::Duration::from_secs(cfg.gemini_timeout_secs);
+            let c = crate::canonicalize::GeminiCanonicalizer::new(
+                key,
+                cfg.gemini_model.clone(),
+                timeout,
+            )?;
+            Some(Arc::new(c))
+        }
+        None => {
+            tracing::warn!(
+                "GEMINI_API_KEY not set; LLM canonicalize disabled (PR #21 word-boundary scan only)"
+            );
+            None
+        }
+    };
     Ok(AppState {
         pool,
         vegapunk,
         jwt_keys,
         cfg: Arc::new(cfg),
         ingest_serializer: Arc::new(crate::ingest_serializer::IngestSerializer::new()),
+        canonicalizer,
     })
 }
 

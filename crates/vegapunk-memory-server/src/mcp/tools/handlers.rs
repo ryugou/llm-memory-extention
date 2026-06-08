@@ -1376,6 +1376,69 @@ async fn acquire_ingest_serializer(
     guard
 }
 
+/// catalogue (shared + personal) から **canonical name の重複なし list** を
+/// 返す。LLM canonicalize の prompt に渡す前段ヘルパ。shared を personal より
+/// 先に並べることで「shared 既存名 = 正典」というシグナルを prompt 上でも
+/// 維持する (= 先頭側ほど LLM が canonical 候補として強く扱う想定)。
+fn catalogue_canonical_names(catalogue: &DedupCatalogue) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(catalogue.shared.len() + catalogue.personal.len());
+    for ent in catalogue.shared.iter().chain(catalogue.personal.iter()) {
+        let name = ent.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if seen.insert(name.to_string()) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// state.canonicalizer (= Gemini Flash client) があれば LLM canonicalize を
+/// 1 回呼んで text を rewrite する。client が無い (= `GEMINI_API_KEY` 未設定)
+/// / catalogue が空 / text が空 / LLM 失敗の **いずれの場合も静かに元 text を
+/// 返す** (= ingest は止めない、PR #21 word-boundary scan の結果がそのまま
+/// vegapunk に流れる)。
+async fn apply_llm_canonicalize(
+    state: &AppState,
+    method: &'static str,
+    catalogue_names: &[String],
+    text: &str,
+) -> String {
+    let Some(canonicalizer) = state.canonicalizer.as_ref() else {
+        return text.to_string();
+    };
+    if catalogue_names.is_empty() || text.trim().is_empty() {
+        return text.to_string();
+    }
+    let started = std::time::Instant::now();
+    match canonicalizer.canonicalize(catalogue_names, text).await {
+        Ok(out) => {
+            // 個人名漏えい防止のため rewrite 前後 text は log に出さず、
+            // byte 差分と所要時間のみ DEBUG で出す。
+            tracing::debug!(
+                method,
+                catalogue_size = catalogue_names.len(),
+                input_bytes = text.len(),
+                output_bytes = out.len(),
+                wait_ms = started.elapsed().as_millis() as u64,
+                "llm canonicalize done"
+            );
+            out
+        }
+        Err(e) => {
+            tracing::warn!(
+                method,
+                error = %e,
+                wait_ms = started.elapsed().as_millis() as u64,
+                "llm canonicalize failed; falling back to pre-LLM text"
+            );
+            text.to_string()
+        }
+    }
+}
+
 pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
     let mut request = match build_ingest_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
@@ -1386,6 +1449,7 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
     // (= 8 query_nodes 上限) に抑え、scan は pure 関数で per-message に
     // 適用する。N messages × 8 fetch の問題を回避する。
     let catalogue = collect_dedup_catalogue(state, user).await;
+    let catalogue_names = catalogue_canonical_names(&catalogue);
     for (i, msg) in request.messages.iter_mut().enumerate() {
         match scan_text_with_catalogue(&catalogue, &msg.text) {
             IngestPreCheck::BlockedByShared { hit } => {
@@ -1403,6 +1467,9 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
             }
             IngestPreCheck::Proceed => {}
         }
+        // PR #21 の word-boundary scan で拾えなかった typo / 助詞付き異字体
+        // を Gemini に canonicalize させる。失敗は無視 (= 直前の text を維持)。
+        msg.text = apply_llm_canonicalize(state, "ingest", &catalogue_names, &msg.text).await;
     }
     let mut client = state.vegapunk.clone();
     // entity_extraction job を後で `ListJobs(since_ms=...)` で拾うため、
@@ -1451,6 +1518,7 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
     // dedup pre-check。shared 既存は抑制、personal 表記揺れは canonical 化。
     // catalogue 取得は ingest_raw 1 件あたり 1 回。
     let catalogue = collect_dedup_catalogue(state, user).await;
+    let catalogue_names = catalogue_canonical_names(&catalogue);
     match scan_text_with_catalogue(&catalogue, &request.text) {
         IngestPreCheck::BlockedByShared { hit } => {
             return shared_dedup_block_content("ingest_raw", &hit);
@@ -1465,6 +1533,10 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
         }
         IngestPreCheck::Proceed => {}
     }
+    // PR #21 word-boundary scan で取れなかった typo / 異字体を LLM (Gemini Flash)
+    // に追加 rewrite させる。失敗は無視 (= 直前の text を維持)。
+    request.text =
+        apply_llm_canonicalize(state, "ingest_raw", &catalogue_names, &request.text).await;
     let mut client = state.vegapunk.clone();
     match client.ingest_raw(request).await {
         Err(status) => tonic_error_content("IngestRaw", status),
