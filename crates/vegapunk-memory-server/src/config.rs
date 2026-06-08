@@ -58,6 +58,10 @@ pub struct ServerConfig {
     /// wrapper の deadline 全体を食い潰さないよう、各 LLM 呼び出しは
     /// この秒数で打ち切る。
     pub gemini_timeout_secs: u64,
+    /// Gemini API のエンドポイント base URL。テストでは wiremock の URL を
+    /// 注入する。production では `https://generativelanguage.googleapis.com/v1beta`
+    /// (= default)。末尾 `/` は持たない形に正規化される。
+    pub gemini_endpoint_base: String,
 }
 
 impl ServerConfig {
@@ -105,6 +109,11 @@ impl ServerConfig {
                 .and_then(|s| s.parse().ok())
                 .filter(|&n: &u64| n > 0)
                 .unwrap_or(30),
+            gemini_endpoint_base: std::env::var("GEMINI_ENDPOINT_BASE")
+                .ok()
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".to_string()),
         })
     }
 }

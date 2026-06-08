@@ -34,16 +34,31 @@ const MAX_TEXT_BYTES: usize = 32 * 1024;
 
 /// catalogue 件数の上限。これより多いと prompt が肥大化するため、
 /// 切り詰めて先頭分のみ LLM に渡す。
-const MAX_CATALOGUE_ENTRIES: usize = 200;
+pub(crate) const MAX_CATALOGUE_ENTRIES: usize = 200;
+
+/// LLM 出力が **入力 text の何倍まで** 許容されるか。これより長い rewrite
+/// は prompt injection / model drift の疑いがあるので拒否する (= 元 text に
+/// fallback)。1.5x で「typo を canonical に置換 (= 多少伸びる)」程度の余裕
+/// は確保しつつ、`Ignore previous...` 系の暴走出力を検出する。
+const MAX_OUTPUT_RATIO: f32 = 1.5;
+/// 出力の最低絶対バイト数 (= 入力 text が極小の時の比率検査ノイズを防ぐ)。
+const OUTPUT_ABSOLUTE_MIN_BYTES: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum CanonicalizeError {
     #[error("http transport error: {0}")]
     Http(String),
-    #[error("gemini api error: status={status} body={body}")]
-    Api { status: u16, body: String },
+    /// API が non-2xx を返した。**body は意図的に保持しない** ことに注意。
+    /// prompt や catalogue 名が provider 側 error body に echo されて log に
+    /// 出回るリスクを避けるため、status code のみ surface する。
+    #[error("gemini api error: status={status}")]
+    Api { status: u16 },
     #[error("response parse error: {0}")]
     Parse(String),
+    /// LLM 出力が想定範囲を超えた (= 異常に長い / prompt injection 疑い)。
+    /// 呼び出し側は元 text に fallback する想定。
+    #[error("llm output rejected: {0}")]
+    OutputRejected(String),
 }
 
 /// Gemini API client。`AppState` から `Arc<GeminiCanonicalizer>` で共有。
@@ -52,6 +67,10 @@ pub struct GeminiCanonicalizer {
     client: Client,
     api_key: String,
     model: String,
+    /// API base URL (末尾 `/` 無し)。production は
+    /// `https://generativelanguage.googleapis.com/v1beta`、テストでは
+    /// wiremock のホスト URL を注入する。
+    endpoint_base: String,
 }
 
 impl GeminiCanonicalizer {
@@ -61,6 +80,7 @@ impl GeminiCanonicalizer {
     pub fn new(
         api_key: String,
         model: String,
+        endpoint_base: String,
         timeout: Duration,
     ) -> Result<Self, CanonicalizeError> {
         let client = Client::builder()
@@ -71,6 +91,7 @@ impl GeminiCanonicalizer {
             client,
             api_key,
             model,
+            endpoint_base: endpoint_base.trim_end_matches('/').to_string(),
         })
     }
 
@@ -102,8 +123,8 @@ impl GeminiCanonicalizer {
 
         let prompt = build_prompt(catalogue_names, text);
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-            self.model
+            "{}/models/{}:generateContent",
+            self.endpoint_base, self.model
         );
         let body = serde_json::json!({
             "contents": [{
@@ -131,19 +152,43 @@ impl GeminiCanonicalizer {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_else(|_| "<no body>".into());
+            // body は provider 側に prompt/catalogue が echo される可能性
+            // (PII / 登録 entity 名) があるため log に乗せない。status のみ
+            // surface し、呼び出し側で warn + fallback。debug log でも body は
+            // 出さない (= log されない = leak しない、強い保証)。
+            // body は drop (= read もしない)。
+            let _ = resp;
             return Err(CanonicalizeError::Api {
                 status: status.as_u16(),
-                // body から API key が漏れるのを避けるため最初 200 文字に切る
-                body: body.chars().take(200).collect(),
             });
         }
         let payload: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| CanonicalizeError::Parse(format!("json decode: {e}")))?;
-        extract_text(&payload)
+        let output = extract_text(&payload)?;
+        validate_output_size(text, &output)?;
+        Ok(output)
     }
+}
+
+/// LLM 出力サイズの post-validation。入力 text の `MAX_OUTPUT_RATIO` 倍 +
+/// `OUTPUT_ABSOLUTE_MIN_BYTES` を上限にして、それを超えたら拒否する。
+/// 規約上は「rewrite した text のみを返す」想定で長さほぼ等倍 (typo を
+/// canonical に変える程度で多少増減) のはず。極端な肥大は prompt injection
+/// (= LLM が prompt の出力規約を無視して別物を返した) を示唆。
+fn validate_output_size(input: &str, output: &str) -> Result<(), CanonicalizeError> {
+    let absolute_cap =
+        OUTPUT_ABSOLUTE_MIN_BYTES.max(((input.len() as f32) * MAX_OUTPUT_RATIO).ceil() as usize);
+    if output.len() > absolute_cap {
+        return Err(CanonicalizeError::OutputRejected(format!(
+            "output bytes {} exceed cap {} (input bytes {})",
+            output.len(),
+            absolute_cap,
+            input.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Gemini レスポンス JSON から rewritten text を取り出す。
@@ -213,16 +258,26 @@ Rewritten text:"
 mod tests {
     use super::*;
 
+    fn test_canon_with_base(base: String) -> GeminiCanonicalizer {
+        GeminiCanonicalizer::new(
+            "test-key".into(),
+            "gemini-3.5-flash".into(),
+            base,
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    fn test_canon() -> GeminiCanonicalizer {
+        // 早期 return path 用 (= 実 URL は呼ばれない)。
+        test_canon_with_base("https://invalid.test/v1beta".into())
+    }
+
     #[test]
     fn empty_catalogue_returns_text_unchanged() {
         // tokio runtime 不要の path (= 早期 return)。
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let canon = GeminiCanonicalizer::new(
-            "test-key".into(),
-            "gemini-3.5-flash".into(),
-            Duration::from_secs(30),
-        )
-        .unwrap();
+        let canon = test_canon();
         let out = rt.block_on(canon.canonicalize(&[], "hello world")).unwrap();
         assert_eq!(out, "hello world");
     }
@@ -230,12 +285,7 @@ mod tests {
     #[test]
     fn empty_text_returns_unchanged() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let canon = GeminiCanonicalizer::new(
-            "test-key".into(),
-            "gemini-3.5-flash".into(),
-            Duration::from_secs(30),
-        )
-        .unwrap();
+        let canon = test_canon();
         let names = vec!["Vegapunk".to_string()];
         let out = rt.block_on(canon.canonicalize(&names, "")).unwrap();
         assert_eq!(out, "");
@@ -246,17 +296,201 @@ mod tests {
     #[test]
     fn oversize_text_returns_unchanged_without_api_call() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let canon = GeminiCanonicalizer::new(
-            "test-key".into(),
-            "gemini-3.5-flash".into(),
-            Duration::from_secs(30),
-        )
-        .unwrap();
+        let canon = test_canon();
         let big_text = "x".repeat(MAX_TEXT_BYTES + 1);
         let names = vec!["Vegapunk".to_string()];
         // API key は dummy だが呼び出し前に早期 return するので Ok を返す。
         let out = rt.block_on(canon.canonicalize(&names, &big_text)).unwrap();
         assert_eq!(out, big_text);
+    }
+
+    #[test]
+    fn validate_output_size_accepts_modest_growth() {
+        // typo 補正で多少伸びる程度は許容 (= 入力の 1.5x 以下)。
+        let input = "We use vegpunk for graphs.";
+        let output = "We use Vegapunk for graphs.";
+        assert!(validate_output_size(input, output).is_ok());
+    }
+
+    #[test]
+    fn validate_output_size_rejects_huge_blowup() {
+        let input = "short";
+        // 出力が >> 入力 * 1.5 + min(256) で拒否される。
+        let output = "x".repeat(OUTPUT_ABSOLUTE_MIN_BYTES + 1);
+        let err = validate_output_size(input, output.as_str()).unwrap_err();
+        assert!(matches!(err, CanonicalizeError::OutputRejected(_)));
+    }
+
+    #[test]
+    fn validate_output_size_uses_absolute_minimum_for_tiny_input() {
+        // 入力 5 byte で 1.5x = 7.5 byte だが、絶対最低 256 byte までは許容
+        // (= 比率検査が誤検知しないための floor)。
+        let input = "tiny!";
+        let output_within = "x".repeat(OUTPUT_ABSOLUTE_MIN_BYTES);
+        assert!(validate_output_size(input, &output_within).is_ok());
+    }
+
+    // ── HTTP mock-based tests (wiremock) ─────────────────────────────────
+
+    /// wiremock の base URL から GeminiCanonicalizer を作る helper。
+    async fn mock_canon(server: &wiremock::MockServer) -> GeminiCanonicalizer {
+        test_canon_with_base(server.uri())
+    }
+
+    #[tokio::test]
+    async fn success_returns_rewritten_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.5-flash:generateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{"text": "We use Vegapunk for graphs."}]
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let canon = mock_canon(&server).await;
+        let names = vec!["Vegapunk".to_string()];
+        let out = canon
+            .canonicalize(&names, "We use vegpunk for graphs.")
+            .await
+            .unwrap();
+        assert_eq!(out, "We use Vegapunk for graphs.");
+    }
+
+    #[tokio::test]
+    async fn non_2xx_returns_api_error_without_body_leak() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // provider error body に prompt が echo されたケースを再現
+        // → CanonicalizeError::Api { status } には body が含まれないことを確認。
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.5-flash:generateContent"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string(
+                    "internal error: catalogue contained PII (Person 'Ryugo'), secret tokens echoed back",
+                ),
+            )
+            .mount(&server)
+            .await;
+        let canon = mock_canon(&server).await;
+        let names = vec!["Vegapunk".to_string()];
+        let err = canon
+            .canonicalize(&names, "We use vegpunk.")
+            .await
+            .unwrap_err();
+        match err {
+            CanonicalizeError::Api { status } => assert_eq!(status, 500),
+            other => panic!("expected Api error, got {other:?}"),
+        }
+        // error の Display 表現に body が含まれないことを確認 (= 公開時の leak 防止)。
+        let display = format!("{}", CanonicalizeError::Api { status: 500 });
+        assert!(!display.contains("PII"));
+        assert!(!display.contains("secret"));
+        assert!(display.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn malformed_json_response_returns_parse_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.5-flash:generateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not actually json{["))
+            .mount(&server)
+            .await;
+        let canon = mock_canon(&server).await;
+        let names = vec!["Vegapunk".to_string()];
+        let err = canon
+            .canonicalize(&names, "We use vegpunk.")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CanonicalizeError::Parse(_)));
+    }
+
+    #[tokio::test]
+    async fn valid_json_missing_candidates_returns_parse_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.5-flash:generateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"foo": 1})))
+            .mount(&server)
+            .await;
+        let canon = mock_canon(&server).await;
+        let names = vec!["Vegapunk".to_string()];
+        let err = canon
+            .canonicalize(&names, "We use vegpunk.")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CanonicalizeError::Parse(_)));
+    }
+
+    #[tokio::test]
+    async fn huge_output_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // input ~30 byte に対し output 8 KiB を返す (prompt injection で
+        // 暴走したケース)。MAX_OUTPUT_RATIO * 30 ≈ 45、absolute floor 256
+        // を超えるので拒否されるはず。
+        let blown_up: String = "X".repeat(8 * 1024);
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.5-flash:generateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": blown_up}]}
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let canon = mock_canon(&server).await;
+        let names = vec!["Vegapunk".to_string()];
+        let err = canon
+            .canonicalize(&names, "We use vegpunk for graphs.")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CanonicalizeError::OutputRejected(_)));
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_http_transport_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // server は応答に 5 秒以上かける一方、canon の timeout は test
+        // 用に 1 秒に短縮する。
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.5-flash:generateContent"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(serde_json::json!({
+                        "candidates": [{"content": {"parts": [{"text": "ok"}]}}]
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let canon = GeminiCanonicalizer::new(
+            "test-key".into(),
+            "gemini-3.5-flash".into(),
+            server.uri(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let names = vec!["Vegapunk".to_string()];
+        let err = canon
+            .canonicalize(&names, "We use vegpunk.")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CanonicalizeError::Http(_)));
     }
 
     #[test]

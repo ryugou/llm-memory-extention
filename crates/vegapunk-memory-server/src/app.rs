@@ -36,6 +36,7 @@ pub async fn build_state(cfg: ServerConfig, jwt_keys: JwtKeys) -> Result<AppStat
             let c = crate::canonicalize::GeminiCanonicalizer::new(
                 key,
                 cfg.gemini_model.clone(),
+                cfg.gemini_endpoint_base.clone(),
                 timeout,
             )?;
             Some(Arc::new(c))

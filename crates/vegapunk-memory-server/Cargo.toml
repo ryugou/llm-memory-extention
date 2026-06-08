@@ -43,3 +43,6 @@ tower = { version = "0.5", features = ["util"] }
 # test helpers (src/test_support.rs) で `tonic::transport::Endpoint::connect_lazy`
 # を使うため、tests のみ transport を有効化する。
 tonic = { version = "0.12", default-features = false, features = ["transport"] }
+# Gemini API への HTTP mock (canonicalize.rs の non-2xx / timeout /
+# malformed response 経路を pin)。
+wiremock = "0.6"

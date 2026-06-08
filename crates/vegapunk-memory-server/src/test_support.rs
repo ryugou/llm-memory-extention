@@ -40,6 +40,7 @@ pub(crate) async fn test_state() -> AppState {
         gemini_api_key: None,
         gemini_model: "gemini-3.5-flash".into(),
         gemini_timeout_secs: 30,
+        gemini_endpoint_base: "https://generativelanguage.googleapis.com/v1beta".into(),
     };
     AppState {
         pool,

@@ -1376,6 +1376,12 @@ async fn acquire_ingest_serializer(
     guard
 }
 
+/// structured `ingest` で LLM canonicalize を許可する messages 件数の上限。
+/// これを超える batch では LLM 層を skip して PR #21 word-boundary scan の
+/// みで処理する。大規模 ingest で N × LLM 呼び出しが直列に走り cost と
+/// latency が線形に伸びるのを防ぐ。
+const INGEST_LLM_CANONICALIZE_MAX_MESSAGES: usize = 16;
+
 /// catalogue (shared + personal) から **canonical name の重複なし list** を
 /// 返す。LLM canonicalize の prompt に渡す前段ヘルパ。shared を personal より
 /// 先に並べることで「shared 既存名 = 正典」というシグナルを prompt 上でも
@@ -1412,6 +1418,12 @@ async fn apply_llm_canonicalize(
     if catalogue_names.is_empty() || text.trim().is_empty() {
         return text.to_string();
     }
+    // prompt に実際に乗る件数 = `MAX_CATALOGUE_ENTRIES` で切り詰めた値。
+    // 200 を超える tenant では personal 側が切り捨てられ得るため、effective
+    // 件数を log に出す (= 運用で「足りなかった」を観測可能にする)。
+    let effective_catalogue_size = catalogue_names
+        .len()
+        .min(crate::canonicalize::MAX_CATALOGUE_ENTRIES);
     let started = std::time::Instant::now();
     match canonicalizer.canonicalize(catalogue_names, text).await {
         Ok(out) => {
@@ -1420,6 +1432,7 @@ async fn apply_llm_canonicalize(
             tracing::debug!(
                 method,
                 catalogue_size = catalogue_names.len(),
+                effective_catalogue_size,
                 input_bytes = text.len(),
                 output_bytes = out.len(),
                 wait_ms = started.elapsed().as_millis() as u64,
@@ -1450,6 +1463,23 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
     // 適用する。N messages × 8 fetch の問題を回避する。
     let catalogue = collect_dedup_catalogue(state, user).await;
     let catalogue_names = catalogue_canonical_names(&catalogue);
+    let n_messages = request.messages.len();
+    // structured ingest は N messages 並ぶ可能性があり、LLM canonicalize を
+    // 全件に走らせると N × (30s timeout 上限) と cost が乗算で伸びる。
+    // `INGEST_LLM_CANONICALIZE_MAX_MESSAGES` を超える batch では LLM 層を
+    // skip して PR #21 word-boundary scan のみで vegapunk に渡す (= ingest
+    // 全体は止めない、ただし dedup 品質が下がることを warn ログ + 後で
+    // response field で透明に伝えたい)。閾値は実運用で十分余裕のある値。
+    let llm_canonicalize_enabled =
+        state.canonicalizer.is_some() && n_messages <= INGEST_LLM_CANONICALIZE_MAX_MESSAGES;
+    if state.canonicalizer.is_some() && !llm_canonicalize_enabled {
+        tracing::warn!(
+            method = "ingest",
+            n_messages,
+            cap = INGEST_LLM_CANONICALIZE_MAX_MESSAGES,
+            "skipping LLM canonicalize for oversize batch; PR #21 word-boundary scan only"
+        );
+    }
     for (i, msg) in request.messages.iter_mut().enumerate() {
         match scan_text_with_catalogue(&catalogue, &msg.text) {
             IngestPreCheck::BlockedByShared { hit } => {
@@ -1467,9 +1497,12 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
             }
             IngestPreCheck::Proceed => {}
         }
-        // PR #21 の word-boundary scan で拾えなかった typo / 助詞付き異字体
-        // を Gemini に canonicalize させる。失敗は無視 (= 直前の text を維持)。
-        msg.text = apply_llm_canonicalize(state, "ingest", &catalogue_names, &msg.text).await;
+        if llm_canonicalize_enabled {
+            // PR #21 の word-boundary scan で拾えなかった typo / 助詞付き
+            // 異字体を Gemini に canonicalize させる。失敗は無視 (= 直前の
+            // text を維持)。
+            msg.text = apply_llm_canonicalize(state, "ingest", &catalogue_names, &msg.text).await;
+        }
     }
     let mut client = state.vegapunk.clone();
     // entity_extraction job を後で `ListJobs(since_ms=...)` で拾うため、
