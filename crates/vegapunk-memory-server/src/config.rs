@@ -106,6 +106,11 @@ impl ServerConfig {
                 .unwrap_or_else(|| "gemini-3.5-flash".to_string()),
             gemini_timeout_secs: std::env::var("GEMINI_TIMEOUT_SECS")
                 .ok()
+                // Copilot review #26 round 2: 他の string env (e.g.
+                // `VEGAPUNK_SHARED_SCHEMA_NAME`) と同じく先頭末尾 whitespace を
+                // 取ってから parse する。テンプレートで `" 30"` のように渡る
+                // ケースで silent fallback してしまうのを防ぐ。
+                .map(|s| s.trim().to_string())
                 .and_then(|s| s.parse().ok())
                 .filter(|&n: &u64| n > 0)
                 .unwrap_or(30),
