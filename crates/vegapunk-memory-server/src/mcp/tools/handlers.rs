@@ -1469,9 +1469,12 @@ async fn apply_llm_canonicalize(
     if catalogue_names.is_empty() || text.trim().is_empty() {
         return text.to_string();
     }
-    // prompt に実際に乗る件数 = `MAX_CATALOGUE_ENTRIES` で切り詰めた値。
-    // 200 を超える tenant では personal 側が切り捨てられ得るため、effective
-    // 件数を log に出す (= 運用で「足りなかった」を観測可能にする)。
+    // prompt に乗りうる **上限値** (= `MAX_CATALOGUE_ENTRIES` cap 適用後の
+    // 件数)。Copilot review #26 round 8: 実際の prompt 件数は `canonicalize`
+    // 内の `sanitize_catalogue_names_for_prompt` で sanitize 後の空項目が
+    // 落ちうるため、この値は「prompt entry の取り得る最大数」と読む。200 を
+    // 超える tenant では personal 側が切り捨てられ得るため、運用で
+    // 「足りなかった」かどうかを観測可能にする目的で log に出す。
     let effective_catalogue_size = catalogue_names
         .len()
         .min(crate::canonicalize::MAX_CATALOGUE_ENTRIES);

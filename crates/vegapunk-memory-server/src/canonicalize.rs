@@ -54,9 +54,12 @@ const OUTPUT_BYTES_PER_TOKEN_FLOOR: usize = 2;
 
 /// prompt に埋め込む catalogue 1 件あたりの最大 byte 数 (Copilot review #26 round 2)。
 /// vegapunk 側 graph に登録された entity 名は normally 数十 byte だが、悪意 or
-/// 事故で異常に長い名前が混ざった場合に prompt サイズが MAX_TEXT_BYTES を超えて
-/// cost 爆発するのを防ぐ。超過分は丸ごと truncate (= 末尾 `…` も付けない、
-/// LLM 側で「同名 entity の variants」と誤認させないため)。
+/// 事故で異常に長い名前が混ざった場合の **prompt 全体肥大化** (= LLM コスト
+/// 爆発、Gemini context window 圧迫) を防ぐ。`MAX_TEXT_BYTES` (= input text
+/// 単独の上限) とは別軸で、catalogue + instruction を含めた prompt 全体の
+/// サイズ管理に寄与する (Copilot review #26 round 8: コメント精度修正)。
+/// 超過分は丸ごと truncate (= 末尾 `…` も付けない、LLM 側で「同名 entity の
+/// variants」と誤認させないため)。
 const MAX_CATALOGUE_NAME_BYTES: usize = 128;
 
 #[derive(Debug, Error)]
