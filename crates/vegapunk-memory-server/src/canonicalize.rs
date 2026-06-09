@@ -187,12 +187,15 @@ impl GeminiCanonicalizer {
         // 算出する (= ASCII 主体でも 1 token ≈ 1〜4 bytes、日本語混在で
         // 3〜6 bytes ある中で「最も少なく見積もる divisor」を採用)。これは
         // **超過幅の抑制であって超過自体の禁止ではない** (= 真の防御線は
-        // post-call の `validate_output_size`)。32_768 token で clamp、
-        // try_into 失敗時は 8_192 を fallback。
+        // post-call の `validate_output_size`)。
+        //
+        // `request_max_output_tokens_for` は `clamp(1, 32_768)` で usize 値を
+        // 32_768 以下に絞っているため、u32 への変換は無損失。`try_from` の
+        // expect は理論上発火しない invariant (Copilot review #26 round 6:
+        // 以前は `try_into().unwrap_or(8_192)` を置いていたが dead code)。
         let output_cap_bytes = output_cap_for(text);
-        let max_output_tokens: u32 = request_max_output_tokens_for(output_cap_bytes)
-            .try_into()
-            .unwrap_or(8_192);
+        let max_output_tokens = u32::try_from(request_max_output_tokens_for(output_cap_bytes))
+            .expect("clamp(1, 32_768) ensures u32 fits");
         let body = serde_json::json!({
             "contents": [{
                 "role": "user",
