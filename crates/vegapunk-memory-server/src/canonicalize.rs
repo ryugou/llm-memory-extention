@@ -395,7 +395,13 @@ fn sanitize_catalogue_names_for_prompt(catalogue_names: &[String]) -> Vec<String
 fn sanitize_catalogue_name(raw: &str) -> String {
     let mut buf = String::with_capacity(raw.len().min(MAX_CATALOGUE_NAME_BYTES));
     for ch in raw.chars() {
-        let replacement = if ch.is_control() { ' ' } else { ch };
+        // Copilot review #26 round 9: `char::is_control()` は Unicode category
+        // Cc (ASCII control / DEL / C1 control) のみ。U+2028 LINE SEPARATOR と
+        // U+2029 PARAGRAPH SEPARATOR は category Zl/Zp で is_control() に
+        // ヒットしないが、レンダラ次第で行分割される可能性があり prompt の
+        // 「1 bullet per entity」構造を壊す。明示的に空白に置換する。
+        let is_line_like = ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}');
+        let replacement = if is_line_like { ' ' } else { ch };
         let ch_len = replacement.len_utf8();
         if buf.len() + ch_len > MAX_CATALOGUE_NAME_BYTES {
             break;
@@ -545,6 +551,19 @@ mod tests {
             .block_on(canon.canonicalize(&names, "hello"))
             .unwrap();
         assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn sanitize_replaces_unicode_line_separators() {
+        // Copilot review #26 round 9: U+2028 / U+2029 は char::is_control()
+        // に該当しないが、prompt の bullet structure を壊し得るので空白置換。
+        let raw = "foo\u{2028}bar\u{2029}baz";
+        let s = sanitize_catalogue_name(raw);
+        assert!(!s.contains('\u{2028}'));
+        assert!(!s.contains('\u{2029}'));
+        assert!(s.contains("foo"));
+        assert!(s.contains("bar"));
+        assert!(s.contains("baz"));
     }
 
     #[test]

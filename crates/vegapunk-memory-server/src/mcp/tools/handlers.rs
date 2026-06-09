@@ -1438,9 +1438,20 @@ fn catalogue_canonical_names(catalogue: &DedupCatalogue) -> Vec<String> {
     // (= `ent.name` の trim 結果) を保持し、out には新規エントリの時だけ
     // `to_string` で 1 回 alloc する。catalogue は loop 中 immutable borrow な
     // ので `&str` の有効期間は出力 `Vec<String>` を組み立て終わるまで保証される。
+    //
+    // Copilot review #26 round 9: 後段 `sanitize_catalogue_names_for_prompt`
+    // が `take(MAX_CATALOGUE_ENTRIES)` で 200 件にしか cap しないため、ここで
+    // catalogue 全体 (large tenant では数千件) を Vec に積んでから捨てるのは
+    // 無駄。`MAX_CATALOGUE_ENTRIES` に達した時点で早期 break する。実効動作は
+    // 同じ (= 200 件分の prompt に到達)、ただし alloc/CPU を削減。
+    let cap = crate::canonicalize::MAX_CATALOGUE_ENTRIES;
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(catalogue.shared.len() + catalogue.personal.len());
+    let mut out: Vec<String> =
+        Vec::with_capacity(cap.min(catalogue.shared.len() + catalogue.personal.len()));
     for ent in catalogue.shared.iter().chain(catalogue.personal.iter()) {
+        if out.len() >= cap {
+            break;
+        }
         let name = ent.name.trim();
         if name.is_empty() {
             continue;
