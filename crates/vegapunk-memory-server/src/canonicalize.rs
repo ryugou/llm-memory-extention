@@ -44,6 +44,14 @@ const MAX_OUTPUT_RATIO: f32 = 1.5;
 /// 出力の最低絶対バイト数 (= 入力 text が極小の時の比率検査ノイズを防ぐ)。
 const OUTPUT_ABSOLUTE_MIN_BYTES: usize = 256;
 
+/// `maxOutputTokens` を request 時に算出する際の、保守的な bytes-per-token
+/// 見積もり (Copilot review #26)。UTF-8 では文字種で token あたり byte 数が
+/// 大きく異なる (ASCII で 1〜4、日本語/中国語/絵文字で 3〜6 など) ため、
+/// `output_cap_bytes` を直接 token 数として渡すと日本語入力で provider 側が
+/// cap の数倍を生成できてしまう (= validation で拒否はされるがコスト浪費)。
+/// 「最も少なく見積もる divisor」を採用して出力 byte ≤ cap になる確率を上げる。
+const OUTPUT_BYTES_PER_TOKEN_FLOOR: usize = 2;
+
 #[derive(Debug, Error)]
 pub enum CanonicalizeError {
     #[error("http transport error: {0}")]
@@ -147,12 +155,24 @@ impl GeminiCanonicalizer {
         // (Codex round 2)。
         //
         // 換算: cap は byte 単位 (`output_cap_for(input)` = `max(256,
-        // input.len() * 1.5)`)。Gemini Flash は 1 token ≈ 数 byte の幅が
-        // あるが、ASCII 主体だと token < byte。よって byte 値を直接 token
-        // 数として渡せば安全側 (= 出る量 < 想定 cap)。さらに Gemini API
-        // 上限の 32_768 token で clamp、try_into 失敗時は 8_192 を fallback。
+        // input.len() * 1.5)`)。token と byte の関係は文字種で大きく違い、
+        // 特に **UTF-8 の日本語/中国語/絵文字は 1 token ≈ 1〜2 char ≈ 3〜
+        // 6 bytes** ある。byte 値を直接 token 数として渡すと、日本語入力で
+        // provider 側は `byte_cap` 個まで token 生成でき、結果として byte
+        // 換算では cap の 3〜6 倍出る可能性がある (= post validation で
+        // 拒否はされるが、provider 側のコスト/レイテンシを払う、Copilot
+        // review #26)。
+        //
+        // 保守的に `OUTPUT_BYTES_PER_TOKEN_FLOOR = 2` で割って token 数を
+        // 算出する (= ASCII 主体でも 1 token ≈ 1〜4 bytes、日本語混在で
+        // 3〜6 bytes ある中で「最も少なく見積もる divisor」を採用)。これは
+        // **超過幅の抑制であって超過自体の禁止ではない** (= 真の防御線は
+        // post-call の `validate_output_size`)。32_768 token で clamp、
+        // try_into 失敗時は 8_192 を fallback。
         let output_cap_bytes = output_cap_for(text);
-        let max_output_tokens: u32 = (output_cap_bytes.min(32_768)).try_into().unwrap_or(8_192);
+        let max_output_tokens: u32 = request_max_output_tokens_for(output_cap_bytes)
+            .try_into()
+            .unwrap_or(8_192);
         let body = serde_json::json!({
             "contents": [{
                 "role": "user",
@@ -180,8 +200,13 @@ impl GeminiCanonicalizer {
             // (PII / 登録 entity 名) があるため log に乗せない。status のみ
             // surface し、呼び出し側で warn + fallback。debug log でも body は
             // 出さない (= log されない = leak しない、強い保証)。
-            // body は drop (= read もしない)。
-            let _ = resp;
+            //
+            // Copilot review #26: ただし body は **読み捨てる** こと。read せず
+            // drop すると reqwest/hyper が connection を keep-alive で再利用
+            // できず、5xx 連発時に new TCP/TLS handshake が積み上がる。`.bytes()`
+            // で body を消費 (= 内容は使わない、エラー化のみ) して connection を
+            // pool に返す。
+            let _ = resp.bytes().await;
             return Err(CanonicalizeError::Api {
                 status: status.as_u16(),
             });
@@ -203,6 +228,14 @@ impl GeminiCanonicalizer {
 /// provider 側で生成させない)。
 fn output_cap_for(input: &str) -> usize {
     OUTPUT_ABSOLUTE_MIN_BYTES.max(((input.len() as f32) * MAX_OUTPUT_RATIO).ceil() as usize)
+}
+
+/// `maxOutputTokens` の request 時計算: byte 単位の cap を保守的な
+/// `OUTPUT_BYTES_PER_TOKEN_FLOOR` で割って token 数に換算し、Gemini API の
+/// 32_768 上限で clamp する。output_cap_for と式を分けることで「validation
+/// cap は byte 単位」「request cap は token 単位」の役割を明示する。
+fn request_max_output_tokens_for(output_cap_bytes: usize) -> usize {
+    (output_cap_bytes / OUTPUT_BYTES_PER_TOKEN_FLOOR).clamp(1, 32_768)
 }
 
 /// LLM 出力サイズの post-validation。`output_cap_for(input)` を上限にして、

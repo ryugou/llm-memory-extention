@@ -1395,14 +1395,18 @@ fn should_run_llm_canonicalize(canonicalizer_present: bool, n_messages: usize) -
 /// 先に並べることで「shared 既存名 = 正典」というシグナルを prompt 上でも
 /// 維持する (= 先頭側ほど LLM が canonical 候補として強く扱う想定)。
 fn catalogue_canonical_names(catalogue: &DedupCatalogue) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
+    // Copilot review #26: 二重 alloc を避ける。HashSet は borrow した &str
+    // (= `ent.name` の trim 結果) を保持し、out には新規エントリの時だけ
+    // `to_string` で 1 回 alloc する。catalogue は loop 中 immutable borrow な
+    // ので `&str` の有効期間は出力 `Vec<String>` を組み立て終わるまで保証される。
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(catalogue.shared.len() + catalogue.personal.len());
     for ent in catalogue.shared.iter().chain(catalogue.personal.iter()) {
         let name = ent.name.trim();
         if name.is_empty() {
             continue;
         }
-        if seen.insert(name.to_string()) {
+        if seen.insert(name) {
             out.push(name.to_string());
         }
     }
