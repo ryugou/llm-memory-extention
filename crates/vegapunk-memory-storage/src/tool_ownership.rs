@@ -31,20 +31,26 @@ impl OwnershipKind {
     }
 }
 
-/// 単一の (kind, foreign_id) → user_id を記録する。既に行があれば
-/// 何もしない (= idempotent、`INSERT OR IGNORE` で実装)。
+/// 単一の (kind, foreign_id) → user_id を記録する。既存行 (= `INSERT OR
+/// IGNORE` で無視された行) が **この user_id 所有か** を Bool で返す
+/// (Copilot review #27 round 2)。これで caller は `ownership_recorded=true/
+/// false` を正確に expose できる:
+/// - `Ok(true)` : 今回新規挿入された、または既存行が同じ user_id 所有
+///   だった (= verify が後で true を返す状態)
+/// - `Ok(false)` : 既存行が **別 user_id 所有** だった (= verify が後で
+///   false を返す状態、attacker による id 横取り試行や vegapunk 側衝突など)
 ///
-/// search_id は vegapunk が UUID 風に発行するため衝突は起き得ないが、
-/// 例えば同じ search を別 user が `search_id` を当てに来た時にここで
-/// 別 user_id の上書きが起きると ownership が壊れる。`OR IGNORE` で
-/// 既存値を保護する。
+/// search_id は vegapunk が UUID 風に発行するため通常は衝突しないが、
+/// 万一の衝突や攻撃者の試行で「ingest_raw 成功なのに get_job_status が
+/// 403」という不可逆な状態に黙って陥らないようにするため、確認 step を
+/// 残す。
 pub async fn record(
     pool: &SqlitePool,
     kind: OwnershipKind,
     foreign_id: &str,
     user_id: &str,
-) -> Result<(), StorageError> {
-    sqlx::query(
+) -> Result<bool, StorageError> {
+    let result = sqlx::query(
         "INSERT OR IGNORE INTO tool_ownership (kind, foreign_id, user_id, created_at)
          VALUES (?, ?, ?, ?)",
     )
@@ -54,24 +60,38 @@ pub async fn record(
     .bind(now_ms())
     .execute(pool)
     .await?;
-    Ok(())
+    if result.rows_affected() == 1 {
+        // 新規挿入 → この user_id 所有。
+        return Ok(true);
+    }
+    // IGNORE された (= 既存行あり)。同じ user_id 所有か念のため確認する。
+    verify(pool, kind, foreign_id, user_id).await
 }
 
 /// 複数 foreign_id をまとめて記録する。1 ingest_raw あたり数十件の
 /// msg_id を 1 transaction (= 1 commit) で INSERT する用途。
 /// 各 id ごとに `execute` を発行するため SQLite との round trip は
 /// 件数分だが、atomic 性は transaction で担保される。
+///
+/// Copilot review #27 round 2: `record` と同じく、全件が **この user_id
+/// 所有** なら `true`、1 件でも別 user_id 所有が混じれば `false` を
+/// 返す。`false` の時 caller (= `ingest_raw`) は `ownership_recorded:
+/// false` を expose して client に retry 判断を任せる。
 pub async fn record_many(
     pool: &SqlitePool,
     kind: OwnershipKind,
     foreign_ids: &[String],
     user_id: &str,
-) -> Result<(), StorageError> {
+) -> Result<bool, StorageError> {
     if foreign_ids.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     let mut tx = pool.begin().await?;
     let now = now_ms();
+    // INSERT 段は IGNORE 経由でまとめて回し、commit 後に「全件 user_id
+    // 所有」かを 1 query で確認する (= per-row verify を transaction 内で
+    // やると read-after-write の整合性は OK だが query 数が多い。commit
+    // 後の bulk verify で十分)。
     for id in foreign_ids {
         sqlx::query(
             "INSERT OR IGNORE INTO tool_ownership (kind, foreign_id, user_id, created_at)
@@ -85,7 +105,15 @@ pub async fn record_many(
         .await?;
     }
     tx.commit().await?;
-    Ok(())
+
+    // 既存行衝突で別 user 所有のままになった行が無いかを確認。1 件でも
+    // 別 user_id 所有が混じれば false。
+    for id in foreign_ids {
+        if !verify(pool, kind, id, user_id).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// `user_id` が `(kind, foreign_id)` を所有しているか確認する。

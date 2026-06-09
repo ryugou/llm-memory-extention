@@ -787,7 +787,13 @@ pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Val
         )
         .await
         {
-            Ok(()) => Some(true),
+            Ok(true) => Some(true),
+            Ok(false) => {
+                tracing::warn!(
+                    "search_id collision: existing tool_ownership row belongs to a different user; feedback will deny this search_id"
+                );
+                Some(false)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to record search ownership (personal); feedback will deny this search_id until retried");
                 Some(false)
@@ -797,7 +803,13 @@ pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Val
     let shared_recorded: Option<bool> = match shared_search_id.as_ref() {
         Some(sid) if !sid.is_empty() => {
             match record_ownership(&state.pool, OwnershipKind::Search, sid, &user.user_id).await {
-                Ok(()) => Some(true),
+                Ok(true) => Some(true),
+                Ok(false) => {
+                    tracing::warn!(
+                        "shared search_id collision: existing tool_ownership row belongs to a different user; feedback will deny this search_id"
+                    );
+                    Some(false)
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to record search ownership (shared); feedback will deny this search_id until retried");
                     Some(false)
@@ -1761,7 +1773,17 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
             )
             .await
             {
-                Ok(()) => true,
+                Ok(true) => true,
+                Ok(false) => {
+                    // Copilot review #27 round 2: msg_id 衝突で別 user 所有
+                    // のままになった行が混じった (= rare、攻撃 / vegapunk
+                    // 側 id 衝突)。client に retry させる方が安全。
+                    tracing::warn!(
+                        n = resp.msg_ids.len(),
+                        "msg_id collision detected; one or more msg_ids belong to a different user, get_job_status will deny them"
+                    );
+                    false
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -2166,7 +2188,9 @@ pub(super) async fn feedback(state: &AppState, user: &AuthenticatedUser, args: V
     // `comment` は optional だが、指定された場合 (Some(_)) は string であ
     // るべき (= inputSchema の `"type": "string"` と整合)。Codex round 2:
     // 「present + non-string」を validation error にする以上、`null` 明示も
-    // reject する (= 「省略」と「null 値」を区別)。omit 時のみ空文字を許容。
+    // reject する (= 「省略」と「null 値」を区別)。`None` (= 完全省略) は
+    // 空文字、`Some(Value::String(s))` はそのまま値 (= 空文字 string も
+    // accept)、それ以外 (null / number / bool / array / object) は reject。
     let comment = match args_obj.get("comment") {
         None => String::new(),
         Some(Value::String(s)) => s.clone(),
