@@ -37,6 +37,10 @@ pub(crate) async fn test_state() -> AppState {
         trusted_proxy_count: 1,
         shared_schema_name: "sivira-shared".into(),
         default_schema_template: "discussion".into(),
+        gemini_api_key: None,
+        gemini_model: "gemini-3.5-flash".into(),
+        gemini_timeout_secs: 30,
+        gemini_endpoint_base: "https://generativelanguage.googleapis.com/v1beta".into(),
     };
     AppState {
         pool,
@@ -44,6 +48,7 @@ pub(crate) async fn test_state() -> AppState {
         jwt_keys: JwtKeys::for_tests(),
         cfg: Arc::new(cfg),
         ingest_serializer: Arc::new(crate::ingest_serializer::IngestSerializer::new()),
+        canonicalizer: None,
     }
 }
 

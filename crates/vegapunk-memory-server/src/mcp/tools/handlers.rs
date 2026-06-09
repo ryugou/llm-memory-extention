@@ -1376,6 +1376,147 @@ async fn acquire_ingest_serializer(
     guard
 }
 
+/// structured `ingest` で LLM canonicalize を許可する messages 件数の上限。
+/// これを超える batch では LLM 層を skip して PR #21 word-boundary scan の
+/// みで処理する。大規模 ingest で N × LLM 呼び出しが直列に走り cost と
+/// latency が線形に伸びるのを防ぐ。
+const INGEST_LLM_CANONICALIZE_MAX_MESSAGES: usize = 16;
+
+/// structured `ingest` の per-message LLM canonicalize **ループのみ** に対する
+/// hard cap (秒)。Copilot review #26 round 4 で導入。狙いは ingest serializer
+/// lock 内で LLM が連鎖して `N × GEMINI_TIMEOUT_SECS` の lock 占有 (= 16 × 30
+/// = 8 分) になるのを止めること。本 budget は `tokio::time::timeout(remaining,
+/// apply_llm_canonicalize)` で個別 LLM await を cancel する (Codex round 8
+/// Warning #1) ため、LLM ループ単体は 60 秒で確実に抜ける。
+///
+/// **注意**: 本 budget は ingest 全体の lock 占有時間ではなく LLM 層に対する
+/// もの。lock は `client.ingest(...)` と後続の `await_extraction_jobs_for_schema`
+/// (`JOB_AWAIT_TIMEOUT_SECS` 制御下) まで保持される。ingest 全体の上限は
+/// それぞれの別 timeout で制御される (Codex round 9 Warning)。
+///
+/// default `GEMINI_TIMEOUT_SECS=30` (env で変更可) のおおよそ 2 件分 + 余白で
+/// 60 秒に設定。
+const INGEST_LLM_TOTAL_BUDGET_SECS: u64 = 60;
+
+/// `INGEST_LLM_TOTAL_BUDGET_SECS` を使い切った旨を 1 度だけ warn する helper
+/// (Codex round 9 Suggestion: 同じ warn コードが `remaining.is_zero()` と
+/// `Err(Elapsed)` 両分岐で重複していたのを集約)。`exhausted` がまだ false の
+/// ときだけ warn して true にセットする。
+fn warn_budget_exhausted_once(
+    exhausted: &mut bool,
+    message_index: usize,
+    n_messages: usize,
+    reason: &'static str,
+) {
+    if !*exhausted {
+        tracing::warn!(
+            method = "ingest",
+            skipped_from_index = message_index,
+            n_messages,
+            budget_secs = INGEST_LLM_TOTAL_BUDGET_SECS,
+            reason,
+            "LLM canonicalize total budget exhausted; falling back to PR #21 scan only for remaining messages"
+        );
+        *exhausted = true;
+    }
+}
+
+/// LLM canonicalize を呼ぶべきかを判定する pure helper。
+/// `n_messages <= INGEST_LLM_CANONICALIZE_MAX_MESSAGES` かつ
+/// `canonicalizer_present == true` のときのみ true。閾値判定の境界
+/// (= 16 = ok / 17 = skip) を unit test で固定するための切り出し。
+fn should_run_llm_canonicalize(canonicalizer_present: bool, n_messages: usize) -> bool {
+    canonicalizer_present && n_messages <= INGEST_LLM_CANONICALIZE_MAX_MESSAGES
+}
+
+/// catalogue (shared + personal) から **canonical name の重複なし list** を
+/// 返す。LLM canonicalize の prompt に渡す前段ヘルパ。shared を personal より
+/// 先に並べることで「shared 既存名 = 正典」というシグナルを prompt 上でも
+/// 維持する (= 先頭側ほど LLM が canonical 候補として強く扱う想定)。
+fn catalogue_canonical_names(catalogue: &DedupCatalogue) -> Vec<String> {
+    // Copilot review #26: 二重 alloc を避ける。HashSet は borrow した &str
+    // (= `ent.name` の trim 結果) を保持し、out には新規エントリの時だけ
+    // `to_string` で 1 回 alloc する。catalogue は loop 中 immutable borrow な
+    // ので `&str` の有効期間は出力 `Vec<String>` を組み立て終わるまで保証される。
+    //
+    // Copilot review #26 round 9: 後段 `sanitize_catalogue_names_for_prompt`
+    // が `take(MAX_CATALOGUE_ENTRIES)` で 200 件にしか cap しないため、ここで
+    // catalogue 全体 (large tenant では数千件) を Vec に積んでから捨てるのは
+    // 無駄。`MAX_CATALOGUE_ENTRIES` に達した時点で早期 break する。実効動作は
+    // 同じ (= 200 件分の prompt に到達)、ただし alloc/CPU を削減。
+    let cap = crate::canonicalize::MAX_CATALOGUE_ENTRIES;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out: Vec<String> =
+        Vec::with_capacity(cap.min(catalogue.shared.len() + catalogue.personal.len()));
+    for ent in catalogue.shared.iter().chain(catalogue.personal.iter()) {
+        if out.len() >= cap {
+            break;
+        }
+        let name = ent.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if seen.insert(name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// state.canonicalizer (= Gemini Flash client) があれば LLM canonicalize を
+/// 1 回呼んで text を rewrite する。client が無い (= `GEMINI_API_KEY` 未設定)
+/// / catalogue が空 / text が空 / LLM 失敗の **いずれの場合も静かに元 text を
+/// 返す** (= ingest は止めない、PR #21 word-boundary scan の結果がそのまま
+/// vegapunk に流れる)。
+async fn apply_llm_canonicalize(
+    state: &AppState,
+    method: &'static str,
+    catalogue_names: &[String],
+    text: &str,
+) -> String {
+    let Some(canonicalizer) = state.canonicalizer.as_ref() else {
+        return text.to_string();
+    };
+    if catalogue_names.is_empty() || text.trim().is_empty() {
+        return text.to_string();
+    }
+    // prompt に乗りうる **上限値** (= `MAX_CATALOGUE_ENTRIES` cap 適用後の
+    // 件数)。Copilot review #26 round 8: 実際の prompt 件数は `canonicalize`
+    // 内の `sanitize_catalogue_names_for_prompt` で sanitize 後の空項目が
+    // 落ちうるため、この値は「prompt entry の取り得る最大数」と読む。200 を
+    // 超える tenant では personal 側が切り捨てられ得るため、運用で
+    // 「足りなかった」かどうかを観測可能にする目的で log に出す。
+    let effective_catalogue_size = catalogue_names
+        .len()
+        .min(crate::canonicalize::MAX_CATALOGUE_ENTRIES);
+    let started = std::time::Instant::now();
+    match canonicalizer.canonicalize(catalogue_names, text).await {
+        Ok(out) => {
+            // 個人名漏えい防止のため rewrite 前後 text は log に出さず、
+            // byte 差分と所要時間のみ DEBUG で出す。
+            tracing::debug!(
+                method,
+                catalogue_size = catalogue_names.len(),
+                effective_catalogue_size,
+                input_bytes = text.len(),
+                output_bytes = out.len(),
+                wait_ms = started.elapsed().as_millis() as u64,
+                "llm canonicalize done"
+            );
+            out
+        }
+        Err(e) => {
+            tracing::warn!(
+                method,
+                error = %e,
+                wait_ms = started.elapsed().as_millis() as u64,
+                "llm canonicalize failed; falling back to pre-LLM text"
+            );
+            text.to_string()
+        }
+    }
+}
+
 pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
     let mut request = match build_ingest_request(&user.vegapunk_schema, &args) {
         Ok(r) => r,
@@ -1386,6 +1527,38 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
     // (= 8 query_nodes 上限) に抑え、scan は pure 関数で per-message に
     // 適用する。N messages × 8 fetch の問題を回避する。
     let catalogue = collect_dedup_catalogue(state, user).await;
+    let n_messages = request.messages.len();
+    // structured ingest は N messages 並ぶ可能性があり、LLM canonicalize を
+    // 全件に走らせると N × (30s timeout 上限) と cost が乗算で伸びる。
+    // `INGEST_LLM_CANONICALIZE_MAX_MESSAGES` を超える batch では LLM 層を
+    // skip して PR #21 word-boundary scan のみで vegapunk に渡す (= ingest
+    // 全体は止めない、ただし dedup 品質が下がることを warn ログ + 後で
+    // response field で透明に伝えたい)。閾値は実運用で十分余裕のある値。
+    let llm_canonicalize_enabled =
+        should_run_llm_canonicalize(state.canonicalizer.is_some(), n_messages);
+    if state.canonicalizer.is_some() && !llm_canonicalize_enabled {
+        tracing::warn!(
+            method = "ingest",
+            n_messages,
+            cap = INGEST_LLM_CANONICALIZE_MAX_MESSAGES,
+            "skipping LLM canonicalize for oversize batch; PR #21 word-boundary scan only"
+        );
+    }
+    // Copilot review #26 round 7: `catalogue_canonical_names` は HashSet +
+    // alloc を伴うため、LLM canonicalize を実行しないケース (= canonicalizer
+    // 不在 / oversize batch で gate) では構築しない。
+    let catalogue_names: Vec<String> = if llm_canonicalize_enabled {
+        catalogue_canonical_names(&catalogue)
+    } else {
+        Vec::new()
+    };
+    // Copilot review #26 round 4: ingest serializer lock 内で per-message LLM
+    // を直列に await すると最悪 N × GEMINI_TIMEOUT_SECS 分 lock 占有して
+    // 他並列 ingest を待たせる。`llm_deadline` を batch 開始時刻 + 60s で取り、
+    // 超過後の message は LLM skip して PR #21 結果のまま流す。
+    let llm_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(INGEST_LLM_TOTAL_BUDGET_SECS);
+    let mut llm_budget_exhausted = false;
     for (i, msg) in request.messages.iter_mut().enumerate() {
         match scan_text_with_catalogue(&catalogue, &msg.text) {
             IngestPreCheck::BlockedByShared { hit } => {
@@ -1402,6 +1575,37 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
                 msg.text = new_text;
             }
             IngestPreCheck::Proceed => {}
+        }
+        // Copilot review #26 round 5: `llm_budget_exhausted` 後は LLM branch 全体を
+        // skip する (= 残 message に対して timeout チェックすら走らせない)。
+        // 以前の実装は budget 後も `tokio::time::timeout` を全 message で
+        // 呼んでおり、毎回 `Err(Elapsed)` で warn 抑制だけしていたが、
+        // 「HTTP request が即座に開始 → cancel」される無駄な経路が残っていた。
+        if llm_canonicalize_enabled && !llm_budget_exhausted {
+            let remaining = llm_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                warn_budget_exhausted_once(&mut llm_budget_exhausted, i, n_messages, "skipped");
+            } else {
+                // hard deadline: `tokio::time::timeout` で残り時間を被せる
+                // ことで、deadline 直前に開始した 1 件が GEMINI_TIMEOUT_SECS
+                // まで伸びるのを防ぐ (Codex round 8 Warning #1)。timeout
+                // 発火時は元 text を保持 (apply_llm_canonicalize の silent
+                // fallback と同等)。
+                match tokio::time::timeout(
+                    remaining,
+                    apply_llm_canonicalize(state, "ingest", &catalogue_names, &msg.text),
+                )
+                .await
+                {
+                    Ok(new_text) => msg.text = new_text,
+                    Err(_) => warn_budget_exhausted_once(
+                        &mut llm_budget_exhausted,
+                        i,
+                        n_messages,
+                        "cancelled",
+                    ),
+                }
+            }
         }
     }
     let mut client = state.vegapunk.clone();
@@ -1451,6 +1655,14 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
     // dedup pre-check。shared 既存は抑制、personal 表記揺れは canonical 化。
     // catalogue 取得は ingest_raw 1 件あたり 1 回。
     let catalogue = collect_dedup_catalogue(state, user).await;
+    // Copilot review #26 round 7: `catalogue_canonical_names` は HashSet +
+    // alloc を伴うため、canonicalizer 不在環境では構築しない。
+    let llm_canonicalize_enabled = should_run_llm_canonicalize(state.canonicalizer.is_some(), 1);
+    let catalogue_names: Vec<String> = if llm_canonicalize_enabled {
+        catalogue_canonical_names(&catalogue)
+    } else {
+        Vec::new()
+    };
     match scan_text_with_catalogue(&catalogue, &request.text) {
         IngestPreCheck::BlockedByShared { hit } => {
             return shared_dedup_block_content("ingest_raw", &hit);
@@ -1464,6 +1676,15 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
             request.text = new_text;
         }
         IngestPreCheck::Proceed => {}
+    }
+    // PR #21 word-boundary scan で取れなかった typo / 異字体を LLM (Gemini Flash)
+    // に追加 rewrite させる。失敗は無視 (= 直前の text を維持)。
+    // Copilot review #26 round 3: `ingest` 経路と同じく gate する (= 上で
+    // `llm_canonicalize_enabled` を組み立て済み)。canonicalizer 未設定時は
+    // `apply_llm_canonicalize` の `text.to_string()` clone path を通らない。
+    if llm_canonicalize_enabled {
+        request.text =
+            apply_llm_canonicalize(state, "ingest_raw", &catalogue_names, &request.text).await;
     }
     let mut client = state.vegapunk.clone();
     match client.ingest_raw(request).await {
@@ -2863,6 +3084,32 @@ mod tests {
         assert_eq!(AwaitStatus::Ok.as_str(), "ok");
         assert_eq!(AwaitStatus::Partial.as_str(), "partial");
         assert_eq!(AwaitStatus::Timeout.as_str(), "timeout");
+    }
+
+    // ── should_run_llm_canonicalize gate ───────────────────────────────
+
+    #[test]
+    fn llm_canonicalize_skipped_when_canonicalizer_absent() {
+        // `GEMINI_API_KEY` 未設定 (= canonicalizer = None) なら N によらず false。
+        assert!(!should_run_llm_canonicalize(false, 0));
+        assert!(!should_run_llm_canonicalize(false, 1));
+        assert!(!should_run_llm_canonicalize(false, 16));
+        assert!(!should_run_llm_canonicalize(false, 100));
+    }
+
+    #[test]
+    fn llm_canonicalize_runs_up_to_max_messages() {
+        // 境界の上 (= 16) では呼ぶ、超過 (= 17) では skip する。
+        assert!(should_run_llm_canonicalize(true, 1));
+        assert!(should_run_llm_canonicalize(
+            true,
+            INGEST_LLM_CANONICALIZE_MAX_MESSAGES
+        ));
+        assert!(!should_run_llm_canonicalize(
+            true,
+            INGEST_LLM_CANONICALIZE_MAX_MESSAGES + 1
+        ));
+        assert!(!should_run_llm_canonicalize(true, 1000));
     }
 
     #[test]
