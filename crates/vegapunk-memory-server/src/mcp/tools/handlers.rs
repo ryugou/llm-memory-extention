@@ -2374,7 +2374,7 @@ pub(super) async fn get_traceable_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{test_state, test_user};
+    use crate::test_support::test_state;
     use vegapunk_memory_storage::tool_ownership::{OwnershipKind, record as record_ownership};
     use vegapunk_memory_storage::users::insert as insert_user;
 
@@ -2525,12 +2525,6 @@ mod tests {
                 "rating={bad}: {text}"
             );
         }
-    }
-
-    // suppress unused-imports warnings when no other test in this mod uses them
-    #[allow(dead_code)]
-    fn _force_uses() {
-        let _ = test_user();
     }
 
     #[test]

@@ -58,7 +58,9 @@ pub async fn record(
 }
 
 /// 複数 foreign_id をまとめて記録する。1 ingest_raw あたり数十件の
-/// msg_id を 1 round trip で INSERT する用途。
+/// msg_id を 1 transaction (= 1 commit) で INSERT する用途。
+/// 各 id ごとに `execute` を発行するため SQLite との round trip は
+/// 件数分だが、atomic 性は transaction で担保される。
 pub async fn record_many(
     pool: &SqlitePool,
     kind: OwnershipKind,
@@ -163,8 +165,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_is_idempotent() {
-        // 同じ (kind, foreign_id) を 2 度 record しても OK_IGNORE で
-        // 既存 user_id が保護される。
+        // 同じ (kind, foreign_id) を 2 度 record しても `INSERT OR IGNORE`
+        // で既存 user_id が保護される。
         let pool = setup().await;
         record(&pool, OwnershipKind::Search, "sid-1", "u1")
             .await
