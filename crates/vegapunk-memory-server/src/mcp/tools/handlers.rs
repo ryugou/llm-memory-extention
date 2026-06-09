@@ -1580,8 +1580,14 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
     }
     // PR #21 word-boundary scan で取れなかった typo / 異字体を LLM (Gemini Flash)
     // に追加 rewrite させる。失敗は無視 (= 直前の text を維持)。
-    request.text =
-        apply_llm_canonicalize(state, "ingest_raw", &catalogue_names, &request.text).await;
+    // Copilot review #26 round 3: `ingest` 経路と同じく `should_run_llm_canonicalize`
+    // で gate する。canonicalizer 未設定 (= `GEMINI_API_KEY` 無し) のとき
+    // `apply_llm_canonicalize` が中で `text.to_string()` する経路を通らない
+    // ようにして、1 ingest あたりの 1 回不要 clone を削る。
+    if should_run_llm_canonicalize(state.canonicalizer.is_some(), 1) {
+        request.text =
+            apply_llm_canonicalize(state, "ingest_raw", &catalogue_names, &request.text).await;
+    }
     let mut client = state.vegapunk.clone();
     match client.ingest_raw(request).await {
         Err(status) => tonic_error_content("IngestRaw", status),
