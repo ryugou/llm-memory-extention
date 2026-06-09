@@ -1382,6 +1382,45 @@ async fn acquire_ingest_serializer(
 /// latency が線形に伸びるのを防ぐ。
 const INGEST_LLM_CANONICALIZE_MAX_MESSAGES: usize = 16;
 
+/// structured `ingest` の per-message LLM canonicalize **ループのみ** に対する
+/// hard cap (秒)。Copilot review #26 round 4 で導入。狙いは ingest serializer
+/// lock 内で LLM が連鎖して `N × GEMINI_TIMEOUT_SECS` の lock 占有 (= 16 × 30
+/// = 8 分) になるのを止めること。本 budget は `tokio::time::timeout(remaining,
+/// apply_llm_canonicalize)` で個別 LLM await を cancel する (Codex round 8
+/// Warning #1) ため、LLM ループ単体は 60 秒で確実に抜ける。
+///
+/// **注意**: 本 budget は ingest 全体の lock 占有時間ではなく LLM 層に対する
+/// もの。lock は `client.ingest(...)` と後続の `await_extraction_jobs_for_schema`
+/// (`JOB_AWAIT_TIMEOUT_SECS` 制御下) まで保持される。ingest 全体の上限は
+/// それぞれの別 timeout で制御される (Codex round 9 Warning)。
+///
+/// default `GEMINI_TIMEOUT_SECS=30` (env で変更可) のおおよそ 2 件分 + 余白で
+/// 60 秒に設定。
+const INGEST_LLM_TOTAL_BUDGET_SECS: u64 = 60;
+
+/// `INGEST_LLM_TOTAL_BUDGET_SECS` を使い切った旨を 1 度だけ warn する helper
+/// (Codex round 9 Suggestion: 同じ warn コードが `remaining.is_zero()` と
+/// `Err(Elapsed)` 両分岐で重複していたのを集約)。`exhausted` がまだ false の
+/// ときだけ warn して true にセットする。
+fn warn_budget_exhausted_once(
+    exhausted: &mut bool,
+    message_index: usize,
+    n_messages: usize,
+    reason: &'static str,
+) {
+    if !*exhausted {
+        tracing::warn!(
+            method = "ingest",
+            skipped_from_index = message_index,
+            n_messages,
+            budget_secs = INGEST_LLM_TOTAL_BUDGET_SECS,
+            reason,
+            "LLM canonicalize total budget exhausted; falling back to PR #21 scan only for remaining messages"
+        );
+        *exhausted = true;
+    }
+}
+
 /// LLM canonicalize を呼ぶべきかを判定する pure helper。
 /// `n_messages <= INGEST_LLM_CANONICALIZE_MAX_MESSAGES` かつ
 /// `canonicalizer_present == true` のときのみ true。閾値判定の境界
@@ -1492,6 +1531,13 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
             "skipping LLM canonicalize for oversize batch; PR #21 word-boundary scan only"
         );
     }
+    // Copilot review #26 round 4: ingest serializer lock 内で per-message LLM
+    // を直列に await すると最悪 N × GEMINI_TIMEOUT_SECS 分 lock 占有して
+    // 他並列 ingest を待たせる。`llm_deadline` を batch 開始時刻 + 60s で取り、
+    // 超過後の message は LLM skip して PR #21 結果のまま流す。
+    let llm_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(INGEST_LLM_TOTAL_BUDGET_SECS);
+    let mut llm_budget_exhausted = false;
     for (i, msg) in request.messages.iter_mut().enumerate() {
         match scan_text_with_catalogue(&catalogue, &msg.text) {
             IngestPreCheck::BlockedByShared { hit } => {
@@ -1510,10 +1556,30 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
             IngestPreCheck::Proceed => {}
         }
         if llm_canonicalize_enabled {
-            // PR #21 の word-boundary scan で拾えなかった typo / 助詞付き
-            // 異字体を Gemini に canonicalize させる。失敗は無視 (= 直前の
-            // text を維持)。
-            msg.text = apply_llm_canonicalize(state, "ingest", &catalogue_names, &msg.text).await;
+            let remaining = llm_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                warn_budget_exhausted_once(&mut llm_budget_exhausted, i, n_messages, "skipped");
+            } else {
+                // hard deadline: `tokio::time::timeout` で残り時間を被せる
+                // ことで、deadline 直前に開始した 1 件が GEMINI_TIMEOUT_SECS
+                // まで伸びるのを防ぐ (Codex round 8 Warning #1)。timeout
+                // 発火時は元 text を保持 (apply_llm_canonicalize の silent
+                // fallback と同等)。
+                match tokio::time::timeout(
+                    remaining,
+                    apply_llm_canonicalize(state, "ingest", &catalogue_names, &msg.text),
+                )
+                .await
+                {
+                    Ok(new_text) => msg.text = new_text,
+                    Err(_) => warn_budget_exhausted_once(
+                        &mut llm_budget_exhausted,
+                        i,
+                        n_messages,
+                        "cancelled",
+                    ),
+                }
+            }
         }
     }
     let mut client = state.vegapunk.clone();
