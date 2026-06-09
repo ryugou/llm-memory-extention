@@ -1555,7 +1555,12 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
             }
             IngestPreCheck::Proceed => {}
         }
-        if llm_canonicalize_enabled {
+        // Copilot review #26 round 5: `llm_budget_exhausted` 後は LLM branch 全体を
+        // skip する (= 残 message に対して timeout チェックすら走らせない)。
+        // 以前の実装は budget 後も `tokio::time::timeout` を全 message で
+        // 呼んでおり、毎回 `Err(Elapsed)` で warn 抑制だけしていたが、
+        // 「HTTP request が即座に開始 → cancel」される無駄な経路が残っていた。
+        if llm_canonicalize_enabled && !llm_budget_exhausted {
             let remaining = llm_deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 warn_budget_exhausted_once(&mut llm_budget_exhausted, i, n_messages, "skipped");

@@ -298,9 +298,13 @@ fn extract_text(payload: &serde_json::Value) -> Result<String, CanonicalizeError
     Ok(out)
 }
 
-/// LLM 用 prompt 構築。catalogue は `MAX_CATALOGUE_ENTRIES` で切り詰める。
-/// 重複名は事前に dedup する責任は caller 側 (= 通常 catalogue は wrapper
-/// 内 `collect_dedup_catalogue` から取るので既に並列で揃っている)。
+/// LLM 用 prompt 構築。**事前に sanitize / truncate 済みの** `sanitized_names`
+/// を受け取って prompt 文字列を組むだけ (Copilot review #26 round 5 で
+/// doc 整合性指摘)。 sanitize と `MAX_CATALOGUE_ENTRIES` 切り詰めは
+/// `sanitize_catalogue_names_for_prompt` 側の責任、本関数は再 sanitize しない
+/// (= 同じ catalogue で重複 sanitize するコストを避ける)。重複名は事前に
+/// dedup する責任は caller 側 (= 通常 catalogue は wrapper 内
+/// `collect_dedup_catalogue` から取るので既に並列で揃っている)。
 fn build_prompt(sanitized_names: &[String], text: &str) -> String {
     // Caller (`canonicalize` または unit test) が `sanitize_catalogue_names_for_prompt`
     // を通した sanitized リストを渡す前提。本関数では prompt 文字列を組むだけ。
