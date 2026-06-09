@@ -1513,7 +1513,6 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
     // (= 8 query_nodes 上限) に抑え、scan は pure 関数で per-message に
     // 適用する。N messages × 8 fetch の問題を回避する。
     let catalogue = collect_dedup_catalogue(state, user).await;
-    let catalogue_names = catalogue_canonical_names(&catalogue);
     let n_messages = request.messages.len();
     // structured ingest は N messages 並ぶ可能性があり、LLM canonicalize を
     // 全件に走らせると N × (30s timeout 上限) と cost が乗算で伸びる。
@@ -1531,6 +1530,14 @@ pub(super) async fn ingest(state: &AppState, user: &AuthenticatedUser, args: Val
             "skipping LLM canonicalize for oversize batch; PR #21 word-boundary scan only"
         );
     }
+    // Copilot review #26 round 7: `catalogue_canonical_names` は HashSet +
+    // alloc を伴うため、LLM canonicalize を実行しないケース (= canonicalizer
+    // 不在 / oversize batch で gate) では構築しない。
+    let catalogue_names: Vec<String> = if llm_canonicalize_enabled {
+        catalogue_canonical_names(&catalogue)
+    } else {
+        Vec::new()
+    };
     // Copilot review #26 round 4: ingest serializer lock 内で per-message LLM
     // を直列に await すると最悪 N × GEMINI_TIMEOUT_SECS 分 lock 占有して
     // 他並列 ingest を待たせる。`llm_deadline` を batch 開始時刻 + 60s で取り、
@@ -1634,7 +1641,14 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
     // dedup pre-check。shared 既存は抑制、personal 表記揺れは canonical 化。
     // catalogue 取得は ingest_raw 1 件あたり 1 回。
     let catalogue = collect_dedup_catalogue(state, user).await;
-    let catalogue_names = catalogue_canonical_names(&catalogue);
+    // Copilot review #26 round 7: `catalogue_canonical_names` は HashSet +
+    // alloc を伴うため、canonicalizer 不在環境では構築しない。
+    let llm_canonicalize_enabled = should_run_llm_canonicalize(state.canonicalizer.is_some(), 1);
+    let catalogue_names: Vec<String> = if llm_canonicalize_enabled {
+        catalogue_canonical_names(&catalogue)
+    } else {
+        Vec::new()
+    };
     match scan_text_with_catalogue(&catalogue, &request.text) {
         IngestPreCheck::BlockedByShared { hit } => {
             return shared_dedup_block_content("ingest_raw", &hit);
@@ -1651,11 +1665,10 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
     }
     // PR #21 word-boundary scan で取れなかった typo / 異字体を LLM (Gemini Flash)
     // に追加 rewrite させる。失敗は無視 (= 直前の text を維持)。
-    // Copilot review #26 round 3: `ingest` 経路と同じく `should_run_llm_canonicalize`
-    // で gate する。canonicalizer 未設定 (= `GEMINI_API_KEY` 無し) のとき
-    // `apply_llm_canonicalize` が中で `text.to_string()` する経路を通らない
-    // ようにして、1 ingest あたりの 1 回不要 clone を削る。
-    if should_run_llm_canonicalize(state.canonicalizer.is_some(), 1) {
+    // Copilot review #26 round 3: `ingest` 経路と同じく gate する (= 上で
+    // `llm_canonicalize_enabled` を組み立て済み)。canonicalizer 未設定時は
+    // `apply_llm_canonicalize` の `text.to_string()` clone path を通らない。
+    if llm_canonicalize_enabled {
         request.text =
             apply_llm_canonicalize(state, "ingest_raw", &catalogue_names, &request.text).await;
     }

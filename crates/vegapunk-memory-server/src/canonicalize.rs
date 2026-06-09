@@ -282,7 +282,26 @@ fn validate_output_size(input: &str, output: &str) -> Result<(), CanonicalizeErr
 /// Gemini レスポンス JSON から rewritten text を取り出す。
 /// candidates[0].content.parts[*].text を順番に concat する (= Gemini は
 /// 通常 1 part に収まるが multi-part も仕様上ありうる)。
+///
+/// Copilot review #26 round 7: `candidates[0].finishReason == "MAX_TOKENS"`
+/// なら出力は `maxOutputTokens` で打ち切られている可能性が高く、末尾欠落
+/// した text を ingest すると破壊的。`OutputRejected` で fallback を発動
+/// させる (= caller 側で元 text を維持)。他の正常系 finishReason は `STOP`、
+/// 異常系は `SAFETY` / `RECITATION` / `OTHER` などがあるが、本関数では
+/// `MAX_TOKENS` のみを「黙って受け入れると壊れる」として明示拒否する。
+/// その他の異常 finishReason はそもそも parts が空になることが多く、
+/// 既存の "no text" Parse error path で捕まる想定。
 fn extract_text(payload: &serde_json::Value) -> Result<String, CanonicalizeError> {
+    if let Some(reason) = payload
+        .pointer("/candidates/0/finishReason")
+        .and_then(|v| v.as_str())
+    {
+        if reason == "MAX_TOKENS" {
+            return Err(CanonicalizeError::OutputRejected(
+                "gemini finishReason=MAX_TOKENS; output likely truncated".into(),
+            ));
+        }
+    }
     let parts = payload
         .pointer("/candidates/0/content/parts")
         .and_then(|v| v.as_array())
@@ -794,6 +813,32 @@ mod tests {
         assert!(p.contains(&format!("- Entity{last_idx}")));
         // 切り詰め後のものは入っていない。
         assert!(!p.contains(&format!("- Entity{MAX_CATALOGUE_ENTRIES}")));
+    }
+
+    #[test]
+    fn extract_text_rejects_max_tokens_finish_reason() {
+        // Copilot review #26 round 7: finishReason=MAX_TOKENS は末尾欠落の
+        // signal なので OutputRejected で fallback。caller 側で元 text 維持。
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "truncated tex"}]},
+                "finishReason": "MAX_TOKENS"
+            }]
+        });
+        let err = extract_text(&payload).unwrap_err();
+        assert!(matches!(err, CanonicalizeError::OutputRejected(_)));
+    }
+
+    #[test]
+    fn extract_text_accepts_stop_finish_reason() {
+        // STOP は正常終了、parts が読めれば accept。
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "ok"}]},
+                "finishReason": "STOP"
+            }]
+        });
+        assert_eq!(extract_text(&payload).unwrap(), "ok");
     }
 
     #[test]
