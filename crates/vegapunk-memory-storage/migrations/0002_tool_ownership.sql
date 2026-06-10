@@ -25,4 +25,4 @@ CREATE TABLE tool_ownership (
   PRIMARY KEY (kind, foreign_id)
 );
 
-CREATE INDEX idx_tool_ownership_user ON tool_ownership (user_id);
+CREATE INDEX idx_tool_ownership_user_id ON tool_ownership (user_id);
