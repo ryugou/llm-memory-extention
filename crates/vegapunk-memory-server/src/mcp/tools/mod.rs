@@ -41,13 +41,12 @@ pub(super) const TRACEABLE_CHAIN_MAX_DEPTH_DEFAULT: i32 = 5;
 /// vegapunk wrapper として公開する tool 名の集合。
 /// 「公開しない vegapunk RPC」(= UpsertNodes / Reingest / Rebuild / Migrate /
 /// PurgeRawMessages / SetMaintenanceMode 等の admin) は意図的に外す。
-// NOTE: `feedback` と `get_job_status` は意図的に外している。proto 上、
+// PR #27 で `feedback` と `get_job_status` を再追加した。これらの
 // `FeedbackRequest` / `GetJobStatusRequest` には schema フィールドが無く、
-// 識別子 (`search_id` / `msg_id`) だけで vegapunk に投げる API。wrapper 側で
-// 「その識別子が caller の tenant のものか」を確認する仕組み (ownership
-// tracking テーブル) が無い状態で advertise すると、他 tenant の id を
-// 推測 / 漏洩経由で知った caller が cross-tenant でアクセスできてしまう
-// (Codex P1/P2)。ownership tracking を別 PR で入れてから再 advertise する。
+// 識別子 (`search_id` / `msg_id`) だけで vegapunk に投げるが、wrapper の
+// `tool_ownership` テーブルで「その識別子が caller の tenant のものか」を
+// 必ず verify してから RPC を発行する。verify 失敗時は 403 相当の
+// permission_denied content を返す (= cross-tenant 試行をブロック)。
 const TOOL_NAMES: &[&str] = &[
     "search",
     "ingest",
@@ -57,6 +56,8 @@ const TOOL_NAMES: &[&str] = &[
     "list_schemas",
     "stats",
     "get_traceable_chain",
+    "feedback",
+    "get_job_status",
 ];
 
 /// `tools/list` の戻り値を組み立てる。
@@ -279,6 +280,48 @@ fn tool_descriptor(name: &str) -> Value {
                 "required": ["node_id"]
             }
         }),
+        "feedback" => json!({
+            "name": "feedback",
+            "description": "Send relevance feedback for a prior `search` call (vegapunk Feedback RPC). `search_id` must come from a search this user made; cross-tenant ids are rejected.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "search_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S",
+                        "description": "Identifier returned by a previous `search` call."
+                    },
+                    "rating": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                        "description": "1-5 scale (1=lowest, 5=highest)."
+                    },
+                    "comment": {
+                        "type": "string",
+                        "description": "Optional free-text comment."
+                    }
+                },
+                "required": ["search_id", "rating"]
+            }
+        }),
+        "get_job_status" => json!({
+            "name": "get_job_status",
+            "description": "Look up the status of an ingest job by `msg_id` (vegapunk GetJobStatus RPC). `msg_id` must come from an `ingest_raw` this user made; cross-tenant ids are rejected.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "msg_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S",
+                        "description": "msg_id returned by a previous `ingest_raw` call."
+                    }
+                },
+                "required": ["msg_id"]
+            }
+        }),
         _ => json!({
             "name": name,
             "description": "(unknown tool)",
@@ -340,6 +383,8 @@ pub async fn call(
         "list_schemas" => handlers::list_schemas(&state, &user).await,
         "stats" => handlers::stats(&state, &user, args).await,
         "get_traceable_chain" => handlers::get_traceable_chain(&state, &user, args).await,
+        "feedback" => handlers::feedback(&state, &user, args).await,
+        "get_job_status" => handlers::get_job_status(&state, &user, args).await,
         other if TOOL_NAMES.contains(&other) => not_implemented_content(other),
         _ => {
             return JsonRpcResponse::error(
@@ -529,13 +574,12 @@ mod tests {
     }
 
     #[test]
-    fn feedback_and_get_job_status_are_not_advertised() {
-        // proto: FeedbackRequest / GetJobStatusRequest には schema が無く、
-        // wrapper 側で「その識別子は caller の tenant か」を確認する仕組み
-        // (ownership tracking) が未実装。それまで tools/list に出すと
-        // cross-tenant の rating 改竄 / job 状態漏洩を許してしまうので、
-        // TOOL_NAMES に含めないことを test で pin する。
-        assert!(!TOOL_NAMES.contains(&"feedback"));
-        assert!(!TOOL_NAMES.contains(&"get_job_status"));
+    fn feedback_and_get_job_status_are_advertised_after_ownership_tracking() {
+        // PR #27 で `tool_ownership` テーブルを導入し、search 経路で
+        // `search_id`、ingest_raw 経路で `msg_id` を user_id と紐付けて
+        // 記録するようになった。feedback / get_job_status handler はその
+        // 紐付けを verify して 403 を返すので、安全に advertise できる。
+        assert!(TOOL_NAMES.contains(&"feedback"));
+        assert!(TOOL_NAMES.contains(&"get_job_status"));
     }
 }

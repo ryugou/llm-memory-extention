@@ -4,13 +4,14 @@
 //! ここでは認証・ユーザメタ情報 (users / oauth_clients / tokens /
 //! shared_memories) のみを SQLite に格納する。
 //!
-//! migration: `migrations/0001_initial.sql`
+//! migrations: `migrations/0001_initial.sql`, `migrations/0002_tool_ownership.sql`
 
 pub mod error;
 pub mod oauth_clients;
 pub mod pool;
 pub mod shared_memories;
 pub mod tokens;
+pub mod tool_ownership;
 pub mod users;
 
 pub use error::StorageError;

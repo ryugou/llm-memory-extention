@@ -16,7 +16,7 @@ use serde_json::{Map, Value, json};
 
 use vegapunk_client::GraphRagClient;
 use vegapunk_client::graphrag::{
-    AttributeFilter, GetJobStatusRequest, GetSchemaRequest, GetStatsRequest,
+    AttributeFilter, FeedbackRequest, GetJobStatusRequest, GetSchemaRequest, GetStatsRequest,
     GetTraceableChainRequest, IngestMessage, IngestRawMetadata, IngestRawRequest, IngestRequest,
     ListJobsRequest, ListSchemasRequest, MessageMetadata, QueryNodesRequest, SchemaListItem,
     SearchRequest, SearchResultItem,
@@ -761,11 +761,76 @@ pub(super) async fn search(state: &AppState, user: &AuthenticatedUser, args: Val
     // `search_ids.{personal,shared}` で両方の id を取得できる。
     let personal_search_id = personal.search_id;
     let shared_search_id = shared.as_ref().map(|s| s.search_id.clone());
+
+    // PR #27 ownership tracking: feedback handler が後から
+    // `search_id` を verify できるよう、本 user に発行した両 id を
+    // SQLite に記録する。空文字 (= vegapunk が id を発行しなかった
+    // edge case) は記録しない (= verify で常に false → 403)。失敗は
+    // warn して search 結果は返す (= ownership 記録の失敗で search が
+    // 失敗するのは挙動として強すぎる)。
+    // Codex round 2 Warning: ownership 記録失敗を client から見えるように
+    // expose する。`ingest_raw` の `ownership_recorded` と対称な形で、
+    // search も personal/shared 個別に bool を返す。shared 側は best-effort
+    // (= shared search 自体が失敗していたら `null`)。
+    //   - true: 記録成功、feedback で使える
+    //   - false: 記録失敗、feedback で 403 になる可能性、retry 推奨
+    //   - null: そもそも search 自体が失敗 / id 未発行で記録対象外
+    use vegapunk_memory_storage::tool_ownership::{OwnershipKind, record as record_ownership};
+    let personal_recorded: Option<bool> = if personal_search_id.is_empty() {
+        None
+    } else {
+        match record_ownership(
+            &state.pool,
+            OwnershipKind::Search,
+            &personal_search_id,
+            &user.user_id,
+        )
+        .await
+        {
+            Ok(true) => Some(true),
+            Ok(false) => {
+                tracing::warn!(
+                    "search_id collision: existing tool_ownership row belongs to a different user; feedback will deny this search_id"
+                );
+                Some(false)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to record search ownership (personal); feedback will deny this search_id until retried");
+                Some(false)
+            }
+        }
+    };
+    let shared_recorded: Option<bool> = match shared_search_id.as_ref() {
+        Some(sid) if !sid.is_empty() => {
+            match record_ownership(&state.pool, OwnershipKind::Search, sid, &user.user_id).await {
+                Ok(true) => Some(true),
+                Ok(false) => {
+                    tracing::warn!(
+                        "shared search_id collision: existing tool_ownership row belongs to a different user; feedback will deny this search_id"
+                    );
+                    Some(false)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to record search ownership (shared); feedback will deny this search_id until retried");
+                    Some(false)
+                }
+            }
+        }
+        _ => None,
+    };
+
     success_content(json!({
         "search_id": personal_search_id.clone(),
         "search_ids": {
             "personal": personal_search_id,
             "shared": shared_search_id,
+        },
+        // PR #27 Codex round 2: ownership 記録の可視化。`feedback` を retry
+        // 判断するために client が見る。`null` = id 自体が無い、`false` =
+        // id はあるが記録失敗 (= feedback で 403)、`true` = 記録成功。
+        "ownership_recorded": {
+            "personal": personal_recorded,
+            "shared": shared_recorded,
         },
         "total_count": personal.total_count + shared.as_ref().map(|s| s.total_count).unwrap_or(0),
         "results": merged_results,
@@ -1691,6 +1756,43 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
         Err(status) => tonic_error_content("IngestRaw", status),
         Ok(resp) => {
             let resp = resp.into_inner();
+            // PR #27 ownership tracking: get_job_status handler が後から
+            // `msg_id` を verify できるよう、本 user に発行した msg_ids を
+            // 一括で記録する。失敗は warn + response field で client に
+            // 透明に伝える (Codex review Warning: 失敗を silent にすると
+            // ingest 成功なのに後の get_job_status が必ず 403 という不可逆な
+            // 不整合を起こすため、client が retry 判断できるよう expose する)。
+            use vegapunk_memory_storage::tool_ownership::{
+                OwnershipKind, record_many as record_ownership_many,
+            };
+            let ownership_recorded = match record_ownership_many(
+                &state.pool,
+                OwnershipKind::Msg,
+                &resp.msg_ids,
+                &user.user_id,
+            )
+            .await
+            {
+                Ok(true) => true,
+                Ok(false) => {
+                    // Copilot review #27 round 2: msg_id 衝突で別 user 所有
+                    // のままになった行が混じった (= rare、攻撃 / vegapunk
+                    // 側 id 衝突)。client に retry させる方が安全。
+                    tracing::warn!(
+                        n = resp.msg_ids.len(),
+                        "msg_id collision detected; one or more msg_ids belong to a different user, get_job_status will deny them"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        n = resp.msg_ids.len(),
+                        "failed to record msg ownership; get_job_status will deny these msg_ids until retried"
+                    );
+                    false
+                }
+            };
             // ingest_raw は IngestRawResponse.msg_ids を返すので、各 msg_id を
             // 直接 GetJobStatus で polling できる (= list_jobs ベースの ingest
             // 経路よりピンポイント)。詳細は `await_msg_ids_complete` 参照。
@@ -1703,6 +1805,9 @@ pub(super) async fn ingest_raw(state: &AppState, user: &AuthenticatedUser, args:
                 // ingest_raw は msg_ids 個別追跡で **正確に** 待機できる。
                 // structured ingest との対比で client が判断できるよう明示。
                 "await_semantics": "exact",
+                // `false` の時、これらの msg_id は get_job_status で 403 に
+                // なる。client は ingest_raw を retry すべき。
+                "ownership_recorded": ownership_recorded,
             }))
         }
     }
@@ -2036,13 +2141,146 @@ pub(super) async fn stats(state: &AppState, user: &AuthenticatedUser, args: Valu
     }))
 }
 
-// `feedback` / `get_job_status` handlers are intentionally absent in this PR.
-// Their proto requests (FeedbackRequest / GetJobStatusRequest) carry no schema
-// field, and the wrapper has no ownership-tracking table yet to verify the
-// caller actually owns the supplied `search_id` / `msg_id`. Without that, a
-// caller who learns another tenant's identifier could rate / inspect it.
-// They will land in a follow-up PR once we record (search_id, msg_id) →
-// user_id mapping during search / ingest.
+/// 403 相当の content。`tool_ownership` 検証に失敗した時 (= 別 tenant の
+/// id を試行してきた、未知の id を当てに来た) に返す。content text に
+/// 元の id を反映しない (= 攻撃者が `feedback` の応答差で id の存在を
+/// 推測できないように、検証失敗時は全部同じ 403 表現を返す)。
+fn ownership_denied_content(tool: &str) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!("permission denied: '{tool}' identifier does not belong to caller"),
+        }],
+        "isError": true
+    })
+}
+
+/// internal error 用 content。DB 接続失敗など、client 入力の不備でも
+/// permission 拒否でもない **server 側の障害** に使う (Codex review
+/// Suggestion: `invalid_args_content` は client 側の問題を含意するため
+/// 区別したい)。msg は server log で原因を辿るための短い識別子だけ。
+fn internal_error_content(tool: &str, msg: &str) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!("internal error in '{tool}': {msg}"),
+        }],
+        "isError": true
+    })
+}
+
+/// `feedback` tool: search_id に対する relevance feedback を vegapunk へ
+/// 送る。`tool_ownership` で search_id の所有者を確認し、別 tenant の
+/// id を渡された場合は 403 相当を返す。
+pub(super) async fn feedback(state: &AppState, user: &AuthenticatedUser, args: Value) -> Value {
+    let args_obj = match args.as_object() {
+        Some(o) => o,
+        None => return invalid_args_content("feedback", "arguments must be a JSON object"),
+    };
+    let search_id = match args_obj.get("search_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return invalid_args_content("feedback", "missing or empty 'search_id'"),
+    };
+    let rating = match args_obj.get("rating").and_then(|v| v.as_i64()) {
+        Some(n) if (1..=5).contains(&n) => n as i32,
+        _ => return invalid_args_content("feedback", "'rating' must be an integer 1..=5"),
+    };
+    // `comment` は optional だが、指定された場合 (Some(_)) は string であ
+    // るべき (= inputSchema の `"type": "string"` と整合)。Codex round 2:
+    // 「present + non-string」を validation error にする以上、`null` 明示も
+    // reject する (= 「省略」と「null 値」を区別)。`None` (= 完全省略) は
+    // 空文字、`Some(Value::String(s))` はそのまま値 (= 空文字 string も
+    // accept)、それ以外 (null / number / bool / array / object) は reject。
+    let comment = match args_obj.get("comment") {
+        None => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => {
+            return invalid_args_content("feedback", "'comment' must be a string when present");
+        }
+    };
+
+    // ownership 検証: 別 tenant の id (or 未知の id) は早期に 403。
+    use vegapunk_memory_storage::tool_ownership::{OwnershipKind, verify as verify_ownership};
+    match verify_ownership(
+        &state.pool,
+        OwnershipKind::Search,
+        &search_id,
+        &user.user_id,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return ownership_denied_content("feedback"),
+        Err(e) => {
+            tracing::error!(error = %e, "tool_ownership verify failed (feedback)");
+            return internal_error_content("feedback", "ownership check failed");
+        }
+    }
+
+    let mut client = state.vegapunk.clone();
+    match client
+        .feedback(FeedbackRequest {
+            search_id,
+            rating,
+            comment,
+        })
+        .await
+    {
+        Err(status) => tonic_error_content("Feedback", status),
+        Ok(_) => success_content(json!({ "ok": true })),
+    }
+}
+
+/// `get_job_status` tool: msg_id に紐付く ingest job の状態を返す。
+/// `tool_ownership` で msg_id の所有者を確認、別 tenant の id は 403。
+pub(super) async fn get_job_status(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    args: Value,
+) -> Value {
+    let args_obj = match args.as_object() {
+        Some(o) => o,
+        None => return invalid_args_content("get_job_status", "arguments must be a JSON object"),
+    };
+    let msg_id = match args_obj.get("msg_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return invalid_args_content("get_job_status", "missing or empty 'msg_id'"),
+    };
+
+    use vegapunk_memory_storage::tool_ownership::{OwnershipKind, verify as verify_ownership};
+    match verify_ownership(&state.pool, OwnershipKind::Msg, &msg_id, &user.user_id).await {
+        Ok(true) => {}
+        Ok(false) => return ownership_denied_content("get_job_status"),
+        Err(e) => {
+            tracing::error!(error = %e, "tool_ownership verify failed (get_job_status)");
+            return internal_error_content("get_job_status", "ownership check failed");
+        }
+    }
+
+    let mut client = state.vegapunk.clone();
+    match client.get_job_status(GetJobStatusRequest { msg_id }).await {
+        Err(status) => tonic_error_content("GetJobStatus", status),
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            let jobs: Vec<Value> = resp
+                .jobs
+                .iter()
+                .map(|j| {
+                    json!({
+                        "job_type": j.job_type,
+                        "status": j.status,
+                        "error": j.error,
+                    })
+                })
+                .collect();
+            success_content(json!({
+                "msg_id": resp.msg_id,
+                "overall_status": resp.overall_status,
+                "jobs": jobs,
+            }))
+        }
+    }
+}
 
 /// `get_traceable_chain` argument を `GetTraceableChainRequest` に詰める。
 /// `schema` は wrapper が user.vegapunk_schema を強制注入 (cross-tenant guard)。
@@ -2160,6 +2398,158 @@ pub(super) async fn get_traceable_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_state;
+    use vegapunk_memory_storage::tool_ownership::{OwnershipKind, record as record_ownership};
+    use vegapunk_memory_storage::users::insert as insert_user;
+
+    /// `feedback` handler が未知の search_id (= ownership 行が無い) に対して
+    /// 403 相当の `isError: true` content を返すこと。vegapunk RPC まで
+    /// 到達しない (= test_state の dummy connect エラーが出ないこと) で
+    /// 確認できる。
+    #[tokio::test]
+    async fn feedback_returns_permission_denied_for_unknown_search_id() {
+        let state = test_state().await;
+        insert_user(&state.pool, "u1", "google", "sub1", None, "u1-schema")
+            .await
+            .unwrap();
+        let user = AuthenticatedUser {
+            user_id: "u1".into(),
+            client_id: "c".into(),
+            vegapunk_schema: "u1-schema".into(),
+        };
+        let args = json!({"search_id": "never-recorded", "rating": 5});
+        let result = feedback(&state, &user, args).await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("permission denied"),
+            "expected denial, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_returns_permission_denied_for_other_tenants_search_id() {
+        let state = test_state().await;
+        insert_user(&state.pool, "u1", "google", "sub1", None, "u1-schema")
+            .await
+            .unwrap();
+        insert_user(&state.pool, "u2", "google", "sub2", None, "u2-schema")
+            .await
+            .unwrap();
+        // u2 が発行した search_id を、u1 が指定して feedback 試行 → 403。
+        record_ownership(&state.pool, OwnershipKind::Search, "sid-stolen", "u2")
+            .await
+            .unwrap();
+        let user_u1 = AuthenticatedUser {
+            user_id: "u1".into(),
+            client_id: "c".into(),
+            vegapunk_schema: "u1-schema".into(),
+        };
+        let result = feedback(
+            &state,
+            &user_u1,
+            json!({"search_id": "sid-stolen", "rating": 3}),
+        )
+        .await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("permission denied"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn get_job_status_returns_permission_denied_for_unknown_msg_id() {
+        let state = test_state().await;
+        insert_user(&state.pool, "u1", "google", "sub1", None, "u1-schema")
+            .await
+            .unwrap();
+        let user = AuthenticatedUser {
+            user_id: "u1".into(),
+            client_id: "c".into(),
+            vegapunk_schema: "u1-schema".into(),
+        };
+        let result = get_job_status(&state, &user, json!({"msg_id": "never-recorded"})).await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("permission denied"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn get_job_status_returns_permission_denied_for_other_tenants_msg_id() {
+        // Codex review Warning: feedback と同様、別 tenant の msg_id 試行
+        // でも 403 を返すことを pin する。
+        let state = test_state().await;
+        insert_user(&state.pool, "u1", "google", "sub1", None, "u1-schema")
+            .await
+            .unwrap();
+        insert_user(&state.pool, "u2", "google", "sub2", None, "u2-schema")
+            .await
+            .unwrap();
+        record_ownership(&state.pool, OwnershipKind::Msg, "msg-stolen", "u2")
+            .await
+            .unwrap();
+        let user_u1 = AuthenticatedUser {
+            user_id: "u1".into(),
+            client_id: "c".into(),
+            vegapunk_schema: "u1-schema".into(),
+        };
+        let result = get_job_status(&state, &user_u1, json!({"msg_id": "msg-stolen"})).await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("permission denied"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn feedback_rejects_non_string_comment() {
+        // Codex review Suggestion: 非 string `comment` は黙って空文字に
+        // 落とさず validation error にする (= inputSchema と挙動を揃える)。
+        // Codex round 2: `null` 明示も「present + non-string」として reject。
+        let state = test_state().await;
+        insert_user(&state.pool, "u1", "google", "sub1", None, "u1-schema")
+            .await
+            .unwrap();
+        let user = AuthenticatedUser {
+            user_id: "u1".into(),
+            client_id: "c".into(),
+            vegapunk_schema: "u1-schema".into(),
+        };
+        for bad_comment in [json!(42), json!(null), json!(true), json!(["a"]), json!({})] {
+            let result = feedback(
+                &state,
+                &user,
+                json!({"search_id": "x", "rating": 3, "comment": bad_comment.clone()}),
+            )
+            .await;
+            assert_eq!(
+                result["isError"], true,
+                "comment={bad_comment} should be rejected"
+            );
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("comment"), "comment={bad_comment}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn feedback_rejects_invalid_rating() {
+        // ownership 検証より前の引数バリデーションも通ること。
+        let state = test_state().await;
+        insert_user(&state.pool, "u1", "google", "sub1", None, "u1-schema")
+            .await
+            .unwrap();
+        let user = AuthenticatedUser {
+            user_id: "u1".into(),
+            client_id: "c".into(),
+            vegapunk_schema: "u1-schema".into(),
+        };
+        for bad in [0, 6, -1] {
+            let result = feedback(&state, &user, json!({"search_id": "x", "rating": bad})).await;
+            assert_eq!(result["isError"], true);
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("rating") && text.contains("1..=5"),
+                "rating={bad}: {text}"
+            );
+        }
+    }
 
     #[test]
     fn search_request_uses_user_schema_and_ignores_args_schema() {

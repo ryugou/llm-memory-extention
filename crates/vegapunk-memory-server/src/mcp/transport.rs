@@ -301,8 +301,8 @@ mod tests {
         assert_eq!(status, 200);
         let tools = v["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        // `feedback` / `get_job_status` are intentionally NOT advertised
-        // until ownership tracking lands (see `tools::mod` TOOL_NAMES note).
+        // PR #27 で ownership tracking が入ったので feedback / get_job_status
+        // も advertise する。verify は handler 側で実行される。
         for required in [
             "search",
             "ingest",
@@ -312,14 +312,10 @@ mod tests {
             "list_schemas",
             "stats",
             "get_traceable_chain",
+            "feedback",
+            "get_job_status",
         ] {
             assert!(names.contains(&required), "missing tool: {required}");
-        }
-        for must_not in ["feedback", "get_job_status"] {
-            assert!(
-                !names.contains(&must_not),
-                "tool '{must_not}' must not be advertised yet (cross-tenant guard not implemented)"
-            );
         }
     }
 
