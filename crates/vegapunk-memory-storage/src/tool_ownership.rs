@@ -88,10 +88,12 @@ pub async fn record_many(
     }
     let mut tx = pool.begin().await?;
     let now = now_ms();
-    // INSERT 段は IGNORE 経由でまとめて回し、commit 後に「全件 user_id
-    // 所有」かを 1 query で確認する (= per-row verify を transaction 内で
-    // やると read-after-write の整合性は OK だが query 数が多い。commit
-    // 後の bulk verify で十分)。
+    // INSERT 段は IGNORE 経由でまとめて回す。commit 後に念のため per-id
+    // `verify` を loop で発行して「全件が user_id 所有」かを確認する
+    // (Copilot review #27 round 3: 元コメントが「1 query」と読めたが
+    // 実装は N 回 SELECT。`foreign_ids` は通常 ingest_raw 1 回あたり
+    // 数十件で N+1 のコストは無視可能、bulk verify (= `WHERE id IN
+    // (?,?,...)`) に寄せる利得が薄いため per-id verify を維持する)。
     for id in foreign_ids {
         sqlx::query(
             "INSERT OR IGNORE INTO tool_ownership (kind, foreign_id, user_id, created_at)
@@ -106,8 +108,8 @@ pub async fn record_many(
     }
     tx.commit().await?;
 
-    // 既存行衝突で別 user 所有のままになった行が無いかを確認。1 件でも
-    // 別 user_id 所有が混じれば false。
+    // 既存行衝突で別 user 所有のままになった行が無いかを per-id verify
+    // で確認。1 件でも別 user_id 所有が混じれば false。
     for id in foreign_ids {
         if !verify(pool, kind, id, user_id).await? {
             return Ok(false);
